@@ -3,19 +3,17 @@ pub mod routes;
 pub mod sse;
 pub mod types;
 
-use std::sync::{Arc, Mutex};
-
-use axum::Router;
-use golbang_core::Model;
+use golbang_core::SchedulerHandle;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub model: Arc<Mutex<Model>>,
+    pub scheduler: SchedulerHandle,
     pub model_name: String,
+    pub default_timeout: Option<std::time::Duration>,
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
+pub fn router(state: AppState) -> axum::Router {
+    axum::Router::new()
         .route(
             "/v1/chat/completions",
             axum::routing::post(routes::chat_completions),

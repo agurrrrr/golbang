@@ -68,15 +68,17 @@ cargo build -p golbang-sys
 cargo test  -p golbang-sys -- --nocapture
 ```
 
-## P1 서버 (단일 요청 SSE)
+## P2 서버 (스케줄 정책이 교체 가능한 배치 루프)
 
-기본 포트는 **8088** (`:8080` llama-server와 겹치지 않게). `n_ctx` 기본 256 — 같은 GPU에 다른 서버가 있으면 올리지 말 것.
+기본 포트는 **8088** (`:8080` llama-server와 겹치지 않게). `--n-ctx`는 **슬롯당** 컨텍스트(기본 256). 총 KV는 `n_ctx * n_parallel`.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export GOLBANG_TEST_MODEL=/home/agurrrrr/code/local-llm/models/Qwen3-0.6B-Q4_K_M.gguf
 
-cargo run -p golbang-server -- --model "$GOLBANG_TEST_MODEL" --port 8088
+cargo run -p golbang-server --release -- \
+  --model "$GOLBANG_TEST_MODEL" --port 8088 \
+  --n-parallel 2 --queue-size 2 --policy fifo
 
 # 스트리밍
 curl -N -X POST http://127.0.0.1:8088/v1/chat/completions \
@@ -89,7 +91,10 @@ curl -sS -X POST http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":false,"max_tokens":32}'
 ```
 
-`cargo test --workspace` 는 `GOLBANG_TEST_MODEL` 이 있을 때 GPU E2E(SSE / JSON / 빈 messages 4xx)까지 돈다.
+`cargo test --workspace` 는 `GOLBANG_TEST_MODEL` 이 있을 때 GPU E2E(SSE / JSON / 빈 messages 4xx / decode 중 503)까지 돈다.
+
+큐가 가득 차면 **즉시** `503` + `Retry-After: 1` (decode가 끝날 때까지 핸들러가 멈추지 않음).
+벤치 기록은 `docs/bench/p2.md`.
 
 ## 로드맵
 

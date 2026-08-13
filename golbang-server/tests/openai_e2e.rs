@@ -5,10 +5,12 @@ use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use golbang_core::{LoadParams, Model};
+use golbang_core::{
+    spawn_scheduler, Engine, FifoPolicy, LoadParams, Model, SchedulerConfig,
+};
 use golbang_server::{router, AppState};
 use tokio::net::TcpListener;
 
@@ -34,6 +36,58 @@ fn test_model() -> Option<String> {
     }
 }
 
+async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
+    let engine = Arc::new(Engine::new(model));
+    let spawned = spawn_scheduler(
+        engine,
+        Box::new(FifoPolicy),
+        SchedulerConfig {
+            n_parallel,
+            queue_capacity: queue_size,
+            default_timeout: None,
+        },
+    );
+    let state = AppState {
+        scheduler: spawned.handle,
+        model_name: "qwen-test".into(),
+        default_timeout: None,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let app = router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    port
+}
+
+fn curl_json(url: &str, body: &str) -> (i32, String) {
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "-o",
+            "-",
+            "-w",
+            "\nHTTP_STATUS:%{http_code}",
+            "-X",
+            "POST",
+            url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+        ])
+        .output()
+        .expect("curl");
+    let txt = String::from_utf8_lossy(&out.stdout).into_owned();
+    let status = txt
+        .rsplit_once("HTTP_STATUS:")
+        .and_then(|(_, s)| s.trim().parse().ok())
+        .unwrap_or(0);
+    (status, txt)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn openai_sse_json_and_empty_messages() {
     let Some(path) = test_model() else {
@@ -47,6 +101,7 @@ async fn openai_sse_json_and_empty_messages() {
             LoadParams {
                 n_ctx: 256,
                 n_gpu_layers: 99,
+                n_seq_max: 2,
             },
         )
     })
@@ -54,41 +109,16 @@ async fn openai_sse_json_and_empty_messages() {
     .expect("join")
     .expect("load");
 
-    let state = AppState {
-        model: Arc::new(Mutex::new(model)),
-        model_name: "qwen-test".into(),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let app = router(state);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    let port = serve(model, 2, 2).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
-    let empty = Command::new("curl")
-        .args([
-            "-sS",
-            "-o",
-            "-",
-            "-w",
-            "\nHTTP_STATUS:%{http_code}",
-            "-X",
-            "POST",
-            &url,
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            r#"{"model":"qwen","messages":[],"stream":true}"#,
-        ])
-        .output()
-        .expect("curl empty");
-    let empty_txt = String::from_utf8_lossy(&empty.stdout);
+    let (empty_st, empty_txt) = curl_json(
+        &url,
+        r#"{"model":"qwen","messages":[],"stream":true}"#,
+    );
     assert!(
-        empty_txt.contains("HTTP_STATUS:400") || empty_txt.contains("HTTP_STATUS:4"),
-        "empty messages should be 4xx, got:\n{empty_txt}"
+        empty_st == 400 || (400..500).contains(&empty_st),
+        "empty messages should be 4xx, got {empty_st}:\n{empty_txt}"
     );
     assert!(
         empty_txt.contains("messages must not be empty"),
@@ -109,7 +139,11 @@ async fn openai_sse_json_and_empty_messages() {
         ])
         .output()
         .expect("curl sse");
-    assert!(sse.status.success(), "curl sse failed: {}", String::from_utf8_lossy(&sse.stderr));
+    assert!(
+        sse.status.success(),
+        "curl sse failed: {}",
+        String::from_utf8_lossy(&sse.stderr)
+    );
     let sse_txt = String::from_utf8_lossy(&sse.stdout);
     assert!(
         sse_txt.contains("data: [DONE]"),
@@ -153,4 +187,54 @@ async fn openai_sse_json_and_empty_messages() {
     assert_eq!(v["object"], "chat.completion");
     assert!(v["choices"][0]["message"]["content"].is_string());
     assert!(v["choices"][0]["finish_reason"].is_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decode_busy_returns_503_immediately() {
+    let Some(path) = test_model() else {
+        return;
+    };
+    let _lock = lock_gpu();
+
+    let model = tokio::task::spawn_blocking(move || {
+        Model::load(
+            path,
+            LoadParams {
+                n_ctx: 256,
+                n_gpu_layers: 99,
+                n_seq_max: 1,
+            },
+        )
+    })
+    .await
+    .expect("join")
+    .expect("load");
+
+    // One slot + one waiting room: the third concurrent request must 503
+    // without waiting for decode.
+    let port = serve(model, 1, 1).await;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let body = r#"{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":true,"max_tokens":32,"temperature":0}"#;
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let url = url.clone();
+            std::thread::spawn(move || curl_json(&url, body))
+        })
+        .collect();
+
+    let results: Vec<(i32, String)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let n_503 = results.iter().filter(|(s, _)| *s == 503).count();
+    assert!(
+        n_503 >= 1,
+        "expected at least one 503 during decode, got {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|(_, b)| b.to_ascii_lowercase().contains("retry-after")
+                || b.contains("busy")
+                || b.contains("HTTP_STATUS:503")),
+        "503 body should be a busy signal: {results:?}"
+    );
 }

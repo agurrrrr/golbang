@@ -10,6 +10,8 @@ golbang-sys = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 libc = "0.2"

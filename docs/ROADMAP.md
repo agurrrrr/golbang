@@ -38,11 +38,11 @@
 llama-server도 이미 CB가 기본이다. "CB 도입"이나 "decode 중 삽입"은 목표가 아니다.
 join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 
-- [ ] GPU 추론 전담 (`spawn_blocking`) + tokio HTTP 분리
-- [ ] 슬롯 풀 + 정책 trait + iteration 루프
-- [ ] `CancellationToken` (회수 하한은 decode 1회)
-- [ ] bounded mpsc — decode 중에도 즉시 503
-- [ ] **완료 기준:** (a) P1 대비 후발 TTFT 개선 (b) llama-server와 동일 조건 기록. 처리량 승리 필수 아님
+- [x] GPU 추론 전담 (`spawn_blocking`) + tokio HTTP 분리
+- [x] 슬롯 풀 + 정책 trait + iteration 루프
+- [x] `CancellationToken` (회수 하한은 decode 1회)
+- [x] bounded mpsc — decode 중에도 즉시 503
+- [x] **완료 기준:** (a) P1 대비 후발 TTFT 개선 (b) llama-server와 동일 조건 기록. 처리량 승리 필수 아님
 
 ## P3 — 성능 & 안정화
 

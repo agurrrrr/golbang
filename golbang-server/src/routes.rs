@@ -23,16 +23,9 @@ pub async fn chat_completions(
     );
 
     if req.stream {
-        return Ok(sse::stream_completion(state, req).into_response());
+        return Ok(sse::stream_completion(state, req)?.into_response());
     }
 
-    let model_name = sse::model_name(&req, &state);
-    let completion = tokio::task::spawn_blocking(move || {
-        let mut model = state.model.lock().unwrap_or_else(|e| e.into_inner());
-        sse::complete_blocking(&mut model, req, &model_name)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("worker join: {e}")))??;
-
+    let completion = sse::complete(state, req).await?;
     Ok(Json(completion).into_response())
 }

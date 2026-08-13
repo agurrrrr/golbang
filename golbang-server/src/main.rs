@@ -1,17 +1,20 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use golbang_core::{LoadParams, Model};
+use golbang_core::{
+    spawn_scheduler, Engine, FifoPolicy, LoadParams, Model, SchedulerConfig,
+};
 use golbang_server::{router, AppState};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "golbang-server",
-    about = "golbang OpenAI-compatible server (P1, single request)"
+    about = "golbang OpenAI-compatible server (P2 concurrency core)"
 )]
 struct Args {
     /// GGUF path. Also reads GOLBANG_MODEL. Falls back to GOLBANG_TEST_MODEL.
@@ -24,12 +27,28 @@ struct Args {
     #[arg(long, env = "GOLBANG_PORT", default_value_t = 8088)]
     port: u16,
 
-    /// Keep small when another process already holds most of VRAM.
+    /// Per-sequence context. Total KV is n_ctx * n_parallel.
     #[arg(long, env = "GOLBANG_N_CTX", default_value_t = 256)]
     n_ctx: u32,
 
     #[arg(long, env = "GOLBANG_N_GPU_LAYERS", default_value_t = 99)]
     n_gpu_layers: i32,
+
+    /// Slot count / llama n_seq_max.
+    #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
+    n_parallel: u32,
+
+    /// Bounded submit queue. Full → immediate 503 + Retry-After.
+    #[arg(long, env = "GOLBANG_QUEUE_SIZE", default_value_t = 2)]
+    queue_size: usize,
+
+    /// Optional per-request generation timeout.
+    #[arg(long, env = "GOLBANG_TIMEOUT_SECS")]
+    timeout_secs: Option<u64>,
+
+    /// Schedule policy. Only `fifo` is built in (P2).
+    #[arg(long, env = "GOLBANG_POLICY", default_value = "fifo")]
+    policy: String,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -60,18 +79,37 @@ async fn main() -> Result<()> {
         .unwrap_or("golbang")
         .to_string();
 
+    let n_parallel = args.n_parallel.max(1);
     let model = Model::load(
         &model_path,
         LoadParams {
             n_gpu_layers: args.n_gpu_layers,
             n_ctx: args.n_ctx,
+            n_seq_max: n_parallel,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
 
+    let policy: Box<dyn golbang_core::SchedulePolicy> = match args.policy.as_str() {
+        "fifo" => Box::new(FifoPolicy),
+        other => anyhow::bail!("unknown policy {other} (P2 ships fifo only)"),
+    };
+
+    let engine = Arc::new(Engine::new(model));
+    let spawned = spawn_scheduler(
+        engine,
+        policy,
+        SchedulerConfig {
+            n_parallel,
+            queue_capacity: args.queue_size.max(1),
+            default_timeout: args.timeout_secs.map(Duration::from_secs),
+        },
+    );
+
     let state = AppState {
-        model: Arc::new(Mutex::new(model)),
+        scheduler: spawned.handle,
         model_name,
+        default_timeout: args.timeout_secs.map(Duration::from_secs),
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -80,7 +118,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    tracing::info!(%addr, "listening");
+    tracing::info!(%addr, n_parallel, queue = args.queue_size, "listening");
 
     axum::serve(listener, router(state))
         .await

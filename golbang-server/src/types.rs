@@ -15,7 +15,7 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Stop>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]

@@ -10,12 +10,14 @@ use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
 use crate::tokenizer::{Token, Tokenizer};
 
-/// Load options. `n_ctx` stays small by default so this can share a card
-/// with another llama-server occupying most of VRAM (P0 leftover ~800 MiB).
+/// Load options. `n_ctx` is **per sequence**. Total KV is `n_ctx * n_seq_max`
+/// so P1's 256-token slot stays 256 when `--n-parallel` grows.
+/// Keep both small when another llama-server already holds most of VRAM.
 #[derive(Clone, Debug)]
 pub struct LoadParams {
     pub n_gpu_layers: i32,
     pub n_ctx: u32,
+    pub n_seq_max: u32,
 }
 
 impl Default for LoadParams {
@@ -23,6 +25,7 @@ impl Default for LoadParams {
         Self {
             n_gpu_layers: 99,
             n_ctx: 256,
+            n_seq_max: 1,
         }
     }
 }
@@ -55,10 +58,14 @@ impl Model {
             reason: "path contains interior NUL".into(),
         })?;
 
-        let n_ctx = params.n_ctx.max(1);
+        let n_ctx_seq = params.n_ctx.max(1);
+        let n_seq_max = params.n_seq_max.max(1);
+        let n_ctx_total = n_ctx_seq.saturating_mul(n_seq_max);
         tracing::info!(
             path = %path.display(),
-            n_ctx,
+            n_ctx_seq,
+            n_ctx_total,
+            n_seq_max,
             n_gpu_layers = params.n_gpu_layers,
             "loading GGUF"
         );
@@ -89,10 +96,10 @@ impl Model {
         }
 
         let mut cparams = unsafe { llama_context_default_params() };
-        cparams.n_ctx = n_ctx;
-        cparams.n_batch = n_ctx;
-        cparams.n_ubatch = n_ctx;
-        cparams.n_seq_max = 1;
+        cparams.n_ctx = n_ctx_total;
+        cparams.n_batch = n_ctx_seq;
+        cparams.n_ubatch = n_ctx_seq;
+        cparams.n_seq_max = n_seq_max;
 
         let ctx = unsafe { llama_init_from_model(model, cparams) };
         if ctx.is_null() {
@@ -105,6 +112,8 @@ impl Model {
 
         tracing::info!(
             n_ctx = unsafe { llama_n_ctx(ctx) },
+            n_ctx_seq = unsafe { llama_n_ctx_seq(ctx) },
+            n_seq_max = unsafe { llama_n_seq_max(ctx) },
             n_vocab,
             n_layer = unsafe { llama_model_n_layer(model) },
             "model ready"
@@ -129,6 +138,19 @@ impl Model {
 
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_n_ctx(self.ctx) }
+    }
+
+    /// Per-sequence context (KV cells one slot may occupy).
+    pub fn n_ctx_seq(&self) -> u32 {
+        unsafe { llama_n_ctx_seq(self.ctx) }
+    }
+
+    pub fn n_seq_max(&self) -> u32 {
+        unsafe { llama_n_seq_max(self.ctx) }
+    }
+
+    pub fn n_batch(&self) -> u32 {
+        unsafe { llama_n_batch(self.ctx) }
     }
 
     pub fn tokenizer(&self) -> Tokenizer<'_> {
@@ -161,14 +183,24 @@ impl Model {
         }
     }
 
-    /// Tokens already in seq 0 (0 if empty).
-    pub fn n_past(&self) -> u32 {
+    /// Drop one sequence's KV. Whole-sequence remove never fails (llama.h).
+    pub fn clear_seq(&mut self, seq_id: i32) {
+        unsafe {
+            let mem = llama_get_memory(self.ctx);
+            if !mem.is_null() {
+                llama_memory_seq_rm(mem, seq_id, -1, -1);
+            }
+        }
+    }
+
+    /// Tokens already in `seq_id` (0 if empty).
+    pub fn n_past_seq(&self, seq_id: i32) -> u32 {
         unsafe {
             let mem = llama_get_memory(self.ctx);
             if mem.is_null() {
                 return 0;
             }
-            let max = llama_memory_seq_pos_max(mem, 0);
+            let max = llama_memory_seq_pos_max(mem, seq_id);
             if max < 0 {
                 0
             } else {
@@ -177,10 +209,30 @@ impl Model {
         }
     }
 
-    /// Prefill or decode a token chunk. Positions are tracked by llama.cpp.
+    /// Tokens already in seq 0 (0 if empty).
+    pub fn n_past(&self) -> u32 {
+        self.n_past_seq(0)
+    }
+
+    /// Prefill or decode a token chunk on seq 0. Positions tracked by llama.cpp
+    /// when `n_seq_max == 1`; multi-seq contexts use explicit pos/seq ids.
     pub fn decode(&mut self, tokens: &[Token]) -> Result<()> {
         if tokens.is_empty() {
             return Ok(());
+        }
+        if self.n_seq_max() > 1 {
+            let start = self.n_past_seq(0) as i32;
+            let items: Vec<crate::batch::BatchToken> = tokens
+                .iter()
+                .enumerate()
+                .map(|(i, &token)| crate::batch::BatchToken {
+                    token,
+                    pos: start + i as i32,
+                    seq_id: 0,
+                    logits: i + 1 == tokens.len(),
+                })
+                .collect();
+            return self.decode_items(&items);
         }
         let n_batch = unsafe { llama_n_batch(self.ctx) }.max(1) as usize;
         let mut i = 0;
@@ -197,10 +249,59 @@ impl Model {
         Ok(())
     }
 
+    /// Multi-sequence decode. `items.len()` must be ≤ `n_batch`.
+    pub fn decode_items(&mut self, items: &[crate::batch::BatchToken]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let n_batch = self.n_batch().max(1) as usize;
+        if items.len() > n_batch {
+            return Err(Error::BatchTooLarge {
+                got: items.len(),
+                n_batch,
+            });
+        }
+
+        let n = items.len() as i32;
+        let mut batch = unsafe { llama_batch_init(n, 0, 1) };
+        if batch.token.is_null() || batch.pos.is_null() || batch.seq_id.is_null() {
+            unsafe { llama_batch_free(batch) };
+            return Err(Error::Null("llama_batch_init"));
+        }
+
+        for (i, it) in items.iter().enumerate() {
+            unsafe {
+                *batch.token.add(i) = it.token;
+                *batch.pos.add(i) = it.pos;
+                *batch.n_seq_id.add(i) = 1;
+                let seqs = *batch.seq_id.add(i);
+                if seqs.is_null() {
+                    llama_batch_free(batch);
+                    return Err(Error::Null("llama_batch.seq_id"));
+                }
+                *seqs.add(0) = it.seq_id;
+                *batch.logits.add(i) = i8::from(it.logits);
+            }
+        }
+        batch.n_tokens = n;
+
+        let rc = unsafe { llama_decode(self.ctx, batch) };
+        unsafe { llama_batch_free(batch) };
+        if rc != 0 {
+            return Err(Error::Decode(rc));
+        }
+        Ok(())
+    }
+
     /// Last-token logits from the previous `decode`. Valid until the next decode.
     pub fn logits(&self) -> Result<&[f32]> {
+        self.logits_ith(-1)
+    }
+
+    /// Logits for batch index `i` (`-1` = last). Valid until the next decode.
+    pub fn logits_ith(&self, i: i32) -> Result<&[f32]> {
         unsafe {
-            let ptr = llama_get_logits_ith(self.ctx, -1);
+            let ptr = llama_get_logits_ith(self.ctx, i);
             if ptr.is_null() {
                 return Err(Error::Null("llama_get_logits_ith"));
             }

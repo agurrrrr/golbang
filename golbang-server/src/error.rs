@@ -1,3 +1,4 @@
+use axum::http::header::{HeaderValue, RETRY_AFTER};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -29,6 +30,15 @@ impl ApiError {
             param: None,
         }
     }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            kind: "server_error",
+            param: None,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -41,7 +51,12 @@ impl IntoResponse for ApiError {
                 "code": null
             }
         });
-        (self.status, Json(body)).into_response()
+        let mut res = (self.status, Json(body)).into_response();
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            res.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        res
     }
 }
 
@@ -51,7 +66,21 @@ impl From<golbang_core::Error> for ApiError {
             golbang_core::Error::EmptyPrompt
             | golbang_core::Error::ContextFull { .. }
             | golbang_core::Error::Tokenize(_) => Self::invalid_request(e.to_string(), None),
+            golbang_core::Error::Cancelled | golbang_core::Error::Timeout => {
+                Self::internal(e.to_string())
+            }
             other => Self::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<golbang_core::SubmitError> for ApiError {
+    fn from(e: golbang_core::SubmitError) -> Self {
+        match e {
+            golbang_core::SubmitError::Full => {
+                Self::unavailable("server is busy; retry after the current decode")
+            }
+            golbang_core::SubmitError::Closed => Self::internal("scheduler closed"),
         }
     }
 }

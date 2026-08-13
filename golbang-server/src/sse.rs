@@ -7,7 +7,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use golbang_core::{apply_chat_template, GenerateParams, Model};
+use golbang_core::{
+    apply_chat_template, CancellationToken, GenerateParams, Job, SlotEvent,
+};
 
 use crate::error::ApiError;
 use crate::types::{
@@ -53,105 +55,117 @@ fn core_messages(messages: Vec<ChatMessage>) -> Vec<golbang_core::ChatMessage> {
     messages.into_iter().map(Into::into).collect()
 }
 
-pub fn stream_completion(
-    state: AppState,
-    req: ChatCompletionRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::channel::<Event>(16);
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_stream(&state, req, &tx) {
-            tracing::error!(error = %e.message, "stream generation failed");
-            let payload = serde_json::json!({
-                "error": { "message": e.message, "type": e.kind }
-            });
-            let _ = tx.blocking_send(Event::default().data(payload.to_string()));
-            let _ = tx.blocking_send(Event::default().data("[DONE]"));
-        }
-    });
-    Sse::new(ReceiverStream::new(rx).map(Ok)).keep_alive(KeepAlive::default())
-}
-
-fn run_stream(
-    state: &AppState,
-    req: ChatCompletionRequest,
-    tx: &mpsc::Sender<Event>,
-) -> Result<(), ApiError> {
-    let id = completion_id();
-    let created = unix_ts();
-    let model_name = model_name(&req, state);
-    let params = generate_params(&req);
-    let messages = core_messages(req.messages);
+fn prompt_from(req: &ChatCompletionRequest) -> String {
+    let messages = core_messages(req.messages.clone());
     let applied = apply_chat_template(&messages);
     if !applied.used_chatml {
         tracing::warn!("serving request with raw prompt fallback");
     }
-
-    let mut model = state.model.lock().unwrap_or_else(|e| e.into_inner());
-    let mut generation = model.generate(&applied.prompt, params)?;
-
-    send_chunk(
-        tx,
-        &id,
-        created,
-        &model_name,
-        Delta {
-            role: Some("assistant"),
-            content: None,
-        },
-        None,
-    )?;
-
-    let mut n = 0u32;
-    while let Some(item) = generation.next() {
-        let t = item?;
-        n += 1;
-        if !t.piece.is_empty() {
-            send_chunk(
-                tx,
-                &id,
-                created,
-                &model_name,
-                Delta {
-                    role: None,
-                    content: Some(t.piece),
-                },
-                None,
-            )?;
-        }
-    }
-
-    let finish = generation
-        .finish_reason()
-        .map(|r| r.as_str().to_string());
-    send_chunk(
-        tx,
-        &id,
-        created,
-        &model_name,
-        Delta::default(),
-        finish,
-    )?;
-    tx.blocking_send(Event::default().data("[DONE]"))
-        .map_err(|_| ApiError::internal("client gone"))?;
-
-    tracing::info!(
-        prompt_tokens = generation.prompt_tokens(),
-        completion_tokens = generation.completion_tokens(),
-        streamed = n,
-        finish = ?generation.finish_reason(),
-        "sse finished"
-    );
-    Ok(())
+    applied.prompt
 }
 
-fn send_chunk(
+pub fn stream_completion(
+    state: AppState,
+    req: ChatCompletionRequest,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let id = completion_id();
+    let created = unix_ts();
+    let model_name = model_name(&req, &state);
+    let params = generate_params(&req);
+    let prompt = prompt_from(&req);
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let (sse_tx, sse_rx) = mpsc::channel::<Event>(16);
+    let cancel = CancellationToken::new();
+    let cancel_on_drop = cancel.clone();
+
+    let mut job = Job::new(prompt, params, cancel, ev_tx);
+    job.timeout = state.default_timeout;
+    state.scheduler.try_submit(job)?;
+
+    tokio::spawn(async move {
+        if send_chunk(
+            &sse_tx,
+            &id,
+            created,
+            &model_name,
+            Delta {
+                role: Some("assistant"),
+                content: None,
+            },
+            None,
+        )
+        .await
+        .is_err()
+        {
+            cancel_on_drop.cancel();
+            return;
+        }
+
+        let mut n = 0u32;
+        while let Some(ev) = ev_rx.recv().await {
+            let send = match ev {
+                SlotEvent::Token(t) => {
+                    n += 1;
+                    if t.piece.is_empty() {
+                        continue;
+                    }
+                    send_chunk(
+                        &sse_tx,
+                        &id,
+                        created,
+                        &model_name,
+                        Delta {
+                            role: None,
+                            content: Some(t.piece),
+                        },
+                        None,
+                    )
+                    .await
+                }
+                SlotEvent::Finished { reason, .. } => {
+                    let r = send_chunk(
+                        &sse_tx,
+                        &id,
+                        created,
+                        &model_name,
+                        Delta::default(),
+                        Some(reason.as_str().to_string()),
+                    )
+                    .await;
+                    let _ = sse_tx.send(Event::default().data("[DONE]")).await;
+                    tracing::info!(streamed = n, finish = reason.as_str(), "sse finished");
+                    r
+                }
+                SlotEvent::Failed(e) => {
+                    tracing::error!(error = %e, "stream generation failed");
+                    let payload = serde_json::json!({
+                        "error": { "message": e.to_string(), "type": "server_error" }
+                    });
+                    let _ = sse_tx.send(Event::default().data(payload.to_string())).await;
+                    let _ = sse_tx.send(Event::default().data("[DONE]")).await;
+                    break;
+                }
+            };
+            if send.is_err() {
+                cancel_on_drop.cancel();
+                tracing::info!("client gone; cancel accepted, slot reclaim at next decode");
+                break;
+            }
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(sse_rx).map(Ok)).keep_alive(KeepAlive::default()))
+}
+
+async fn send_chunk(
     tx: &mpsc::Sender<Event>,
     id: &str,
     created: u64,
     model: &str,
     delta: Delta,
     finish_reason: Option<String>,
-) -> Result<(), ApiError> {
+) -> Result<(), ()> {
     let chunk = ChatCompletionChunk {
         id: id.to_string(),
         object: "chat.completion.chunk",
@@ -163,40 +177,54 @@ fn send_chunk(
             finish_reason,
         }],
     };
-    let data = serde_json::to_string(&chunk).map_err(|e| ApiError::internal(e.to_string()))?;
-    tx.blocking_send(Event::default().data(data))
-        .map_err(|_| ApiError::internal("client gone"))?;
-    Ok(())
+    let data = serde_json::to_string(&chunk).map_err(|_| ())?;
+    tx.send(Event::default().data(data)).await.map_err(|_| ())
 }
 
-pub fn complete_blocking(
-    model: &mut Model,
+pub async fn complete(
+    state: AppState,
     req: ChatCompletionRequest,
-    model_name: &str,
 ) -> Result<ChatCompletion, ApiError> {
     let id = completion_id();
     let created = unix_ts();
+    let model_name = model_name(&req, &state);
     let params = generate_params(&req);
-    let messages = core_messages(req.messages);
-    let applied = apply_chat_template(&messages);
-    if !applied.used_chatml {
-        tracing::warn!("serving request with raw prompt fallback");
-    }
+    let prompt = prompt_from(&req);
 
-    let mut generation = model.generate(&applied.prompt, params)?;
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+
+    let mut job = Job::new(prompt, params, cancel, ev_tx);
+    job.timeout = state.default_timeout;
+    state.scheduler.try_submit(job)?;
+
     let mut content = String::new();
-    for item in &mut generation {
-        content.push_str(&item?.piece);
-    }
+    let mut finish = None;
+    let mut prompt_tokens = 0u32;
+    let mut completion_tokens = 0u32;
 
-    let prompt_tokens = generation.prompt_tokens();
-    let completion_tokens = generation.completion_tokens();
-    let finish = generation.finish_reason().map(|r| r.as_str().to_string());
+    while let Some(ev) = ev_rx.recv().await {
+        match ev {
+            SlotEvent::Token(t) => content.push_str(&t.piece),
+            SlotEvent::Finished {
+                reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+            } => {
+                finish = Some(reason.as_str().to_string());
+                prompt_tokens = p;
+                completion_tokens = c;
+                break;
+            }
+            SlotEvent::Failed(e) => return Err(e.into()),
+        }
+    }
 
     tracing::info!(
         prompt_tokens,
         completion_tokens,
-        finish = ?generation.finish_reason(),
+        finish = ?finish,
         "json completion finished"
     );
 
@@ -204,7 +232,7 @@ pub fn complete_blocking(
         id,
         object: "chat.completion",
         created,
-        model: model_name.to_string(),
+        model: model_name,
         choices: vec![Choice {
             index: 0,
             message: crate::types::AssistantMessage {

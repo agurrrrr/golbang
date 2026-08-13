@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("failed to load model from {}: {reason}", path.display())]
     Load { path: PathBuf, reason: String },
@@ -16,6 +16,12 @@ pub enum Error {
     EmptyPrompt,
     #[error("null pointer from llama.cpp ({0})")]
     Null(&'static str),
+    #[error("batch of {got} tokens exceeds n_batch {n_batch}")]
+    BatchTooLarge { got: usize, n_batch: usize },
+    #[error("request cancelled")]
+    Cancelled,
+    #[error("request timed out")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

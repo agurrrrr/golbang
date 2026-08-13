@@ -11,6 +11,8 @@ use crate::tokenizer::Token;
 pub enum FinishReason {
     Stop,
     Length,
+    Cancelled,
+    Timeout,
 }
 
 impl FinishReason {
@@ -18,6 +20,8 @@ impl FinishReason {
         match self {
             Self::Stop => "stop",
             Self::Length => "length",
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -74,7 +78,7 @@ impl<'m> Generate<'m> {
         if tokens.is_empty() {
             return Err(Error::EmptyPrompt);
         }
-        let n_ctx = model.n_ctx();
+        let n_ctx = model.n_ctx_seq();
         let n_prompt = tokens.len() as u32;
         if n_prompt >= n_ctx {
             return Err(Error::ContextFull {
@@ -129,7 +133,7 @@ impl<'m> Generate<'m> {
         }
 
         if let Some(tok) = self.pending.take() {
-            if self.model.n_past() + 1 > self.model.n_ctx() {
+            if self.model.n_past() + 1 > self.model.n_ctx_seq() {
                 self.finish_with(FinishReason::Length);
                 return Ok(None);
             }
@@ -195,17 +199,17 @@ impl Iterator for Generate<'_> {
 }
 
 #[derive(Default)]
-struct Utf8Buf {
+pub(crate) struct Utf8Buf {
     buf: Vec<u8>,
 }
 
 impl Utf8Buf {
-    fn push(&mut self, bytes: &[u8]) -> String {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> String {
         self.buf.extend_from_slice(bytes);
         self.take_valid()
     }
 
-    fn flush(&mut self) -> String {
+    pub(crate) fn flush(&mut self) -> String {
         if self.buf.is_empty() {
             return String::new();
         }
@@ -280,6 +284,7 @@ mod gpu_tests {
             LoadParams {
                 n_ctx: 256,
                 n_gpu_layers: 99,
+                n_seq_max: 1,
             },
         )
         .expect("load");
