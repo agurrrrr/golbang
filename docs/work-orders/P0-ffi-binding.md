@@ -74,9 +74,9 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 | `llama.cpp-furnace` | `5013b9f91` |
 | `llama.cpp-prefetch` | `6e3d2ef73` |
 
-- [ ] 구현 당일 `rev-parse HEAD`와 `.so` mtime이 위 표와 같은지 재확인.
-- [ ] bindgen 입력을 **그 SHA의 `llama.h`**로 고정 (vendor 복사 또는 절대경로). 라이브 트리 헤더와 옛 `.so`를 섞지 말 것.
-- [ ] **심볼/SHA가 바뀌면 (A)를 버리고 (B) 재빌드(P3)로 전환한다.** ADR의 submodule+cmake 서술은 (B)용이며, P0 기본 경로가 아니다.
+- [x] 구현 당일 `rev-parse HEAD`와 `.so` mtime이 위 표와 같은지 재확인. (2026-08-13: HEAD `5b474eb69`, `libggml-hip.so.0` 2026-08-06 19:01, `libllama.so.0` 2026-08-06 19:01, `strings`에 gfx906 포함)
+- [x] bindgen 입력을 **그 SHA의 `llama.h`**로 고정 (`build.rs`가 `git show 5b474eb69:include/llama.h` 로 OUT_DIR에 추출, 1611줄 검증). 라이브 트리 헤더와 옛 `.so`를 섞지 말 것.
+- [x] **심볼/SHA가 바뀌면 (A)를 버리고 (B) 재빌드(P3)로 전환한다.** ADR의 submodule+cmake 서술은 (B)용이며, P0 기본 경로가 아니다. HEAD 불일치 시 `build.rs`가 실패한다.
 
 ### 4.1 링크 전략 결정 (택 1, 먼저 결정할 것)
 
@@ -92,19 +92,19 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 ### 4.2 build.rs 작성
 
-- [ ] llama.cpp 소스/빌드 경로를 환경변수(`GOLBANG_LLAMA_DIR`)로 주입받되, 기본값은 `/home/agurrrrr/code/local-llm/llama.cpp`.
-- [ ] `bindgen::Builder`로 **4.0에서 고정한 그 `llama.h`** 파싱 → `OUT_DIR/bindings.rs` 생성.
+- [x] llama.cpp 소스/빌드 경로를 환경변수(`GOLBANG_LLAMA_DIR`)로 주입받되, 기본값은 `/home/agurrrrr/code/local-llm/llama.cpp`.
+- [x] `bindgen::Builder`로 **4.0에서 고정한 그 `llama.h`** 파싱 → `OUT_DIR/bindings.rs` 생성.
   - allowlist: `llama_*` 함수와 필요한 타입만 (불필요한 심볼 폭증 방지).
-- [ ] 링크 지시 출력:
+- [x] 링크 지시 출력:
   - `cargo:rustc-link-search=native=<llama.cpp build lib 경로>`
-  - `cargo:rustc-link-lib=dylib=llama`, `ggml`, `ggml-base`, `ggml-hip`
-  - ROCm 런타임: `amdhip64`, 필요시 `rocblas`, `hipblas` (`/opt/rocm/lib` 검색 경로 추가)
-- [ ] `cargo:rustc-link-arg`로 rpath 설정(실행 시 `LD_LIBRARY_PATH` 없이 .so 탐색 가능하게) — 선택.
+  - `cargo:rustc-link-lib=dylib=llama`, `ggml`, `ggml-base`, `ggml-cpu`, `ggml-hip`
+  - ROCm 런타임: `amdhip64`, `rocblas`, `hipblas` (`/opt/rocm/lib` 검색 경로 추가)
+- [x] `cargo:rustc-link-arg`로 rpath 설정(실행 시 `LD_LIBRARY_PATH` 없이 .so 탐색 가능하게).
 
 ### 4.3 FFI 바인딩 노출
 
-- [ ] `golbang-sys/src/lib.rs`에서 `include!(concat!(env!("OUT_DIR"), "/bindings.rs"))`.
-- [ ] 스켈레톤 `add()` 제거. 외부로 노출할 최소 심볼 정리:
+- [x] `golbang-sys/src/lib.rs`에서 `include!(concat!(env!("OUT_DIR"), "/bindings.rs"))`.
+- [x] 스켈레톤 `add()` 제거. 외부로 노출할 최소 심볼 정리:
   - 백엔드: `llama_backend_init`, `llama_backend_free`
   - 모델: `llama_model_default_params`, **`llama_model_load_from_file`**, **`llama_model_free`**
   - 컨텍스트: `llama_context_default_params`, **`llama_init_from_model`**, `llama_free`
@@ -118,8 +118,8 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 ### 4.4 검증 테스트 작성
 
-- [ ] 테스트용 소형 GGUF 경로를 환경변수(`GOLBANG_TEST_MODEL`)로 주입.
-- [ ] 테스트 시퀀스:
+- [x] 테스트용 소형 GGUF 경로를 환경변수(`GOLBANG_TEST_MODEL`)로 주입.
+- [x] 테스트 시퀀스:
   1. `llama_backend_init`
   2. 모델 로드 (GPU 오프로드 파라미터 설정 — `n_gpu_layers`)
   3. 컨텍스트 생성
@@ -128,8 +128,8 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
   6. `llama_get_logits`에서 argmax로 다음 토큰 1개 확인
   7. 토큰이 유효 범위 내인지 assert
   8. 자원 해제
-- [ ] **실행 확인:** `cargo test -p golbang-sys -- --nocapture`가 gfx906에서 panic/segfault 없이 통과.
-- [ ] **CPU 폴백 검증 (구체):**
+- [x] **실행 확인:** `cargo test -p golbang-sys -- --nocapture`가 gfx906에서 panic/segfault 없이 통과.
+- [x] **CPU 폴백 검증 (구체):**
   - `llama_backend_init` 로그에서 `backend: HIP`(및 장치명에 gfx906/0x66a1)가 보이는지 확인.
   - `llama_model_load_from_file` 호출 후 **오프로드된 레이어 수**를 assert한다
     (`llama_model_n_layers` 대비 `n_gpu_layers` 설정이 실제로 반영됐는지).
@@ -146,16 +146,16 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 연결 검증이 목적이다. **속도 하한·토큰 품질 기준은 없다.**
 
-- [ ] `cargo build -p golbang-sys` 링크 에러 없음
-- [ ] `GOLBANG_TEST_MODEL`로 소형 GGUF를 지정해 `cargo test -p golbang-sys -- --nocapture` 통과
-- [ ] 테스트 프롬프트는 `"Hello"`
-- [ ] `llama_decode` 1회 후 argmax 토큰이 `[0, n_vocab)`
-- [ ] 로그에 HIP / gfx906이 보이고 CPU 폴백이 아님:
-  - `llama_backend_init` 로그에서 `backend: HIP` 확인
+- [x] `cargo build -p golbang-sys` 링크 에러 없음
+- [x] `GOLBANG_TEST_MODEL`로 소형 GGUF를 지정해 `cargo test -p golbang-sys -- --nocapture` 통과
+- [x] 테스트 프롬프트는 `"Hello"`
+- [x] `llama_decode` 1회 후 argmax 토큰이 `[0, n_vocab)`
+- [x] 로그에 HIP / gfx906이 보이고 CPU 폴백이 아님:
+  - `llama_backend_init` 로그에서 HIP/ROCm 백엔드 확인 (이 SHA의 `GGML_CUDA_NAME`은 `"ROCm"`)
   - 오프로드 레이어 수 assert (`n_gpu_layers` 설정이 실제 반영)
-- [ ] (선택) `LLAMA_LOG` 브릿지로 내부 로그도 `tracing`에 남김
-- [ ] 산출물 커밋
-- [ ] 이 문서 4.0 표의 SHA·빌드 시각이 구현에 쓴 값과 일치
+- [x] (선택) `LLAMA_LOG` 브릿지로 내부 로그도 `tracing`에 남김 — P0는 테스트 콜백으로 stderr+버퍼 캡처. `tracing` 브릿지는 P1.
+- [x] 산출물 커밋
+- [x] 이 문서 4.0 표의 SHA·빌드 시각이 구현에 쓴 값과 일치
 
 ---
 

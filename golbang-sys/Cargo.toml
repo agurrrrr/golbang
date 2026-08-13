@@ -2,5 +2,12 @@
 name = "golbang-sys"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "llama.h / ggml-hip FFI bindings (P0). Unsafe, no safe wrapper."
+links = "llama"
 
 [dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"

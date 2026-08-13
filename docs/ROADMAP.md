@@ -15,12 +15,12 @@
 **목표:** gfx906에서 Rust가 `llama.h`를 통해 모델을 로드하고 토큰 1개를 디코딩한다.
 **목적:** 연결 검증. 속도 하한 없음.
 
-- [ ] 링크 대상 SHA 고정: `5b474eb69` / `llama.h` 1611줄 / 빌드 2026-08-06 19:01
-- [ ] `golbang-sys/build.rs`: 그 SHA의 `llama.h`를 bindgen
-- [ ] (A) 기존 `.so` 링크 (`libllama`, `libggml-hip`, ROCm 런타임)
-- [ ] 현행 API: `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`
-- [ ] 검증: `GOLBANG_TEST_MODEL` + 프롬프트 `"Hello"` → `llama_decode` 1회 → argmax ∈ `[0, n_vocab)` + HIP/gfx906 로그
-- [ ] **완료 기준:** `cargo test -p golbang-sys` 통과 (속도 하한 없음)
+- [x] 링크 대상 SHA 고정: `5b474eb69` / `llama.h` 1611줄 / 빌드 2026-08-06 19:01
+- [x] `golbang-sys/build.rs`: 그 SHA의 `llama.h`를 bindgen
+- [x] (A) 기존 `.so` 링크 (`libllama`, `libggml-hip`, ROCm 런타임)
+- [x] 현행 API: `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`
+- [x] 검증: `GOLBANG_TEST_MODEL` + 프롬프트 `"Hello"` → `llama_decode` 1회 → argmax ∈ `[0, n_vocab)` + HIP/gfx906 로그
+- [x] **완료 기준:** `cargo test -p golbang-sys` 통과 (속도 하한 없음)
 
 ## P1 — 단일 요청 E2E
 

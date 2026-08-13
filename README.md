@@ -53,12 +53,19 @@ golbang이 차별화되는 지점은:
 
 > GPU 처리량 우위는 P2 성공 조건이 아니다. llama-server 대비 동률 + 위 제어면 개선이면 통과.
 
-## 빌드 (예정)
+## 빌드
+
+P0(`golbang-sys`)는 llama.cpp **SHA `5b474eb69`** 의 `llama.h`를 bindgen하고, 같은 SHA로 빌드된 gfx906 `.so`를 링크한다.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-# llama.cpp ggml-hip (gfx906) 링크 필요 — golbang-sys/build.rs가 처리
-cargo build --release
+# 기본값. 다른 트리를 가리키지 말 것 (llama.cpp.new / furnace / prefetch 는 HEAD가 다름).
+export GOLBANG_LLAMA_DIR=/home/agurrrrr/code/local-llm/llama.cpp
+# 소형 GGUF. 추론 테스트에 필요.
+export GOLBANG_TEST_MODEL=/home/agurrrrr/code/local-llm/models/Qwen3-0.6B-Q4_K_M.gguf
+
+cargo build -p golbang-sys
+cargo test  -p golbang-sys -- --nocapture
 ```
 
 ## 로드맵
