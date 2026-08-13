@@ -1,0 +1,60 @@
+# HELP golbang_tokens_generated_total Tokens emitted to clients.
+# TYPE golbang_tokens_generated_total counter
+golbang_tokens_generated_total 234
+# HELP golbang_prompt_tokens_total Prompt tokens prefilled (excludes cache reuse).
+# TYPE golbang_prompt_tokens_total counter
+golbang_prompt_tokens_total 3274
+# HELP golbang_prompt_seconds_total Wall time spent prefilling.
+# TYPE golbang_prompt_seconds_total counter
+golbang_prompt_seconds_total 47.528481
+# HELP golbang_predicted_seconds_total Wall time spent generating.
+# TYPE golbang_predicted_seconds_total counter
+golbang_predicted_seconds_total 28.662052
+# HELP golbang_prompt_tokens_per_second Lifetime average prefill throughput.
+# TYPE golbang_prompt_tokens_per_second gauge
+golbang_prompt_tokens_per_second 68.8850
+# HELP golbang_predicted_tokens_per_second Lifetime average decode throughput.
+# TYPE golbang_predicted_tokens_per_second gauge
+golbang_predicted_tokens_per_second 8.1641
+# HELP golbang_ttft_ms Time to first token (histogram).
+# TYPE golbang_ttft_ms histogram
+golbang_ttft_ms_bucket{le="1"} 0
+golbang_ttft_ms_bucket{le="5"} 0
+golbang_ttft_ms_bucket{le="10"} 0
+golbang_ttft_ms_bucket{le="25"} 0
+golbang_ttft_ms_bucket{le="50"} 0
+golbang_ttft_ms_bucket{le="100"} 0
+golbang_ttft_ms_bucket{le="500"} 3
+golbang_ttft_ms_bucket{le="+Inf"} 7
+golbang_ttft_ms_sum 0
+golbang_ttft_ms_count 10
+# HELP golbang_itl_ms Inter-token latency (histogram).
+# TYPE golbang_itl_ms histogram
+golbang_itl_ms_bucket{le="1"} 0
+golbang_itl_ms_bucket{le="5"} 0
+golbang_itl_ms_bucket{le="10"} 0
+golbang_itl_ms_bucket{le="25"} 0
+golbang_itl_ms_bucket{le="50"} 0
+golbang_itl_ms_bucket{le="100"} 0
+golbang_itl_ms_bucket{le="500"} 227
+golbang_itl_ms_bucket{le="+Inf"} 0
+golbang_itl_ms_sum 0
+golbang_itl_ms_count 227
+# HELP golbang_slot_occupancy Average active slots per iteration.
+# TYPE golbang_slot_occupancy gauge
+golbang_slot_occupancy 0.9190283400809717  # total=227 samples=247
+# HELP golbang_queue_depth Average waiting jobs per iteration.
+# TYPE golbang_queue_depth gauge
+golbang_queue_depth 0.09716599190283401  # total=24 samples=247
+# HELP golbang_http_503_total 503 responses served.
+# TYPE golbang_http_503_total counter
+golbang_http_503_total 2
+# HELP golbang_iterations_total Scheduler loop iterations.
+# TYPE golbang_iterations_total counter
+golbang_iterations_total 247
+# HELP golbang_decodes_total Decode submissions.
+# TYPE golbang_decodes_total counter
+golbang_decodes_total 237
+# HELP golbang_evicts_total Finished/cancelled slot evictions.
+# TYPE golbang_evicts_total counter
+golbang_evicts_total 10
