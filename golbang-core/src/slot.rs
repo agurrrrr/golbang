@@ -36,6 +36,9 @@ pub enum SlotPhase {
 pub(crate) struct ActiveJob {
     pub request_id: u64,
     pub prompt_tokens: Vec<Token>,
+    /// Start index for prefill. Tokens `[0..prompt_offset)` were reused from
+    /// the slot's prefix cache (P3) and are NOT re-prefilled.
+    pub prompt_offset: usize,
     pub prompt_pos: usize,
     pub n_past: u32,
     pub n_generated: u32,
@@ -50,12 +53,17 @@ pub(crate) struct ActiveJob {
     pub deadline: Option<Instant>,
     pub events: mpsc::UnboundedSender<SlotEvent>,
     pub finish: Option<FinishReason>,
+    /// P3 metrics: when the slot was first occupied (TTFT baseline).
+    pub started: Instant,
+    /// P3 metrics: timestamp of the most recently emitted token (ITL delta).
+    pub last_token_at: Instant,
 }
 
 impl ActiveJob {
     pub fn from_parts(
         request_id: u64,
         tokens: Vec<Token>,
+        prompt_offset: usize,
         params: GenerateParams,
         cancel: CancellationToken,
         timeout: Option<Duration>,
@@ -69,8 +77,9 @@ impl ActiveJob {
         Self {
             request_id,
             prompt_tokens: tokens,
+            prompt_offset,
             prompt_pos: 0,
-            n_past: 0,
+            n_past: prompt_offset as u32,
             n_generated: 0,
             n_prompt,
             max_tokens,
@@ -88,6 +97,8 @@ impl ActiveJob {
             deadline,
             events,
             finish: None,
+            started: Instant::now(),
+            last_token_at: Instant::now(),
         }
     }
 
@@ -105,6 +116,7 @@ impl ActiveJob {
         Self::from_parts(
             0,
             prompt_tokens,
+            0,
             GenerateParams::default(),
             CancellationToken::new(),
             None,
@@ -118,6 +130,8 @@ pub struct Slot {
     pub id: SlotId,
     pub phase: SlotPhase,
     pub(crate) job: Option<ActiveJob>,
+    /// P3 prefix cache for this slot's sequence KV.
+    pub prefix_cache: crate::prefix_cache::SlotPrefixCache,
 }
 
 impl Slot {
@@ -126,6 +140,7 @@ impl Slot {
             id,
             phase: SlotPhase::Empty,
             job: None,
+            prefix_cache: Default::default(),
         }
     }
 
@@ -145,5 +160,49 @@ impl Slot {
     pub(crate) fn evict(&mut self) -> Option<ActiveJob> {
         self.phase = SlotPhase::Empty;
         self.job.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generate::GenerateParams;
+
+    #[test]
+    fn from_parts_seeds_n_past_from_reuse_len() {
+        // P3: when a prefix is reused (prompt_offset > 0), n_past must be
+        // seeded at reuse_len so prefill continues from the suffix.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let job = ActiveJob::from_parts(
+            7,
+            vec![1, 2, 3, 4],
+            2, // reused prefix length
+            GenerateParams::default(),
+            CancellationToken::new(),
+            None,
+            tx,
+            256,
+        );
+        assert_eq!(job.prompt_offset, 2);
+        assert_eq!(job.n_past, 2, "n_past seeded at reuse_len");
+        assert_eq!(job.prompt_pos, 0);
+        assert_eq!(job.n_prompt, 4);
+    }
+
+    #[test]
+    fn from_parts_no_reuse_starts_at_zero() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let job = ActiveJob::from_parts(
+            8,
+            vec![9],
+            0,
+            GenerateParams::default(),
+            CancellationToken::new(),
+            None,
+            tx,
+            256,
+        );
+        assert_eq!(job.prompt_offset, 0);
+        assert_eq!(job.n_past, 0);
     }
 }

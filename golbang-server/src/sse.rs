@@ -81,7 +81,16 @@ pub fn stream_completion(
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
-    state.scheduler.try_submit(job)?;
+    if let Err(e) = state.scheduler.try_submit(job) {
+        if matches!(e, golbang_core::SubmitError::Full) {
+            state
+                .scheduler
+                .metrics
+                .service_unavailable_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Err(e.into());
+    }
 
     tokio::spawn(async move {
         if send_chunk(
@@ -197,7 +206,16 @@ pub async fn complete(
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
-    state.scheduler.try_submit(job)?;
+    if let Err(e) = state.scheduler.try_submit(job) {
+        if matches!(e, golbang_core::SubmitError::Full) {
+            state
+                .scheduler
+                .metrics
+                .service_unavailable_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Err(e.into());
+    }
 
     let mut content = String::new();
     let mut finish = None;

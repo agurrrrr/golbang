@@ -17,6 +17,27 @@ pub struct WaitingJobView {
     pub n_prompt: u32,
 }
 
+/// Per-iteration token budget for the unified batch (P3 §4.2 chunked prefill).
+///
+/// `decode_max` bounds how many decode tokens are admitted per iteration so a
+/// burst of prefill cannot starve already-running generation. `prefill_max`
+/// bounds how many prefill tokens one slot may consume per iteration, so a
+/// very long prompt is split across several iterations (chunked prefill).
+#[derive(Clone, Copy, Debug)]
+pub struct IterationBudget {
+    pub prefill_max: usize,
+    pub decode_max: usize,
+}
+
+impl Default for IterationBudget {
+    fn default() -> Self {
+        Self {
+            prefill_max: 32,
+            decode_max: 16,
+        }
+    }
+}
+
 pub trait SchedulePolicy: Send + 'static {
     fn name(&self) -> &'static str;
 
@@ -27,6 +48,12 @@ pub trait SchedulePolicy: Send + 'static {
     /// Extra evictions this iteration. Cancel / EOS / max_tokens are
     /// handled by the scheduler and must not be reimplemented here.
     fn evict(&mut self, active: &[SlotView]) -> Vec<SlotId>;
+
+    /// Per-iteration budget (P3 §4.2). Default keeps decode moving and
+    /// chunks prefill into 32-token slices.
+    fn budget(&self) -> IterationBudget {
+        IterationBudget::default()
+    }
 
     /// Order used to fill the unified batch. Default: slot id.
     fn rank(&self, active: &[SlotView]) -> Vec<SlotId> {

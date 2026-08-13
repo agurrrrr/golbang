@@ -1,4 +1,5 @@
 pub mod error;
+pub mod metrics;
 pub mod routes;
 pub mod sse;
 pub mod types;
@@ -18,5 +19,6 @@ pub fn router(state: AppState) -> axum::Router {
             "/v1/chat/completions",
             axum::routing::post(routes::chat_completions),
         )
+        .route("/metrics", axum::routing::get(metrics::metrics))
         .with_state(state)
 }

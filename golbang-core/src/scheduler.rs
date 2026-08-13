@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -85,6 +85,18 @@ pub struct SchedulerMetrics {
     pub joins: AtomicU64,
     pub evicts: AtomicU64,
     pub decodes: AtomicU64,
+    // P3 §4.3 observability — histogram buckets are coarse (ms).
+    // TTFT (time-to-first-token) and ITL (inter-token latency) buckets.
+    pub ttft_bucket_ms: [AtomicU64; 8],
+    pub itl_bucket_ms: [AtomicU64; 8],
+    /// Slot occupancy: sampled count of active slots per iteration.
+    pub slots_active_total: AtomicU64,
+    pub slots_active_samples: AtomicU64,
+    /// Queue depth: sampled waiting length per iteration.
+    pub queue_depth_total: AtomicU64,
+    pub queue_depth_samples: AtomicU64,
+    /// 503 responses served at the HTTP edge (incremented by the server).
+    pub service_unavailable_total: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -155,6 +167,14 @@ async fn run_loop(
         iter += 1;
         metrics.iterations.store(iter, Ordering::Relaxed);
 
+        // P3 §4.3: sample occupancy and queue depth each iteration.
+        let active = slots.iter().filter(|s| s.is_active()).count() as u64;
+        metrics.slots_active_total.fetch_add(active, Ordering::Relaxed);
+        metrics.slots_active_samples.fetch_add(1, Ordering::Relaxed);
+        let q = waiting.len() as u64;
+        metrics.queue_depth_total.fetch_add(q, Ordering::Relaxed);
+        metrics.queue_depth_samples.fetch_add(1, Ordering::Relaxed);
+
         while let Ok(job) = rx.try_recv() {
             waiting.push_back(job);
         }
@@ -182,7 +202,7 @@ async fn run_loop(
         if order.is_empty() {
             order = slots.iter().filter(|s| s.is_active()).map(|s| s.id).collect();
         }
-        let plan = builder.plan(&slots, &order);
+        let plan = builder.plan(&slots, &order, policy.budget());
 
         if plan.is_empty() {
             if !has_active(&slots) && waiting.is_empty() {
@@ -235,7 +255,7 @@ async fn run_loop(
         };
 
         apply_plan(&mut slots, &plan);
-        sample_and_emit(&mut slots, &plan, &logits, &engine, n_ctx_seq);
+        sample_and_emit(&mut slots, &plan, &logits, &engine, n_ctx_seq, &metrics);
         evict_finished(&mut slots, &engine, iter, &metrics);
     }
 }
@@ -336,18 +356,31 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         }));
         return false;
     }
-    engine.clear_seq(slot.id.0 as i32);
+    // P3 prefix reuse: the slot's cached prefix KV stays resident in seq.
+    // Only the suffix `[reuse_len..)` needs prefill.
+    let reuse_len = slot.prefix_cache.reuse(&tokens);
+    if reuse_len == 0 {
+        // No shared prefix → clear the slot's seq so positions start at 0.
+        engine.clear_seq(slot.id.0 as i32);
+    }
     let req = job.request_id;
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
         tokens,
+        reuse_len,
         job.params,
         job.cancel,
         job.timeout,
         job.events,
         n_ctx_seq,
     ));
-    tracing::debug!(slot = slot.id.0, request_id = req, n_prompt, "slot bound");
+    tracing::debug!(
+        slot = slot.id.0,
+        request_id = req,
+        n_prompt,
+        reused = reuse_len,
+        "slot bound"
+    );
     true
 }
 
@@ -374,12 +407,25 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan) {
     }
 }
 
+/// P3 §4.3: bucket a millisecond latency into a coarse histogram.
+/// Bucket bounds (ms): 1, 5, 10, 25, 50, 100, 500 (index 7 = overflow).
+const BUCKET_BOUNDS_MS: [u64; 8] = [1, 5, 10, 25, 50, 100, 500, u64::MAX];
+
+fn record_bucket(bucket: &[AtomicU64; 8], ms: u64) {
+    let idx = BUCKET_BOUNDS_MS
+        .iter()
+        .position(|b| ms <= *b)
+        .unwrap_or(7);
+    bucket[idx].fetch_add(1, Ordering::Relaxed);
+}
+
 fn sample_and_emit(
     slots: &mut [Slot],
     plan: &crate::batch::BatchPlan,
     logits: &[Vec<f32>],
     engine: &Engine,
     n_ctx_seq: u32,
+    metrics: &SchedulerMetrics,
 ) {
     for (row_i, slot_id) in plan.logit_slots.iter().enumerate() {
         let Some(row) = logits.get(row_i) else {
@@ -394,6 +440,18 @@ fn sample_and_emit(
         if job.finish.is_some() {
             continue;
         }
+
+        // P3 §4.3: TTFT is the first emitted token's latency from join.
+        // ITL is the per-token inter-arrival time for subsequent tokens.
+        let now = Instant::now();
+        if job.n_generated == 0 {
+            let ms = now.duration_since(job.started).as_millis() as u64;
+            record_bucket(&metrics.ttft_bucket_ms, ms);
+        } else {
+            let ms = now.duration_since(job.last_token_at).as_millis() as u64;
+            record_bucket(&metrics.itl_bucket_ms, ms);
+        }
+        job.last_token_at = now;
 
         let token = job.sampler.sample(row);
         if engine.is_eog(token) {

@@ -8,6 +8,7 @@ mod error;
 mod generate;
 mod model;
 mod policy;
+mod prefix_cache;
 mod sampler;
 mod scheduler;
 mod slot;
@@ -20,6 +21,7 @@ pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
 pub use model::{LoadParams, Model};
 pub use policy::{FifoPolicy, SchedulePolicy, SlotView, WaitingJobView};
+pub use prefix_cache::{common_prefix_len, PrefixStore, SlotPrefixCache};
 pub use sampler::{Sampler, SamplerParams};
 pub use scheduler::{
     spawn_scheduler, Job, SchedulerConfig, SchedulerHandle, SchedulerMetrics, SpawnedScheduler,
