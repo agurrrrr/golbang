@@ -7,11 +7,7 @@ use golbang_core::SchedulerHandle;
 
 const BUCKET_LE: [&str; 8] = ["1", "5", "10", "25", "50", "100", "500", "+Inf"];
 
-fn bucket_lines(
-    name: &str,
-    bucket: &[std::sync::atomic::AtomicU64; 8],
-    out: &mut String,
-) {
+fn bucket_lines(name: &str, bucket: &[std::sync::atomic::AtomicU64; 8], out: &mut String) {
     for (i, le) in BUCKET_LE.iter().enumerate() {
         let v = bucket[i].load(std::sync::atomic::Ordering::Relaxed);
         out.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {v}\n"));
@@ -24,15 +20,51 @@ pub fn render(scheduler: &SchedulerHandle) -> String {
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
 
     let mut out = String::new();
+    let prompt_tokens = load(&m.prompt_tokens_total);
+    let gen_tokens = load(&m.tokens_generated_total);
+    let prompt_s = load(&m.prompt_us_total) as f64 / 1e6;
+    let pred_s = load(&m.predicted_us_total) as f64 / 1e6;
+
     out.push_str("# HELP golbang_tokens_generated_total Tokens emitted to clients.\n");
     out.push_str("# TYPE golbang_tokens_generated_total counter\n");
-    // Derived: completion tokens are not counted directly; keep the counter
-    // for future wiring. Currently proxied from generated token events.
-    out.push_str("golbang_tokens_generated_total 0\n");
+    out.push_str(&format!("golbang_tokens_generated_total {gen_tokens}\n"));
 
-    out.push_str("# HELP golbang_prompt_tokens_total Prompt tokens accepted.\n");
+    out.push_str(
+        "# HELP golbang_prompt_tokens_total Prompt tokens prefilled (excludes cache reuse).\n",
+    );
     out.push_str("# TYPE golbang_prompt_tokens_total counter\n");
-    out.push_str("golbang_prompt_tokens_total 0\n");
+    out.push_str(&format!("golbang_prompt_tokens_total {prompt_tokens}\n"));
+
+    out.push_str("# HELP golbang_prompt_seconds_total Wall time spent prefilling.\n");
+    out.push_str("# TYPE golbang_prompt_seconds_total counter\n");
+    out.push_str(&format!("golbang_prompt_seconds_total {prompt_s:.6}\n"));
+
+    out.push_str("# HELP golbang_predicted_seconds_total Wall time spent generating.\n");
+    out.push_str("# TYPE golbang_predicted_seconds_total counter\n");
+    out.push_str(&format!("golbang_predicted_seconds_total {pred_s:.6}\n"));
+
+    let prompt_tps = if prompt_s > 0.0 {
+        prompt_tokens as f64 / prompt_s
+    } else {
+        0.0
+    };
+    let pred_tps = if pred_s > 0.0 {
+        gen_tokens as f64 / pred_s
+    } else {
+        0.0
+    };
+    out.push_str("# HELP golbang_prompt_tokens_per_second Lifetime average prefill throughput.\n");
+    out.push_str("# TYPE golbang_prompt_tokens_per_second gauge\n");
+    out.push_str(&format!(
+        "golbang_prompt_tokens_per_second {prompt_tps:.4}\n"
+    ));
+    out.push_str(
+        "# HELP golbang_predicted_tokens_per_second Lifetime average decode throughput.\n",
+    );
+    out.push_str("# TYPE golbang_predicted_tokens_per_second gauge\n");
+    out.push_str(&format!(
+        "golbang_predicted_tokens_per_second {pred_tps:.4}\n"
+    ));
 
     out.push_str("# HELP golbang_ttft_ms Time to first token (histogram).\n");
     out.push_str("# TYPE golbang_ttft_ms histogram\n");
@@ -83,7 +115,10 @@ pub fn render(scheduler: &SchedulerHandle) -> String {
 
     out.push_str("# HELP golbang_iterations_total Scheduler loop iterations.\n");
     out.push_str("# TYPE golbang_iterations_total counter\n");
-    out.push_str(&format!("golbang_iterations_total {}\n", load(&m.iterations)));
+    out.push_str(&format!(
+        "golbang_iterations_total {}\n",
+        load(&m.iterations)
+    ));
 
     out.push_str("# HELP golbang_decodes_total Decode submissions.\n");
     out.push_str("# TYPE golbang_decodes_total counter\n");
@@ -101,7 +136,10 @@ pub async fn metrics(state: axum::extract::State<crate::AppState>) -> axum::resp
     let body = render(&state.scheduler);
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )
         .body(axum::body::Body::from(body))
         .unwrap()
 }

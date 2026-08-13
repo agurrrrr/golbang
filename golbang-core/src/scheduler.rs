@@ -2,8 +2,8 @@
 //! GPU work is `spawn_blocking`; HTTP `try_submit` never waits on decode.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -15,7 +15,7 @@ use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
 use crate::policy::{SchedulePolicy, SlotView, WaitingJobView};
-use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase};
+use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 
 #[derive(Debug)]
 pub enum SubmitError {
@@ -97,6 +97,13 @@ pub struct SchedulerMetrics {
     pub queue_depth_samples: AtomicU64,
     /// 503 responses served at the HTTP edge (incremented by the server).
     pub service_unavailable_total: AtomicU64,
+    /// Prompt tokens actually prefilled (excludes prefix-cache reuse).
+    pub prompt_tokens_total: AtomicU64,
+    /// Completion tokens sampled and emitted.
+    pub tokens_generated_total: AtomicU64,
+    /// Accumulated prefill / decode wall time (microseconds).
+    pub prompt_us_total: AtomicU64,
+    pub predicted_us_total: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -153,7 +160,11 @@ async fn run_loop(
     let n = config.n_parallel.max(1) as usize;
     let n_seq_max = engine.n_seq_max() as usize;
     if n > n_seq_max {
-        tracing::error!(n_parallel = n, n_seq_max, "n_parallel exceeds context n_seq_max");
+        tracing::error!(
+            n_parallel = n,
+            n_seq_max,
+            "n_parallel exceeds context n_seq_max"
+        );
         return;
     }
 
@@ -169,7 +180,9 @@ async fn run_loop(
 
         // P3 §4.3: sample occupancy and queue depth each iteration.
         let active = slots.iter().filter(|s| s.is_active()).count() as u64;
-        metrics.slots_active_total.fetch_add(active, Ordering::Relaxed);
+        metrics
+            .slots_active_total
+            .fetch_add(active, Ordering::Relaxed);
         metrics.slots_active_samples.fetch_add(1, Ordering::Relaxed);
         let q = waiting.len() as u64;
         metrics.queue_depth_total.fetch_add(q, Ordering::Relaxed);
@@ -200,7 +213,11 @@ async fn run_loop(
 
         let mut order = policy.rank(&slot_views(&slots));
         if order.is_empty() {
-            order = slots.iter().filter(|s| s.is_active()).map(|s| s.id).collect();
+            order = slots
+                .iter()
+                .filter(|s| s.is_active())
+                .map(|s| s.id)
+                .collect();
         }
         let plan = builder.plan(&slots, &order, policy.budget());
 
@@ -255,6 +272,7 @@ async fn run_loop(
         };
 
         apply_plan(&mut slots, &plan);
+        maybe_log_prefill_progress(&mut slots);
         sample_and_emit(&mut slots, &plan, &logits, &engine, n_ctx_seq, &metrics);
         evict_finished(&mut slots, &engine, iter, &metrics);
     }
@@ -286,7 +304,11 @@ fn join_waiting(
     iter: u64,
     metrics: &SchedulerMetrics,
 ) {
-    let empty: Vec<SlotId> = slots.iter().filter(|s| s.is_empty()).map(|s| s.id).collect();
+    let empty: Vec<SlotId> = slots
+        .iter()
+        .filter(|s| s.is_empty())
+        .map(|s| s.id)
+        .collect();
     if empty.is_empty() || waiting.is_empty() {
         return;
     }
@@ -392,12 +414,19 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan) {
                 job.n_past += *take;
                 if job.prompt_pos >= job.prompt_tokens.len() {
                     slot.phase = SlotPhase::Decoding;
+                    if job.generation_started_at.is_none() {
+                        job.generation_started_at = Some(Instant::now());
+                    }
                 }
             }
         }
     }
     for tok in &plan.tokens {
-        if !plan.prefill_consumed.iter().any(|(id, _)| id.0 as i32 == tok.seq_id) {
+        if !plan
+            .prefill_consumed
+            .iter()
+            .any(|(id, _)| id.0 as i32 == tok.seq_id)
+        {
             if let Some(slot) = slots.iter_mut().find(|s| s.id.0 as i32 == tok.seq_id) {
                 if let Some(job) = slot.job.as_mut() {
                     job.n_past = (tok.pos as u32).saturating_add(1);
@@ -412,10 +441,7 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan) {
 const BUCKET_BOUNDS_MS: [u64; 8] = [1, 5, 10, 25, 50, 100, 500, u64::MAX];
 
 fn record_bucket(bucket: &[AtomicU64; 8], ms: u64) {
-    let idx = BUCKET_BOUNDS_MS
-        .iter()
-        .position(|b| ms <= *b)
-        .unwrap_or(7);
+    let idx = BUCKET_BOUNDS_MS.iter().position(|b| ms <= *b).unwrap_or(7);
     bucket[idx].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -447,6 +473,9 @@ fn sample_and_emit(
         if job.n_generated == 0 {
             let ms = now.duration_since(job.started).as_millis() as u64;
             record_bucket(&metrics.ttft_bucket_ms, ms);
+            if job.generation_started_at.is_none() {
+                job.generation_started_at = Some(now);
+            }
         } else {
             let ms = now.duration_since(job.last_token_at).as_millis() as u64;
             record_bucket(&metrics.itl_bucket_ms, ms);
@@ -472,6 +501,7 @@ fn sample_and_emit(
         job.n_generated += 1;
         job.pending = Some(token);
         slot.phase = SlotPhase::Decoding;
+        maybe_log_decode_progress(slot.id.0, job);
 
         if job.n_generated >= job.max_tokens {
             piece.push_str(&job.utf8.flush());
@@ -538,6 +568,9 @@ fn finish_slot(
     let id = slot.id;
     if let Some(job) = slot.evict() {
         engine.clear_seq(id.0 as i32);
+        let timings = job.timings(Instant::now());
+        record_request_totals(metrics, &timings);
+        log_slot_timings(id.0, job.request_id, reason.as_str(), &timings);
         let ev = match reason {
             FinishReason::Cancelled => SlotEvent::Failed(Error::Cancelled),
             FinishReason::Timeout => SlotEvent::Failed(Error::Timeout),
@@ -545,6 +578,7 @@ fn finish_slot(
                 reason: other,
                 prompt_tokens: job.n_prompt,
                 completion_tokens: job.n_generated,
+                timings,
             },
         };
         let _ = job.events.send(ev);
@@ -557,6 +591,135 @@ fn finish_slot(
             "evict"
         );
     }
+}
+
+fn record_request_totals(metrics: &SchedulerMetrics, t: &SlotTimings) {
+    metrics
+        .prompt_tokens_total
+        .fetch_add(u64::from(t.prompt_n), Ordering::Relaxed);
+    metrics
+        .tokens_generated_total
+        .fetch_add(u64::from(t.predicted_n), Ordering::Relaxed);
+    metrics
+        .prompt_us_total
+        .fetch_add((t.prompt_ms * 1e3) as u64, Ordering::Relaxed);
+    metrics
+        .predicted_us_total
+        .fetch_add((t.predicted_ms * 1e3) as u64, Ordering::Relaxed);
+}
+
+fn log_slot_timings(slot: u32, request_id: u64, reason: &str, t: &SlotTimings) {
+    tracing::info!(
+        "slot print_timing: id {slot} | task {request_id} | reason {reason} | cache_n {}",
+        t.cache_n
+    );
+    tracing::info!(
+        "prompt eval time = {:10.2} ms / {:5} tokens ({:8.2} ms per token, {:8.2} tokens per second)",
+        t.prompt_ms,
+        t.prompt_n,
+        t.prompt_per_token_ms(),
+        t.prompt_per_second(),
+    );
+    tracing::info!(
+        "       eval time = {:10.2} ms / {:5} tokens ({:8.2} ms per token, {:8.2} tokens per second)",
+        t.predicted_ms,
+        t.predicted_n,
+        t.predicted_per_token_ms(),
+        t.predicted_per_second(),
+    );
+    tracing::info!(
+        "      total time = {:10.2} ms / {:5} tokens",
+        t.total_ms(),
+        t.total_n(),
+    );
+}
+
+/// llama-server `print_timings_pp`: long prefills emit a progress line every 3s.
+fn maybe_log_prefill_progress(slots: &mut [Slot]) {
+    const MIN_MS: u128 = 3000;
+    for slot in slots.iter_mut() {
+        if slot.phase != SlotPhase::Prefilling {
+            continue;
+        }
+        let Some(job) = slot.job.as_mut() else {
+            continue;
+        };
+        let elapsed = job.started.elapsed();
+        if elapsed.as_millis() < MIN_MS {
+            continue;
+        }
+        if job.last_progress_at.elapsed().as_millis() < MIN_MS {
+            continue;
+        }
+        let processed = job.prompt_pos as u32;
+        let remaining = job
+            .prompt_tokens
+            .len()
+            .saturating_sub(job.prompt_offset + job.prompt_pos) as u32;
+        let total = processed.saturating_add(remaining);
+        let progress = if total == 0 {
+            1.0
+        } else {
+            f64::from(processed) / f64::from(total)
+        };
+        let secs = elapsed.as_secs_f64();
+        let tps = if secs > 0.0 {
+            f64::from(processed) / secs
+        } else {
+            0.0
+        };
+        tracing::info!(
+            slot = slot.id.0,
+            request_id = job.request_id,
+            n_tokens = processed,
+            progress,
+            tps,
+            "prompt processing, n_tokens = {processed}, progress = {progress:.2}, t = {secs:.2} s / {tps:.2} tokens per second"
+        );
+        job.last_progress_at = Instant::now();
+        job.last_progress_n = processed;
+    }
+}
+
+/// llama-server `print_timings_tg`: running decode speed after 100 tokens, every 3s.
+fn maybe_log_decode_progress(slot: u32, job: &mut ActiveJob) {
+    const MIN_DECODED: u32 = 100;
+    const MIN_MS: u128 = 3000;
+    if job.n_generated < MIN_DECODED {
+        return;
+    }
+    if job.last_progress_at.elapsed().as_millis() < MIN_MS {
+        return;
+    }
+    let Some(started_gen) = job.generation_started_at else {
+        return;
+    };
+    let gen_secs = started_gen.elapsed().as_secs_f64();
+    let tg = if gen_secs > 0.0 {
+        f64::from(job.n_generated) / gen_secs
+    } else {
+        0.0
+    };
+    let win_n = job.n_generated.saturating_sub(job.last_progress_n);
+    let win_secs = job.last_progress_at.elapsed().as_secs_f64();
+    let tg_3s = if win_secs > 0.0 {
+        f64::from(win_n) / win_secs
+    } else {
+        0.0
+    };
+    tracing::info!(
+        slot,
+        request_id = job.request_id,
+        n_decoded = job.n_generated,
+        tg,
+        tg_3s,
+        "n_decoded = {:6}, tg = {:6.2} t/s, tg_3s = {:6.2} t/s",
+        job.n_generated,
+        tg,
+        tg_3s,
+    );
+    job.last_progress_at = Instant::now();
+    job.last_progress_n = job.n_generated;
 }
 
 fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
@@ -575,7 +738,12 @@ mod tests {
 
     fn dummy_job() -> Job {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Job::new("hi".into(), GenerateParams::default(), CancellationToken::new(), tx)
+        Job::new(
+            "hi".into(),
+            GenerateParams::default(),
+            CancellationToken::new(),
+            tx,
+        )
     }
 
     #[tokio::test]
@@ -586,7 +754,10 @@ mod tests {
             metrics: Arc::new(SchedulerMetrics::default()),
         };
         assert!(handle.try_submit(dummy_job()).is_ok());
-        assert!(matches!(handle.try_submit(dummy_job()), Err(SubmitError::Full)));
+        assert!(matches!(
+            handle.try_submit(dummy_job()),
+            Err(SubmitError::Full)
+        ));
     }
 }
 
@@ -799,8 +970,10 @@ mod gpu_tests {
         cancel.cancel();
         let end = tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(ev) = rx.recv().await {
-                if matches!(ev, SlotEvent::Failed(Error::Cancelled) | SlotEvent::Finished { .. })
-                {
+                if matches!(
+                    ev,
+                    SlotEvent::Failed(Error::Cancelled) | SlotEvent::Finished { .. }
+                ) {
                     return ev;
                 }
             }

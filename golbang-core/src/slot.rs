@@ -19,8 +19,60 @@ pub enum SlotEvent {
         reason: FinishReason,
         prompt_tokens: u32,
         completion_tokens: u32,
+        timings: SlotTimings,
     },
     Failed(Error),
+}
+
+/// llama-server-compatible per-request timings (ms / tok/s).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SlotTimings {
+    /// Prefix tokens reused from the slot cache (not prefilled this request).
+    pub cache_n: u32,
+    /// Prompt tokens actually prefilled this request.
+    pub prompt_n: u32,
+    pub prompt_ms: f64,
+    /// Generated tokens (sampled).
+    pub predicted_n: u32,
+    pub predicted_ms: f64,
+}
+
+impl SlotTimings {
+    pub fn prompt_per_token_ms(self) -> f64 {
+        rate_ms(self.prompt_ms, self.prompt_n)
+    }
+
+    pub fn prompt_per_second(self) -> f64 {
+        tokens_per_second(self.prompt_ms, self.prompt_n)
+    }
+
+    pub fn predicted_per_token_ms(self) -> f64 {
+        rate_ms(self.predicted_ms, self.predicted_n)
+    }
+
+    pub fn predicted_per_second(self) -> f64 {
+        tokens_per_second(self.predicted_ms, self.predicted_n)
+    }
+
+    pub fn total_ms(self) -> f64 {
+        self.prompt_ms + self.predicted_ms
+    }
+
+    pub fn total_n(self) -> u32 {
+        self.prompt_n.saturating_add(self.predicted_n)
+    }
+}
+
+fn rate_ms(ms: f64, n: u32) -> f64 {
+    if n == 0 { 0.0 } else { ms / f64::from(n) }
+}
+
+fn tokens_per_second(ms: f64, n: u32) -> f64 {
+    if n == 0 || ms <= 0.0 {
+        0.0
+    } else {
+        1e3 / ms * f64::from(n)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +109,11 @@ pub(crate) struct ActiveJob {
     pub started: Instant,
     /// P3 metrics: timestamp of the most recently emitted token (ITL delta).
     pub last_token_at: Instant,
+    /// Prefill finished (generation clock). None while still prefilling.
+    pub generation_started_at: Option<Instant>,
+    /// Last journal progress line (prefill >3s / decode every 3s after 100 toks).
+    pub last_progress_at: Instant,
+    pub last_progress_n: u32,
 }
 
 impl ActiveJob {
@@ -73,7 +130,8 @@ impl ActiveJob {
         let n_prompt = tokens.len() as u32;
         let remaining = n_ctx_seq.saturating_sub(n_prompt).max(1);
         let max_tokens = params.max_tokens.max(1).min(remaining);
-        let deadline = timeout.map(|d| Instant::now() + d);
+        let now = Instant::now();
+        let deadline = timeout.map(|d| now + d);
         Self {
             request_id,
             prompt_tokens: tokens,
@@ -97,8 +155,34 @@ impl ActiveJob {
             deadline,
             events,
             finish: None,
-            started: Instant::now(),
-            last_token_at: Instant::now(),
+            started: now,
+            last_token_at: now,
+            generation_started_at: None,
+            last_progress_at: now,
+            last_progress_n: 0,
+        }
+    }
+
+    pub fn timings(&self, now: Instant) -> SlotTimings {
+        let (prompt_ms, predicted_ms) = match self.generation_started_at {
+            Some(decode_t0) => (
+                decode_t0
+                    .saturating_duration_since(self.started)
+                    .as_secs_f64()
+                    * 1e3,
+                now.saturating_duration_since(decode_t0).as_secs_f64() * 1e3,
+            ),
+            None => (
+                now.saturating_duration_since(self.started).as_secs_f64() * 1e3,
+                0.0,
+            ),
+        };
+        SlotTimings {
+            cache_n: self.prompt_offset as u32,
+            prompt_n: self.n_prompt.saturating_sub(self.prompt_offset as u32),
+            prompt_ms,
+            predicted_n: self.n_generated,
+            predicted_ms,
         }
     }
 
@@ -204,5 +288,60 @@ mod tests {
         );
         assert_eq!(job.prompt_offset, 0);
         assert_eq!(job.n_past, 0);
+    }
+
+    #[test]
+    fn timings_rates_match_llama_server_formula() {
+        let t = SlotTimings {
+            cache_n: 2,
+            prompt_n: 100,
+            prompt_ms: 2000.0,
+            predicted_n: 50,
+            predicted_ms: 5000.0,
+        };
+        assert!((t.prompt_per_token_ms() - 20.0).abs() < 1e-9);
+        assert!((t.prompt_per_second() - 50.0).abs() < 1e-9);
+        assert!((t.predicted_per_token_ms() - 100.0).abs() < 1e-9);
+        assert!((t.predicted_per_second() - 10.0).abs() < 1e-9);
+        assert!((t.total_ms() - 7000.0).abs() < 1e-9);
+        assert_eq!(t.total_n(), 150);
+    }
+
+    #[test]
+    fn timings_zero_tokens_or_ms_are_zero_not_inf() {
+        let empty = SlotTimings::default();
+        assert_eq!(empty.prompt_per_second(), 0.0);
+        assert_eq!(empty.predicted_per_second(), 0.0);
+        assert_eq!(empty.prompt_per_token_ms(), 0.0);
+        let no_time = SlotTimings {
+            predicted_n: 8,
+            predicted_ms: 0.0,
+            ..SlotTimings::default()
+        };
+        assert_eq!(no_time.predicted_per_second(), 0.0);
+    }
+
+    #[test]
+    fn timings_splits_prefill_and_decode_clocks() {
+        let mut job = ActiveJob::for_test(vec![1, 2, 3, 4]);
+        job.prompt_offset = 1;
+        job.n_prompt = 4;
+        job.n_generated = 8;
+        job.generation_started_at = Some(job.started + Duration::from_millis(200));
+        let now = job.started + Duration::from_millis(700);
+        let t = job.timings(now);
+        assert_eq!(t.cache_n, 1);
+        assert_eq!(t.prompt_n, 3);
+        assert_eq!(t.predicted_n, 8);
+        assert!(
+            (t.prompt_ms - 200.0).abs() < 1.0,
+            "prompt_ms={}",
+            t.prompt_ms
+        );
+        assert!(
+            (t.predicted_ms - 500.0).abs() < 1.0,
+            "predicted_ms={}",
+            t.predicted_ms
+        );
     }
 }

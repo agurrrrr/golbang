@@ -55,6 +55,38 @@ pub struct ChatCompletion {
     pub model: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
+}
+
+/// llama-server `timings` object (prompt / predicted tok/s).
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Timings {
+    pub cache_n: u32,
+    pub prompt_n: u32,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: u32,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+}
+
+impl From<golbang_core::SlotTimings> for Timings {
+    fn from(t: golbang_core::SlotTimings) -> Self {
+        Self {
+            cache_n: t.cache_n,
+            prompt_n: t.prompt_n,
+            prompt_ms: t.prompt_ms,
+            prompt_per_token_ms: t.prompt_per_token_ms(),
+            prompt_per_second: t.prompt_per_second(),
+            predicted_n: t.predicted_n,
+            predicted_ms: t.predicted_ms,
+            predicted_per_token_ms: t.predicted_per_token_ms(),
+            predicted_per_second: t.predicted_per_second(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +118,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,5 +186,35 @@ mod tests {
             stop: None,
         };
         assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn timings_json_matches_llama_server_keys() {
+        let t = Timings {
+            cache_n: 2,
+            prompt_n: 8,
+            prompt_ms: 100.0,
+            prompt_per_token_ms: 12.5,
+            prompt_per_second: 80.0,
+            predicted_n: 16,
+            predicted_ms: 2000.0,
+            predicted_per_token_ms: 125.0,
+            predicted_per_second: 8.0,
+        };
+        let v = serde_json::to_value(t).unwrap();
+        for key in [
+            "cache_n",
+            "prompt_n",
+            "prompt_ms",
+            "prompt_per_token_ms",
+            "prompt_per_second",
+            "predicted_n",
+            "predicted_ms",
+            "predicted_per_token_ms",
+            "predicted_per_second",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
+        assert!((v["predicted_per_second"].as_f64().unwrap() - 8.0).abs() < 1e-9);
     }
 }

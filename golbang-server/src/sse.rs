@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
-    Delta, Usage,
+    Delta, Timings, Usage,
 };
 
 pub fn completion_id() -> String {
@@ -128,6 +128,7 @@ pub fn stream_completion(
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .is_err()
@@ -159,10 +160,13 @@ pub fn stream_completion(
                             reasoning_content: split.reasoning,
                         },
                         None,
+                        None,
                     )
                     .await
                 }
-                SlotEvent::Finished { reason, .. } => {
+                SlotEvent::Finished {
+                    reason, timings, ..
+                } => {
                     let split = parser.finish();
                     if !split.is_empty() {
                         let _ = send_chunk(
@@ -176,6 +180,7 @@ pub fn stream_completion(
                                 reasoning_content: split.reasoning,
                             },
                             None,
+                            None,
                         )
                         .await;
                     }
@@ -186,10 +191,19 @@ pub fn stream_completion(
                         &model_name,
                         Delta::default(),
                         Some(reason.as_str().to_string()),
+                        Some(Timings::from(timings)),
                     )
                     .await;
                     let _ = sse_tx.send(Event::default().data("[DONE]")).await;
-                    tracing::info!(streamed = n, finish = reason.as_str(), "sse finished");
+                    tracing::info!(
+                        streamed = n,
+                        finish = reason.as_str(),
+                        prompt_n = timings.prompt_n,
+                        prompt_tps = format!("{:.2}", timings.prompt_per_second()),
+                        predicted_n = timings.predicted_n,
+                        predicted_tps = format!("{:.2}", timings.predicted_per_second()),
+                        "sse finished"
+                    );
                     r
                 }
                 SlotEvent::Failed(e) => {
@@ -222,6 +236,7 @@ async fn send_chunk(
     model: &str,
     delta: Delta,
     finish_reason: Option<String>,
+    timings: Option<Timings>,
 ) -> Result<(), ()> {
     let chunk = ChatCompletionChunk {
         id: id.to_string(),
@@ -233,6 +248,7 @@ async fn send_chunk(
             delta,
             finish_reason,
         }],
+        timings,
     };
     let data = serde_json::to_string(&chunk).map_err(|_| ())?;
     tx.send(Event::default().data(data)).await.map_err(|_| ())
@@ -271,6 +287,7 @@ pub async fn complete(
     let mut finish = None;
     let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u32;
+    let mut timings = None;
 
     while let Some(ev) = ev_rx.recv().await {
         match ev {
@@ -287,6 +304,7 @@ pub async fn complete(
                 reason,
                 prompt_tokens: p,
                 completion_tokens: c,
+                timings: t,
             } => {
                 let split = parser.finish();
                 if let Some(r) = split.reasoning {
@@ -298,18 +316,30 @@ pub async fn complete(
                 finish = Some(reason.as_str().to_string());
                 prompt_tokens = p;
                 completion_tokens = c;
+                timings = Some(Timings::from(t));
                 break;
             }
             SlotEvent::Failed(e) => return Err(e.into()),
         }
     }
 
-    tracing::info!(
-        prompt_tokens,
-        completion_tokens,
-        finish = ?finish,
-        "json completion finished"
-    );
+    if let Some(t) = timings {
+        tracing::info!(
+            prompt_tokens,
+            completion_tokens,
+            finish = ?finish,
+            prompt_tps = format!("{:.2}", t.prompt_per_second),
+            predicted_tps = format!("{:.2}", t.predicted_per_second),
+            "json completion finished"
+        );
+    } else {
+        tracing::info!(
+            prompt_tokens,
+            completion_tokens,
+            finish = ?finish,
+            "json completion finished"
+        );
+    }
 
     Ok(ChatCompletion {
         id,
@@ -334,5 +364,6 @@ pub async fn complete(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
+        timings,
     })
 }

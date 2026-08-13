@@ -31,6 +31,6 @@ pub use scheduler::{
     Job, SchedulerConfig, SchedulerHandle, SchedulerMetrics, SpawnedScheduler, SubmitError,
     spawn_scheduler,
 };
-pub use slot::{Slot, SlotEvent, SlotId, SlotPhase};
+pub use slot::{Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 pub use tokenizer::{Token, Tokenizer};
 pub use tokio_util::sync::CancellationToken;
