@@ -54,13 +54,16 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 |------|---------------------------|
 | 트리 | `/home/agurrrrr/code/local-llm/llama.cpp` |
 | `git rev-parse HEAD` | `5b474eb69dac2d7c26ba8855310d3b60e02a5c4f` (`5b474eb69`) |
-| 커밋 시각 | 2026-08-06 18:56:34 +0900 |
-| `libggml-hip.so.0` 빌드 시각 | 2026-08-06 19:01:11 +0900 |
-| `libllama.so.0` 빌드 시각 | 2026-08-06 19:01:35 +0900 |
+| **커밋 시각** (git 기록 기준) | 2026-08-06 18:56:34 +0900 |
+| **`libggml-hip.so.0` 빌드 시각** (.so mtime 기준) | 2026-08-06 19:01:11 +0900 |
+| **`libllama.so.0` 빌드 시각** (.so mtime 기준) | 2026-08-06 19:01:35 +0900 |
 | gfx906 코드 | `strings build/bin/libggml-hip.so \| grep gfx906` — 포함 확인됨 |
 | bindgen 입력 | **이 SHA의** `include/llama.h` (1611줄). 라이브 최신 헤더 금지 |
 | 현행 로드 API | `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free` |
 | DEPRECATED | `llama_load_model_from_file` / `llama_new_context_with_model` / `llama_free_model` |
+
+> **라벨 구분 (2026-08-13 리뷰 반영):** "커밋 시각"(git 기록)과 ".so 빌드 시각"(.so mtime)은 **서로 다른 값**이다.
+> ADR/README에는 간결히 "빌드 2026-08-06 19:01"로 쓰되, P0 표에서는 위처럼 두 시각을 명시적으로 구분해 둔다.
 
 같은 디렉터리의 다른 HEAD (섞지 말 것):
 
@@ -126,6 +129,11 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
   7. 토큰이 유효 범위 내인지 assert
   8. 자원 해제
 - [ ] **실행 확인:** `cargo test -p golbang-sys -- --nocapture`가 gfx906에서 panic/segfault 없이 통과.
+- [ ] **CPU 폴백 검증 (구체):**
+  - `llama_backend_init` 로그에서 `backend: HIP`(및 장치명에 gfx906/0x66a1)가 보이는지 확인.
+  - `llama_model_load_from_file` 호출 후 **오프로드된 레이어 수**를 assert한다
+    (`llama_model_n_layers` 대비 `n_gpu_layers` 설정이 실제로 반영됐는지).
+  - `n_gpu_layers` 명시만으로 "CPU 폴백 아님"을 단정하지 않는다.
 
 ### 4.5 안전성 / 디버깅
 
@@ -142,7 +150,10 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 - [ ] `GOLBANG_TEST_MODEL`로 소형 GGUF를 지정해 `cargo test -p golbang-sys -- --nocapture` 통과
 - [ ] 테스트 프롬프트는 `"Hello"`
 - [ ] `llama_decode` 1회 후 argmax 토큰이 `[0, n_vocab)`
-- [ ] 로그에 HIP / gfx906이 보이고 CPU 폴백이 아님 (`n_gpu_layers` 명시)
+- [ ] 로그에 HIP / gfx906이 보이고 CPU 폴백이 아님:
+  - `llama_backend_init` 로그에서 `backend: HIP` 확인
+  - 오프로드 레이어 수 assert (`n_gpu_layers` 설정이 실제 반영)
+- [ ] (선택) `LLAMA_LOG` 브릿지로 내부 로그도 `tracing`에 남김
 - [ ] 산출물 커밋
 - [ ] 이 문서 4.0 표의 SHA·빌드 시각이 구현에 쓴 값과 일치
 

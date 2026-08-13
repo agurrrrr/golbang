@@ -83,7 +83,9 @@ Qwen GGUF의 `tokenizer.chat_template`(jinja)를 이 API만으로 처리할 수 
 
 - [ ] `axum` 라우터: `POST /v1/chat/completions`.
 - [ ] 요청 스키마(OpenAI 호환): `model`, `messages[]`, `temperature`, `top_p`, `max_tokens`, `stream`.
-- [ ] `stream: true` → SSE. `false` → (선택) 전체 모아서 단일 JSON. P1은 SSE 우선.
+- [ ] `stream: true` → SSE. `stream: false` → **비스트리밍 전체 JSON 응답으로 P1 범위에서 확정 지원** (선택이 아니라 기본 동작).
+  - OpenAI 호환 서버는 비스트리밍 응답도 기본 지원해야 하므로 P2로 미루지 않는다.
+  - SSE와 동일한 `choices[].message.content` 스키마를 단일 JSON으로 반환.
 - [ ] SSE chunk 포맷: OpenAI `chat.completion.chunk` (`choices[].delta.content`). 종료 시 `data: [DONE]`.
 - [ ] 에러 응답: 모델 미로드 / 검증 실패 시 OpenAI 스타일 에러 JSON.
 - [ ] `messages`가 비어 있으면 **4xx** (본문에 이유를 명시).
@@ -100,7 +102,7 @@ Qwen GGUF의 `tokenizer.chat_template`(jinja)를 이 API만으로 처리할 수 
 - [ ] 각 SSE 이벤트의 `choices[].delta.content`가 **토큰 단위**로 오는지 확인.
 - [ ] EOS 또는 `max_tokens`에서 `data: [DONE]`으로 종료.
 - [ ] `{"messages":[]}` → 4xx.
-- [ ] `stream:false`로 전체 응답 JSON 확인(선택).
+- [ ] `stream:false`로 전체 JSON 응답 확인 (P1 기본 지원).
 
 ---
 
@@ -110,6 +112,7 @@ Qwen GGUF의 `tokenizer.chat_template`(jinja)를 이 API만으로 처리할 수 
 - [ ] `curl` SSE에서 `choices[].delta.content`가 **토큰 단위**로 출력
 - [ ] EOS/`max_tokens`에서 정상 종료 + `data: [DONE]`
 - [ ] 빈 `messages` → 4xx
+- [ ] `stream:false` 비스트리밍 JSON 응답도 정상 동작
 - [ ] ChatML 하드코딩 경로가 기본. 실패 시 raw 폴백 + 경고 로그가 남음
 - [ ] 산출물 커밋
 

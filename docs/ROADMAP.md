@@ -31,7 +31,7 @@
 - [ ] `golbang-server`: axum + SSE
 - [ ] **완료 기준:** `choices[].delta.content` 토큰 단위, EOS/`max_tokens` 시 `data: [DONE]`, 빈 messages는 4xx
 
-## P2 — 스케줄 정책이 교체 가능한 배치 루프
+## P2 — 동시성 코어: 스케줄 정책이 교체 가능한 배치 루프
 
 **목표:** HTTP/스케줄이 decode에 막히지 않고, iteration 경계에서 join/evict/취소가 관측되며, 정책을 Rust에서 교체할 수 있다.
 
@@ -72,6 +72,6 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 |------|--------|------|
 | P0 | FFI 바인딩 + gfx906 추론 1회 | `cargo test` 통과, 속도 하한 없음 |
 | P1 | OpenAI 호환 단일 스트리밍 | curl SSE + 4xx |
-| P2 | 교체 가능한 스케줄 루프 | P1 대비 TTFT + llama-server 기록 |
+| P2 | 동시성 코어 — 교체 가능한 스케줄 루프 | P1 대비 TTFT + llama-server 기록 |
 | P3 | 성능 최적화 | 공정 조건 벤치 |
 | P4 | Rust 커널 일부 (선택) | gate 통과 후, 회귀 없음 |
