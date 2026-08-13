@@ -55,22 +55,22 @@ gate에 "프로파일이 특정 커널을 지목"이 있다. **그 프로파일�
 
 ### 4.0 선행 확인
 
-- [ ] P5(#28)가 생산에서 `cache_n > 0` 인지 확인. 아니면 트레이스가
+- [x] P5(#28)가 생산에서 `cache_n > 0` 인지 확인. 아니면 트레이스가
       3k 전량 prefill GEMM에 먹혀 순위가 왜곡된다.
-- [ ] P5를 못 기다리면, 트레이스에 "전량 prefill / prefix hit"를 **따로** 찍고
+- [x] P5를 못 기다리면, 트레이스에 "전량 prefill / prefix hit"를 **따로** 찍고
       표에 구분한다. 기본은 P5 이후.
 
 ### 4.1 프로파일
 
-- [ ] 대상: `golbang-deepseek`와 같은 모델·옵션
+- [x] 대상: `golbang-deepseek`와 같은 모델·옵션
       (DSV4 IQ2_M, `--n-gpu-layers 99 --n-cpu-moe 32 --flash-attn on`,
       `--n-ctx 60000 --n-batch 5800 --n-ubatch 1024`).
-- [ ] GPU 클럭 고정 (`set_gpu_clocks.sh`).
-- [ ] `rocprof` / `rocprofv3`로 커널 디스패치 시간. 호스트 구간과 섞지 않는다.
-- [ ] 최소 두 구간:
+- [x] GPU 클럭 고정 (`set_gpu_clocks.sh`).
+- [x] `rocprof` / `rocprofv3`로 커널 디스패치 시간. 호스트 구간과 섞지 않는다.
+- [x] 최소 두 구간:
       1. prefill (긴 프롬프트, prefix hit 후 suffix)
       2. decode (생성 ≥50토큰)
-- [ ] 상위 커널 이름·호출 수·총 시간·비율을 `docs/bench/p6.md`에 표로 남긴다.
+- [x] 상위 커널 이름·호출 수·총 시간·비율을 `docs/bench/p6.md`에 표로 남긴다.
 
 ### 4.2 지목 또는 중단
 
@@ -79,6 +79,8 @@ gate에 "프로파일이 특정 커널을 지목"이 있다. **그 프로파일�
 - 1위가 GPU 커널이 아니다 (스케줄러, 토크나이즈, 샘플링).
 - 1위가 CPU MoE / PCIe (`n_cpu_moe=32` expert 이동).
 - 상위 커널 사이 차이가 측정 오차 수준이고, 하나 고쳐도 tok/s가 안 움직일 것으로 본다.
+
+**2026-08-14 결과: 중단.** 세 조건이 모두 해당. 상세 `docs/bench/p6.md`.
 
 지목 조건: 한 커널(또는 명확한 한 패밀리, 예: 특정 attention kernel)이
 해당 구간 GPU 시간의 큰 몫을 차지하고, 알고리즘/타일 개선 후보가 있다.
@@ -109,12 +111,12 @@ gate에 "프로파일이 특정 커널을 지목"이 있다. **그 프로파일�
 
 ## 5. 완료 기준 (Definition of Done)
 
-- [ ] `docs/bench/p6.md`에 prefill/decode 커널 순위
+- [x] `docs/bench/p6.md`에 prefill/decode 커널 순위
 - [ ] 지목됨 → HIP 패치 1개 + 정확도 + 회귀 없는 전후 벤치
-- [ ] 지목 안 됨 → 중단 사유가 같은 파일에 있고 커널 diff 0
-- [ ] Rust GPU 커널 0줄
-- [ ] P4(#27) gate 문장("프로파일이 특정 커널을 지목")을 이 결과로 갱신
-- [ ] 산출물 커밋
+- [x] 지목 안 됨 → 중단 사유가 같은 파일에 있고 커널 diff 0
+- [x] Rust GPU 커널 0줄
+- [x] P4(#27) gate 문장("프로파일이 특정 커널을 지목")을 이 결과로 갱신
+- [x] 산출물 커밋
 
 ---
 

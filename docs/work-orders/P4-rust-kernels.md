@@ -29,8 +29,10 @@ hot-path GPU 커널을 Rust+HIP로 **점진적으로** 재작성해 FFI(ggml-hip
 
 - [ ] **P0~P3가 완료**되어 있다. 그 전에는 착수하지 않는다.
 - [ ] gfx906에서 `rocm-rs` 커널 매크로 스모크가 통과한다 (최소 no-op 또는 vector add).
-- [ ] **P6(#29)** rocprof가 병목을 **오케스트레이션이 아니라 특정 커널**로 지목한다.
-      P3에는 그 트레이스가 없다. P6가 지목하지 않으면 이 gate는 실패다.
+- [x] **P6(#29)** rocprof가 병목을 **오케스트레이션이 아니라 특정 커널**로 지목한다.
+      **실패 (2026-08-14).** `docs/bench/p6.md`: P5 이후 decode/suffix wall의 70–80%는
+      호스트/`n_cpu_moe=32`다. 전량 prefill GPU 시간도 rocBLAS·flash_attn·dequant로 분산.
+      P4를 열지 않는다.
 - [ ] 그 커널을 Rust로 치환했을 때의 기대 이득이 공수를 정당화한다.
 - [ ] `hip-sys` / `rocm-rs` 성숙도를 착수 시점에 다시 조사했다.
 

@@ -67,9 +67,9 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 
 **목표:** P3 §4.5를 실제로 한다. Rust 커널이 아니다.
 
-- [ ] gfx906 rocprof, prefill/decode 순위표 (`docs/bench/p6.md`)
-- [ ] 지목되면 커널 1개 HIP C++. 아니면 중단 사유만
-- [ ] **완료 기준:** 순위표 + (조건부) 패치·회귀 없음. 이슈 #29
+- [x] gfx906 rocprof, prefill/decode 순위표 (`docs/bench/p6.md`)
+- [x] 지목 안 됨 — 중단 사유만 (decode/suffix 1위는 CPU MoE `n_cpu_moe=32`. HIP 패치 0)
+- [x] **완료 기준:** 순위표 + 중단 사유. 커널 diff 0. 이슈 #29
 
 ## P4 — (장기·선택) 순수 Rust 커널
 
@@ -78,7 +78,7 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 착수 전 gate (전부 필수):
 
 - [x] P0~P3 완료
-- [ ] P6(#29) rocprof가 병목을 특정 커널로 지목 (아니면 열지 않음)
+- [x] P6(#29) rocprof가 병목을 특정 커널로 지목 — **실패. 열지 않음** (`docs/bench/p6.md`)
 - [ ] gfx906에서 rocm-rs 커널 매크로 스모크 (no-op / vector add)
 - [ ] **완료 기준:** 특정 커널 Rust 치환 + 성능 회귀 없음
 
