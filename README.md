@@ -54,3 +54,8 @@ cargo build --release
 ## 로드맵
 
 `docs/ROADMAP.md` 참조.
+
+## 작업 지시서
+
+각 단계(P0~P4)의 상세 실행 지시서는 `docs/work-orders/` 참조.
+방향: **하이브리드 확정** (Rust 오케스트레이션 + gfx906 빌드된 ggml-hip FFI).

@@ -1,0 +1,109 @@
+# P1 — 단일 요청 E2E: OpenAI 호환 SSE 스트리밍
+
+> **이슈:** #18 · **선행:** P0 (FFI 추론 1회 성공) · **후행:** P2
+> **성격:** P0의 unsafe FFI를 **안전한 Rust API**로 감싸고, HTTP 서버로 단일 요청을 끝까지 처리한다.
+> 이 단계까진 **동시성 없음** — 요청 1개를 올바르게 스트리밍하는 데 집중한다.
+
+---
+
+## 1. 목표
+
+OpenAI 호환 `POST /v1/chat/completions` 요청 1건을 받아:
+1. 메시지를 프롬프트로 변환하고 토크나이즈
+2. prefill + autoregressive decode를 반복하며
+3. 생성되는 토큰을 **SSE(Server-Sent Events)** 로 토큰 단위 스트리밍 응답한다.
+
+**완료 기준:** `curl`로 채팅 1건이 토큰 단위 SSE 스트리밍으로 출력된다.
+
+---
+
+## 2. 배경 / 근거
+
+- P0에서 "로드 → 토크나이즈 → decode 1회 → logits"가 검증됐다.
+- P1은 이를 반복 루프(autoregressive generation)로 확장하고, tokio/axum HTTP 경계와 연결한다.
+- 아키텍처 책임 분리:
+  - `golbang-core` — 모델/토크나이저/샘플러의 **안전한 Rust API** (unsafe는 `golbang-sys`에 격리)
+  - `golbang-server` — axum 라우터, 요청 검증, SSE 인코딩
+
+---
+
+## 3. 산출물
+
+| 산출물 | 위치 | 설명 |
+|--------|------|------|
+| 안전한 모델 래퍼 | `golbang-core/src/model.rs` | `Model::load`, `generate` 등 safe API |
+| 토크나이저 | `golbang-core/src/tokenizer.rs` | encode/decode 래퍼 |
+| 샘플러 | `golbang-core/src/sampler.rs` | temperature / top-p / top-k |
+| 생성 루프 | `golbang-core/src/generate.rs` | 토큰 스트림(yield) 반환 |
+| HTTP 라우터 | `golbang-server/src/main.rs`, `routes.rs` | axum 엔드포인트 |
+| OpenAI 스키마 | `golbang-server/src/types.rs` | request/response + SSE chunk |
+| SSE 스트림 | `golbang-server/src/sse.rs` | `Sse<...>` 스트림 변환 |
+
+---
+
+## 4. 단계별 작업
+
+### 4.1 golbang-core — 안전한 래퍼
+
+- [ ] `Model::load(path, params)` — `golbang-sys` unsafe 호출을 감싼 safe 생성자. RAII로 `Drop`에서 자원 해제.
+- [ ] 내부 상태(모델/컨텍스트/vocab)를 하나의 구조체로 캡슐화. `Send`는 되되, GPU 동시 접근은 이 단계에선 고려하지 않음(P2에서).
+- [ ] `encode(text) -> Vec<Token>`, `decode(tokens) -> String`.
+- [ ] `Sampler` — temperature, top-p, top-k 적용. logits 슬라이스를 받아 토큰 1개 반환.
+- [ ] `generate(prompt, params) -> impl Stream<Item = Token>`:
+  - prefill(프롬프트 전체 decode 1회)
+  - 반복: 마지막 토큰 decode → logits → sample → EOS면 종료, 아니면 토큰 방출
+  - `max_tokens`, stop 조건 처리
+
+### 4.2 golbang-server — HTTP 계층
+
+- [ ] `axum` 라우터: `POST /v1/chat/completions`.
+- [ ] 요청 스키마(OpenAI 호환): `model`, `messages[]`, `temperature`, `top_p`, `max_tokens`, `stream`.
+- [ ] `stream: true` → SSE. `false` → (선택) 전체 모아서 단일 JSON. P1은 SSE 우선.
+- [ ] chat template: Qwen 계열 GGUF는 chat template이 모델에 내장된 경우가 많다. **P1에서는 단순 템플릿 적용**(예: `<|im_start|>user ...`) 후, 내장 템플릿 연동은 개선 항목으로 표기.
+- [ ] SSE chunk 포맷: OpenAI `chat.completion.chunk` (`choices[].delta.content`). 종료 시 `data: [DONE]`.
+- [ ] 에러 응답: 모델 미로드 / 검증 실패 시 OpenAI 스타일 에러 JSON.
+
+### 4.3 실행 진입점
+
+- [ ] `main.rs`: `--model` 경로, `--host/--port` 인자(clap 또는 env). 서버 기동 시 모델 1회 로드.
+- [ ] `tracing-subscriber`로 로깅. 요청/생성 토큰 수 로그.
+
+### 4.4 검증
+
+- [ ] 서버 기동 후 `curl -N -X POST localhost:PORT/v1/chat/completions -d '{"model":"...","messages":[{"role":"user","content":"안녕"}],"stream":true}'`
+- [ ] 토큰이 순차적으로 SSE로 흘러나오는지 확인.
+- [ ] `stream:false`로 전체 응답 JSON 확인(선택).
+
+---
+
+## 5. 완료 기준 (Definition of Done)
+
+- [ ] `cargo build` 전체 크레이트 통과
+- [ ] `curl`로 `/v1/chat/completions` 1건이 **토큰 단위 SSE**로 출력
+- [ ] EOS/`max_tokens`에서 정상 종료 + `data: [DONE]`
+- [ ] 잘못된 요청(빈 messages 등)에 적절한 4xx 에러
+- [ ] 산출물 커밋
+
+---
+
+## 6. 리스크 & 완화
+
+| 리스크 | 영향 | 완화 |
+|--------|------|------|
+| chat template 미스매치 | 모델이 엉뚱한 출력 | P1은 단순 템플릿. 모델 내장 template은 후속 개선으로 분리 |
+| unsafe→safe 경계 누수 | UB/메모리 문제 | unsafe는 `golbang-sys`에만. core는 safe API만 노출. RAII Drop 철저 |
+| 생성 루프 무한/미종료 | 서버 행 | `max_tokens` 상한 + EOS 감지를 테스트로 고정 |
+| SSE 백프레셔 미비 | 느린 클라이언트에 버퍼 팽창 | P1은 단일 요청이라 영향 작음. 본격 백프레셔는 P2 |
+
+---
+
+## 7. 예상 공수
+
+**1 ~ 2일.** P0에서 추론이 이미 검증됐다면, 대부분은 safe 래퍼 설계와 OpenAI 스키마/SSE 포맷 맞추기.
+
+---
+
+## 8. 다음 단계로 넘기는 것
+
+- P1이 끝나면 "모델 1개 + 생성 루프"가 있다. P2는 이 생성 루프를 **여러 요청이 동시에** 쓰도록 스케줄러/슬롯 풀로 재구성한다.
+- P1의 `generate` 루프는 P2에서 iteration 단위로 쪼개져 스케줄러에 편입될 것이므로, **토큰 1개 생성을 잘게 나눌 수 있는 구조**로 작성해 두면 P2가 수월하다.
