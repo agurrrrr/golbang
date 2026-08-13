@@ -35,6 +35,9 @@ pub struct LoadParams {
     pub n_ubatch: u32,
     /// 0 = llama.cpp default thread count.
     pub n_threads: i32,
+    /// Recurrent-state snapshots per seq (`llama_context_params.n_rs_seq`).
+    /// DSV4 cannot `seq_rm` a suffix without at least 1. 0 = library default.
+    pub n_rs_seq: u32,
 }
 
 impl Default for LoadParams {
@@ -48,6 +51,8 @@ impl Default for LoadParams {
             n_batch: 0,
             n_ubatch: 0,
             n_threads: 0,
+            // DSV4 suffix rm needs ≥1 snapshot (~12 MiB). Other archs clamp to 0.
+            n_rs_seq: 1,
         }
     }
 }
@@ -103,6 +108,7 @@ impl Model {
             n_gpu_layers = params.n_gpu_layers,
             n_cpu_moe = params.n_cpu_moe,
             flash_attn = params.flash_attn,
+            n_rs_seq = params.n_rs_seq,
             "loading GGUF"
         );
 
@@ -143,6 +149,9 @@ impl Model {
         cparams.n_ubatch = n_ubatch;
         cparams.n_seq_max = n_seq_max;
         cparams.flash_attn_type = params.flash_attn;
+        if params.n_rs_seq > 0 {
+            cparams.n_rs_seq = params.n_rs_seq;
+        }
         if params.n_threads > 0 {
             cparams.n_threads = params.n_threads;
             cparams.n_threads_batch = params.n_threads;
@@ -292,6 +301,47 @@ impl Model {
                 llama_memory_seq_rm(mem, seq_id, -1, -1);
             }
         }
+    }
+
+    /// Drop KV cells at positions `[p0, inf)` for `seq_id`. False if llama.cpp
+    /// refused a partial remove — caller should restore a prefix checkpoint
+    /// or `clear_seq` and full-prefill.
+    pub fn rm_seq_from(&mut self, seq_id: i32, p0: i32) -> bool {
+        unsafe {
+            let mem = llama_get_memory(self.ctx);
+            if mem.is_null() {
+                return false;
+            }
+            llama_memory_seq_rm(mem, seq_id, p0, -1)
+        }
+    }
+
+    /// Snapshot one sequence (PARTIAL_ONLY: raw KV + DSV4 recurrent state).
+    pub fn seq_state_get(&mut self, seq_id: i32) -> Option<Vec<u8>> {
+        let flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        let n = unsafe { llama_state_seq_get_size_ext(self.ctx, seq_id, flags) };
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n];
+        let wrote = unsafe { llama_state_seq_get_data_ext(self.ctx, buf.as_mut_ptr(), n, seq_id, flags) };
+        if wrote == 0 {
+            return None;
+        }
+        buf.truncate(wrote);
+        Some(buf)
+    }
+
+    /// Restore a snapshot from [`seq_state_get`].
+    pub fn seq_state_set(&mut self, seq_id: i32, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        let flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        let n = unsafe {
+            llama_state_seq_set_data_ext(self.ctx, data.as_ptr(), data.len(), seq_id, flags)
+        };
+        n > 0
     }
 
     /// Tokens already in `seq_id` (0 if empty).

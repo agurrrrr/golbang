@@ -59,6 +59,23 @@ impl Engine {
         self.lock().clear_seq(seq_id);
     }
 
+    /// Remove KV from position `p0` to the end of `seq_id`. See [`Model::rm_seq_from`].
+    pub fn rm_seq_from(&self, seq_id: i32, p0: i32) -> bool {
+        self.lock().rm_seq_from(seq_id, p0)
+    }
+
+    pub fn n_past_seq(&self, seq_id: i32) -> u32 {
+        self.lock().n_past_seq(seq_id)
+    }
+
+    pub fn seq_state_get(&self, seq_id: i32) -> Option<Vec<u8>> {
+        self.lock().seq_state_get(seq_id)
+    }
+
+    pub fn seq_state_set(&self, seq_id: i32, data: &[u8]) -> bool {
+        self.lock().seq_state_set(seq_id, data)
+    }
+
     /// Decode one planned batch and copy logits for every token that asked
     /// for them. Copies so the async side can sample after the lock drops.
     pub fn decode_and_logits(&self, items: &[BatchToken]) -> Result<Vec<Vec<f32>>> {

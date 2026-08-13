@@ -97,6 +97,9 @@ pub(crate) struct ActiveJob {
     pub n_prompt: u32,
     pub max_tokens: u32,
     pub pending: Option<Token>,
+    /// Sampled token IDs this request (not including EOG). Used to grow the
+    /// slot prefix cache so the next turn's LCP covers the assistant reply.
+    pub generated: Vec<Token>,
     pub sampler: Sampler,
     pub stop: Vec<String>,
     pub acc: String,
@@ -142,6 +145,7 @@ impl ActiveJob {
             n_prompt,
             max_tokens,
             pending: None,
+            generated: Vec::new(),
             sampler: Sampler::new(SamplerParams {
                 temperature: params.temperature,
                 top_p: params.top_p,
@@ -216,6 +220,15 @@ pub struct Slot {
     pub(crate) job: Option<ActiveJob>,
     /// P3 prefix cache for this slot's sequence KV.
     pub prefix_cache: crate::prefix_cache::SlotPrefixCache,
+    /// Prefill-end snapshot. DSV4 cannot `seq_rm` a long generated suffix
+    /// (`n_rs_seq` is tiny), so the next bind restores this then trims 1 token.
+    pub(crate) prefix_ckpt: Option<SeqCheckpoint>,
+}
+
+/// Host copy of one sequence at a known length (see [`Slot::prefix_ckpt`]).
+pub(crate) struct SeqCheckpoint {
+    pub n_tokens: u32,
+    pub data: Vec<u8>,
 }
 
 impl Slot {
@@ -225,6 +238,7 @@ impl Slot {
             phase: SlotPhase::Empty,
             job: None,
             prefix_cache: Default::default(),
+            prefix_ckpt: None,
         }
     }
 

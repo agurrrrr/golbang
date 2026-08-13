@@ -58,10 +58,10 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 
 **목표:** 같은 대화의 다음 턴에서 prefix KV가 슬롯에 남아 suffix만 prefill한다.
 
-- [ ] Stop/Length evict 후 `clear_seq` 하지 않음
-- [ ] 생성 토큰 ID를 슬롯 캐시에 누적
-- [ ] bind 시 LCP만큼 `n_past`, suffix KV만 `llama_memory_seq_rm`
-- [ ] **완료 기준:** 2턴째 `cache_n > 0`, 3k대 TTFT가 suffix만큼. 이슈 #28
+- [x] Stop/Length evict 후 `clear_seq` 하지 않음
+- [x] 생성 토큰 ID를 슬롯 캐시에 누적
+- [x] bind 시 LCP만큼 `n_past`, suffix KV만 `llama_memory_seq_rm` (DSV4는 prefill 체크포인트 + `n_rs_seq=1`)
+- [x] **완료 기준:** 2턴째 `cache_n > 0`, 3k대 TTFT가 suffix만큼. 이슈 #28
 
 ## P6 — rocprof → 지목 커널만 HIP C++
 

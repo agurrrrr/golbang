@@ -5,11 +5,10 @@
 //! **slot-local reuse** path: each slot keeps the KV of its own prefix so a
 //! re-bound job that shares the same prefix does not re-prefill it.
 //!
-//! A global cross-slot store is intentionally NOT implemented (see §4.1 note):
-//! copying a whole seq with `llama_memory_seq_cp` requires a reserved sequence
-//! slot and shifts position bookkeeping; the spike showed the simpler
-//! slot-local path already removes the dominant TTFT cost for repeated
-//! system prompts.
+//! P5: Stop/Length leave that KV resident. `remember` stores prompt + generated
+//! token IDs so the next bind's LCP can include the previous assistant turn.
+//! A global cross-slot store is still NOT implemented — `PrefixStore` stays
+//! inactive; no `llama_memory_seq_cp` between slots.
 
 use std::collections::HashMap;
 
@@ -61,6 +60,38 @@ impl SlotPrefixCache {
         self.tokens.clear();
         self.prefix_len = 0;
     }
+
+    /// After a successful Stop/Length, record the tokens whose KV is actually
+    /// resident (`n_past` == `llama_memory_seq_pos_max + 1`). The last sampled
+    /// token may not have been decoded yet, so `n_past` can be shorter than
+    /// `prompt.len() + generated.len()`.
+    pub fn remember(&mut self, prompt: &[Token], generated: &[Token], n_past: u32) {
+        self.tokens.clear();
+        self.tokens.extend_from_slice(prompt);
+        self.tokens.extend_from_slice(generated);
+        self.tokens.truncate(n_past as usize);
+        self.prefix_len = self.tokens.len();
+    }
+
+    /// Bind-time reuse. Returns how many leading prompt tokens keep their KV.
+    ///
+    /// Always leaves at least one prompt token to prefill so the last cell has
+    /// logits (llama-server `TAG_PROMPT_LOGITS`). Returns 0 when the GPU must
+    /// start from position 0 (`clear_seq`).
+    pub fn reuse_for_bind(&mut self, prompt: &[Token], gpu_n_past: u32) -> usize {
+        if prompt.is_empty() {
+            self.reset();
+            return 0;
+        }
+        let mut n = common_prefix_len(&self.tokens, prompt);
+        n = n.min(prompt.len() - 1);
+        if n == 0 || gpu_n_past < n as u32 {
+            self.reset();
+            return 0;
+        }
+        self.prefix_len = n;
+        n
+    }
 }
 
 /// Optional global prefix store (disabled by default — see module doc).
@@ -110,5 +141,56 @@ mod tests {
         assert_eq!(c.reuse(&t(&[9, 8])), 0);
         // reset clears; a no-match does not overwrite the cache
         assert_eq!(c.tokens, t(&[1, 2]));
+    }
+
+    #[test]
+    fn remember_truncates_to_resident_n_past() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3, 4]), &t(&[5, 6]), 5);
+        assert_eq!(c.tokens, t(&[1, 2, 3, 4, 5]));
+        assert_eq!(c.prefix_len, 5);
+    }
+
+    #[test]
+    fn second_bind_reuses_common_prefix() {
+        let mut c = SlotPrefixCache::new();
+        assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3, 4]), 0), 0);
+        c.remember(&t(&[1, 2, 3, 4]), &t(&[5, 6]), 6);
+        let n = c.reuse_for_bind(&t(&[1, 2, 3, 4, 5, 6, 7, 8]), 6);
+        assert!(n > 0, "shared prefix must reuse, got {n}");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn bind_without_common_prefix_clears() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3]), &[], 3);
+        assert_eq!(c.reuse_for_bind(&t(&[9, 8, 7]), 3), 0);
+        assert!(c.tokens.is_empty());
+    }
+
+    #[test]
+    fn generated_tokens_extend_next_lcp() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3]), &t(&[4, 5]), 5);
+        // Next prompt includes the previous assistant ids [4,5].
+        let n = c.reuse_for_bind(&t(&[1, 2, 3, 4, 5, 6]), 5);
+        assert_eq!(n, 5, "LCP must include generated assistant tokens");
+    }
+
+    #[test]
+    fn reuse_for_bind_leaves_one_token_for_logits() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3]), &[], 3);
+        // Exact prompt match would be LCP==len; clamp so we still prefill.
+        assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3]), 3), 2);
+    }
+
+    #[test]
+    fn reuse_for_bind_rejects_when_gpu_shorter_than_lcp() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3, 4]), &[], 4);
+        assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3, 4, 5]), 2), 0);
+        assert!(c.tokens.is_empty());
     }
 }

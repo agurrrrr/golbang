@@ -281,7 +281,7 @@ async fn run_loop(
             }
         };
 
-        apply_plan(&mut slots, &plan);
+        apply_plan(&mut slots, &plan, &engine);
         maybe_log_prefill_progress(&mut slots);
         sample_and_emit(&mut slots, &plan, &logits, &engine, n_ctx_seq, &metrics);
         evict_finished(&mut slots, &engine, iter, &metrics);
@@ -405,13 +405,14 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         }));
         return false;
     }
-    // P3 prefix reuse: the slot's cached prefix KV stays resident in seq.
-    // Only the suffix `[reuse_len..)` needs prefill.
-    let reuse_len = slot.prefix_cache.reuse(&tokens);
-    if reuse_len == 0 {
-        // No shared prefix → clear the slot's seq so positions start at 0.
-        engine.clear_seq(slot.id.0 as i32);
-    }
+    // P5: keep resident KV for the LCP. DSV4 cannot seq_rm a long generated
+    // suffix (n_rs_seq is 1), so we restore the prefill checkpoint then trim.
+    let seq = slot.id.0 as i32;
+    let gpu_n = engine.n_past_seq(seq);
+    let ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
+    let hint_n = gpu_n.max(ckpt_n);
+    let mut reuse_len = slot.prefix_cache.reuse_for_bind(&tokens, hint_n);
+    reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n);
     let req = job.request_id;
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
@@ -423,19 +424,21 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         job.events,
         n_ctx_seq,
     ));
-    tracing::debug!(
+    tracing::info!(
         slot = slot.id.0,
         request_id = req,
         n_prompt,
         reused = reuse_len,
+        gpu_n,
         "slot bound"
     );
     true
 }
 
-fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan) {
+fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engine) {
     for (id, take) in &plan.prefill_consumed {
         if let Some(slot) = slots.iter_mut().find(|s| s.id == *id) {
+            let mut need_ckpt = false;
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
                 job.n_past += *take;
@@ -443,8 +446,12 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan) {
                     slot.phase = SlotPhase::Decoding;
                     if job.generation_started_at.is_none() {
                         job.generation_started_at = Some(Instant::now());
+                        need_ckpt = true;
                     }
                 }
+            }
+            if need_ckpt {
+                capture_prefix_checkpoint(slot, engine);
             }
         }
     }
@@ -526,6 +533,7 @@ fn sample_and_emit(
         };
         let mut piece = job.utf8.push(&bytes);
         job.n_generated += 1;
+        job.generated.push(token);
         job.pending = Some(token);
         slot.phase = SlotPhase::Decoding;
         maybe_log_decode_progress(slot.id.0, job);
@@ -594,7 +602,23 @@ fn finish_slot(
 ) {
     let id = slot.id;
     if let Some(job) = slot.evict() {
-        engine.clear_seq(id.0 as i32);
+        if keeps_prefix_kv(reason) {
+            let gpu_n = engine.n_past_seq(id.0 as i32);
+            if gpu_n != job.n_past {
+                tracing::debug!(
+                    slot = id.0,
+                    gpu_n,
+                    n_past = job.n_past,
+                    "n_past vs seq_pos_max+1"
+                );
+            }
+            slot.prefix_cache
+                .remember(&job.prompt_tokens, &job.generated, job.n_past);
+        } else {
+            engine.clear_seq(id.0 as i32);
+            slot.prefix_cache.reset();
+            slot.prefix_ckpt = None;
+        }
         let timings = job.timings(Instant::now());
         record_request_totals(metrics, &timings);
         log_slot_timings(id.0, job.request_id, reason.as_str(), &timings);
@@ -754,9 +778,114 @@ fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
         let id = slot.id;
         if let Some(job) = slot.evict() {
             engine.clear_seq(id.0 as i32);
+            slot.prefix_cache.reset();
+            slot.prefix_ckpt = None;
             let _ = job.events.send(SlotEvent::Failed(err.clone()));
         }
     }
+}
+
+fn keeps_prefix_kv(reason: FinishReason) -> bool {
+    matches!(reason, FinishReason::Stop | FinishReason::Length)
+}
+
+fn capture_prefix_checkpoint(slot: &mut Slot, engine: &Engine) {
+    let n_tokens = slot.job.as_ref().map(|j| j.n_past).unwrap_or(0);
+    if n_tokens == 0 {
+        return;
+    }
+    match engine.seq_state_get(slot.id.0 as i32) {
+        Some(data) if !data.is_empty() => {
+            tracing::info!(
+                slot = slot.id.0,
+                n_tokens,
+                bytes = data.len(),
+                "prefix checkpoint saved"
+            );
+            slot.prefix_ckpt = Some(crate::slot::SeqCheckpoint { n_tokens, data });
+        }
+        _ => tracing::debug!(slot = slot.id.0, "prefix checkpoint skipped"),
+    }
+}
+
+/// Trim or restore so GPU KV covers exactly `reuse_len` cells (or 0 = clear).
+fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u32) -> usize {
+    let seq = slot.id.0 as i32;
+    if reuse_len == 0 {
+        engine.clear_seq(seq);
+        slot.prefix_ckpt = None;
+        return 0;
+    }
+    if trim_seq_to(engine, seq, reuse_len) {
+        return reuse_len;
+    }
+    let Some(ckpt) = slot.prefix_ckpt.as_ref() else {
+        tracing::warn!(
+            slot = slot.id.0,
+            reuse_len,
+            gpu_n,
+            "prefix seq_rm failed and no checkpoint; full prefill"
+        );
+        engine.clear_seq(seq);
+        slot.prefix_cache.reset();
+        return 0;
+    };
+    // Restore is useful if it lands at reuse_len or one token past (DSV4
+    // `<think>` vs `</think>`). n_rs_seq=1 can drop that extra token.
+    if ckpt.n_tokens == 0 || ckpt.n_tokens > reuse_len as u32 + 1 {
+        tracing::warn!(
+            slot = slot.id.0,
+            reuse_len,
+            ckpt_n = ckpt.n_tokens,
+            gpu_n,
+            "prefix checkpoint not usable; full prefill"
+        );
+        engine.clear_seq(seq);
+        slot.prefix_cache.reset();
+        slot.prefix_ckpt = None;
+        return 0;
+    }
+    let ckpt_n = ckpt.n_tokens;
+    if !engine.seq_state_set(seq, &ckpt.data) {
+        tracing::warn!(slot = slot.id.0, "prefix checkpoint restore failed");
+        engine.clear_seq(seq);
+        slot.prefix_cache.reset();
+        slot.prefix_ckpt = None;
+        return 0;
+    }
+    let kept = reuse_len.min(ckpt_n as usize);
+    if trim_seq_to(engine, seq, kept) {
+        tracing::info!(
+            slot = slot.id.0,
+            reuse_len = kept,
+            ckpt_n,
+            gpu_n,
+            "prefix restored from checkpoint"
+        );
+        return kept;
+    }
+    tracing::warn!(
+        slot = slot.id.0,
+        reuse_len,
+        ckpt_n,
+        gpu_after = engine.n_past_seq(seq),
+        "prefix restore still longer than LCP; full prefill"
+    );
+    engine.clear_seq(seq);
+    slot.prefix_cache.reset();
+    slot.prefix_ckpt = None;
+    0
+}
+
+fn trim_seq_to(engine: &Engine, seq: i32, n: usize) -> bool {
+    let gpu = engine.n_past_seq(seq);
+    if gpu == n as u32 {
+        return true;
+    }
+    if gpu < n as u32 {
+        return false;
+    }
+    engine.rm_seq_from(seq, n as i32) && engine.n_past_seq(seq) == n as u32
 }
 
 #[cfg(test)]
@@ -793,6 +922,14 @@ mod tests {
         );
         assert_eq!(b.prefill_max, 5800);
         assert_eq!(b.decode_max, 4);
+    }
+
+    #[test]
+    fn stop_and_length_keep_kv_failures_do_not() {
+        assert!(keeps_prefix_kv(FinishReason::Stop));
+        assert!(keeps_prefix_kv(FinishReason::Length));
+        assert!(!keeps_prefix_kv(FinishReason::Cancelled));
+        assert!(!keeps_prefix_kv(FinishReason::Timeout));
     }
 
     #[tokio::test]
@@ -1034,6 +1171,88 @@ mod gpu_tests {
             matches!(end, SlotEvent::Failed(Error::Cancelled)),
             "slot reclaim should surface cancel, got {end:?}"
         );
+        drop(spawned.handle);
+        let _ = spawned.worker.await;
+    }
+
+    async fn collect_timings(
+        handle: &SchedulerHandle,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> SlotTimings {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let job = Job::new(
+            prompt.to_string(),
+            GenerateParams {
+                max_tokens,
+                temperature: 0.0,
+                ..GenerateParams::default()
+            },
+            CancellationToken::new(),
+            tx,
+        );
+        handle.try_submit(job).expect("submit");
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                SlotEvent::Finished { timings, .. } => return timings,
+                SlotEvent::Failed(e) => panic!("job failed: {e}"),
+                SlotEvent::Token(_) => {}
+            }
+        }
+        panic!("channel closed without finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_turn_reuses_slot_prefix_kv() {
+        let Some(path) = test_model() else {
+            return;
+        };
+        let _lock = lock_gpu();
+
+        let model = tokio::task::spawn_blocking(move || {
+            Model::load(
+                path,
+                LoadParams {
+                    n_ctx: 256,
+                    n_gpu_layers: 99,
+                    n_seq_max: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .expect("join")
+        .expect("load");
+        let engine = Arc::new(Engine::new(model));
+        let spawned = spawn_scheduler(
+            engine,
+            Box::new(FifoPolicy::default()),
+            SchedulerConfig {
+                n_parallel: 1,
+                queue_capacity: 1,
+                default_timeout: None,
+            },
+        );
+
+        let turn1 = "<|im_start|>user\n안녕<|im_end|>\n<|im_start|>assistant\n";
+        let t1 = collect_timings(&spawned.handle, turn1, 8).await;
+        assert_eq!(t1.cache_n, 0, "first turn has no prefix");
+
+        let turn2 = "<|im_start|>user\n안녕<|im_end|>\n<|im_start|>assistant\n응답<|im_end|>\n<|im_start|>user\n다음<|im_end|>\n<|im_start|>assistant\n";
+        let t2 = collect_timings(&spawned.handle, turn2, 8).await;
+        assert!(
+            t2.cache_n > 0,
+            "second turn must reuse slot KV, cache_n={}",
+            t2.cache_n
+        );
+        assert!(
+            t2.prompt_n < t1.prompt_n + t2.cache_n,
+            "suffix prefill should be shorter than a full second prompt: t1.prompt_n={} t2.prompt_n={} t2.cache_n={}",
+            t1.prompt_n,
+            t2.prompt_n,
+            t2.cache_n
+        );
+
         drop(spawned.handle);
         let _ = spawned.worker.await;
     }

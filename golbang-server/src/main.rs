@@ -55,6 +55,11 @@ struct Args {
     #[arg(long, env = "GOLBANG_N_THREADS", default_value_t = 0)]
     n_threads: i32,
 
+    /// DSV4 suffix rollback snapshots. 1 lets bind drop the last `<think>` token
+    /// after restoring a prefill checkpoint. 0 = llama.cpp default (no rollback).
+    #[arg(long, env = "GOLBANG_N_RS_SEQ", default_value_t = 1)]
+    n_rs_seq: u32,
+
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
     n_parallel: u32,
@@ -135,6 +140,7 @@ async fn main() -> Result<()> {
             n_batch: args.n_batch,
             n_ubatch: args.n_ubatch,
             n_threads: args.n_threads,
+            n_rs_seq: args.n_rs_seq,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
