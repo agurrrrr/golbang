@@ -15,10 +15,12 @@
 
 ## 왜 하이브리드인가
 
-순수 Rust로 gfx906 GPU 커널을 작성하는 것은 현재 불가능에 가깝다
-(candle/mistral.rs는 HIP 백엔드 없음, hipfire는 RDNA 전용).
+순수 Rust로 gfx906 GPU 커널을 작성하는 길은 **검증되지 않았다**.
+rocm-rs에 `#[amdgpu_global]` 커널 매크로는 있으나 gfx906 코드젠·rocBLAS급 최적화 커널은 미검증이고,
+candle/mistral.rs는 HIP 백엔드가 없으며 hipfire는 RDNA 전용이다.
 따라서 **서빙·스케줄링·배칭은 100% Rust**로 작성하되,
-GPU 수학 연산은 **이미 gfx906으로 빌드된 ggml-hip 커널을 Rust가 C ABI로 호출**한다.
+GPU 수학 연산은 **이미 gfx906으로 빌드된 ggml-hip 커널을 Rust가 C ABI로 호출**한다(P0~P3).
+순수 Rust 커널 경로는 P4에서 재평가한다.
 최종 산출물은 파이썬/Go 런타임이 없는 **단일 Rust 바이너리**다.
 
 상세 결정 근거는 위키 `architecture-decision` 참조.
@@ -33,15 +35,23 @@ golbang-sys      # llama.cpp / ggml-hip 저수준 FFI 바인딩 (unsafe, bindgen
 
 ## "개선된 동시성"의 의미
 
-llama-server는 모든 활성 슬롯을 하나의 통합 배치로 묶어 `llama_decode()`를
-동기 호출한다. decode가 반환될 때까지 새 요청·취소가 배치에 끼어들지 못해
-head-of-line blocking이 생긴다.
+llama-server도 이미 continuous batching(슬롯+통합 batch)이 기본 내장되어 있다.
+실제 한계는 (a) 스케줄 루프가 `llama_decode`에 동기 결합되어 정책(join/evict/chunked prefill/우선순위)을 바꾸기 어렵고,
+(b) 취소가 decode 경계까지 기다려야 하며, (c) 기능이 무겁다는 점이다.
 
-golbang은:
+golbang이 차별화되는 지점은:
+- **정책 제어** — 스케줄 정책(join/evict/우선순위)을 Rust 코드로 직접 교체 가능
+- **단순한 제어면** — 연결 끊김 → 슬롯 회수의 경로가 짧고 명시적
+- **즉시 503** — bounded 큐로 과부하 시 대기 없이 거절
+- **경량 표면** — 임베딩/rerank/스펙큘레이티브 없이 채팅 스트리밍에 집중
+
+구현 수단은:
 - **비동기 분리** — HTTP 수신 / 스케줄링 / GPU 추론을 별도 tokio 태스크로 격리
-- **iteration-level continuous batching** — 매 iteration마다 슬롯 join/evict
+- **iteration 경계 join/evict** — `llama_decode` 반환 직후 빈 슬롯에 신규 요청 삽입
 - **선제 취소** — `CancellationToken`으로 연결 끊김 즉시 슬롯 회수
 - **백프레셔** — bounded 큐로 과부하 시 즉시 503
+
+> GPU 처리량 우위는 P2 성공 조건이 아니다. llama-server 대비 동률 + 위 제어면 개선이면 통과.
 
 ## 빌드 (예정)
 

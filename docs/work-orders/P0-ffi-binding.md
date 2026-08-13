@@ -1,9 +1,11 @@
 # P0 — golbang-sys: llama.h Rust FFI 바인딩 + gfx906 추론 1회
 
-> **이슈:** #17 · **선행:** 없음 · **후행:** P1
+> **이슈:** #23 · **선행:** 없음 · **후행:** P1
 > **왜 먼저인가:** 전체 프로젝트에서 가장 리스크가 큰 구간이다.
 > Rust → llama.cpp(ggml-hip) FFI 연결과 gfx906 실제 추론이 되는지를 **가장 먼저, 가장 작은 범위로** 검증한다.
 > 여기서 막히면 하이브리드 방향 자체를 재검토해야 한다.
+>
+> **이 단계의 목적:** 연결 검증. **속도 하한은 두지 않는다.**
 
 ---
 
@@ -15,7 +17,9 @@ Rust 바이너리가 `llama.h` C API를 통해:
 3. gfx906 GPU에서 `llama_decode`를 1회 실행하고
 4. logits을 읽어 다음 토큰 1개를 샘플링한다.
 
-**완료 기준:** `cargo test -p golbang-sys`가 gfx906에서 **실제 GGUF 추론 1회**를 통과한다.
+**완료 기준:** `GOLBANG_TEST_MODEL`로 지정한 소형 GGUF, 프롬프트 `"Hello"`,
+`llama_decode` 1회 후 argmax 토큰이 `[0, n_vocab)` 이고, 로그에 HIP/gfx906이 보이며
+CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **속도 하한 없음.**
 
 ---
 
@@ -42,21 +46,51 @@ Rust 바이너리가 `llama.h` C API를 통해:
 
 ## 4. 단계별 작업
 
+### 4.0 링크 대상 검증 (첫 태스크, 다른 작업보다 먼저)
+
+구현 착수 전에 아래 **고정 값**을 다시 확인하고, 값이 바뀌었으면 이 표를 고친 뒤 진행한다.
+
+| 항목 | 고정 값 (2026-08-13 확인) |
+|------|---------------------------|
+| 트리 | `/home/agurrrrr/code/local-llm/llama.cpp` |
+| `git rev-parse HEAD` | `5b474eb69dac2d7c26ba8855310d3b60e02a5c4f` (`5b474eb69`) |
+| 커밋 시각 | 2026-08-06 18:56:34 +0900 |
+| `libggml-hip.so.0` 빌드 시각 | 2026-08-06 19:01:11 +0900 |
+| `libllama.so.0` 빌드 시각 | 2026-08-06 19:01:35 +0900 |
+| gfx906 코드 | `strings build/bin/libggml-hip.so \| grep gfx906` — 포함 확인됨 |
+| bindgen 입력 | **이 SHA의** `include/llama.h` (1611줄). 라이브 최신 헤더 금지 |
+| 현행 로드 API | `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free` |
+| DEPRECATED | `llama_load_model_from_file` / `llama_new_context_with_model` / `llama_free_model` |
+
+같은 디렉터리의 다른 HEAD (섞지 말 것):
+
+| 경로 | HEAD |
+|------|------|
+| `llama.cpp` | `5b474eb69` ← **이 트리만 사용** |
+| `llama.cpp.new` | `e700bfb37` |
+| `llama.cpp-furnace` | `5013b9f91` |
+| `llama.cpp-prefetch` | `6e3d2ef73` |
+
+- [ ] 구현 당일 `rev-parse HEAD`와 `.so` mtime이 위 표와 같은지 재확인.
+- [ ] bindgen 입력을 **그 SHA의 `llama.h`**로 고정 (vendor 복사 또는 절대경로). 라이브 트리 헤더와 옛 `.so`를 섞지 말 것.
+- [ ] **심볼/SHA가 바뀌면 (A)를 버리고 (B) 재빌드(P3)로 전환한다.** ADR의 submodule+cmake 서술은 (B)용이며, P0 기본 경로가 아니다.
+
 ### 4.1 링크 전략 결정 (택 1, 먼저 결정할 것)
 
 - **(A) 기존 `.so` 재사용 (권장, 빠름):** 이미 gfx906으로 빌드된 `.so`를 `cargo:rustc-link-search`로 링크.
   - 장점: P0 리스크를 "FFI 연결"에만 집중. llama.cpp 재빌드 시간 제거.
-  - `build.rs`에서 `/home/agurrrrr/code/local-llm/llama.cpp/build/bin`(또는 실제 `.so` 위치)를 탐색.
+  - `build.rs`에서 `$GOLBANG_LLAMA_DIR/build/bin`(또는 실제 `.so` 위치)를 탐색.
+  - 전제: 4.0의 SHA 고정이 지켜질 때만.
 - **(B) cmake+hipcc 재빌드:** `build.rs`가 llama.cpp를 직접 빌드.
   - 장점: 재현성. 단점: P0에서 변수가 많아져 디버깅이 어려움.
   - **P0에서는 A로 검증하고, B는 P3(안정화)에서 재현성 확보용으로 이관.**
 
-> **결정 필요:** P0는 (A) 기존 `.so` 재사용으로 시작. 재현성은 후속 단계에서 해결.
+> **결정 (2026-08-13 고정):** P0는 **(A) + SHA 고정**. 심볼/SHA 드리프트 발생 시 (B)로 전환.
 
 ### 4.2 build.rs 작성
 
 - [ ] llama.cpp 소스/빌드 경로를 환경변수(`GOLBANG_LLAMA_DIR`)로 주입받되, 기본값은 `/home/agurrrrr/code/local-llm/llama.cpp`.
-- [ ] `bindgen::Builder`로 `llama.h` 파싱 → `OUT_DIR/bindings.rs` 생성.
+- [ ] `bindgen::Builder`로 **4.0에서 고정한 그 `llama.h`** 파싱 → `OUT_DIR/bindings.rs` 생성.
   - allowlist: `llama_*` 함수와 필요한 타입만 (불필요한 심볼 폭증 방지).
 - [ ] 링크 지시 출력:
   - `cargo:rustc-link-search=native=<llama.cpp build lib 경로>`
@@ -69,12 +103,15 @@ Rust 바이너리가 `llama.h` C API를 통해:
 - [ ] `golbang-sys/src/lib.rs`에서 `include!(concat!(env!("OUT_DIR"), "/bindings.rs"))`.
 - [ ] 스켈레톤 `add()` 제거. 외부로 노출할 최소 심볼 정리:
   - 백엔드: `llama_backend_init`, `llama_backend_free`
-  - 모델: `llama_model_default_params`, `llama_load_model_from_file`(또는 최신 API 명칭), `llama_free_model`
-  - 컨텍스트: `llama_context_default_params`, `llama_new_context_with_model`(또는 최신 명칭), `llama_free`
+  - 모델: `llama_model_default_params`, **`llama_model_load_from_file`**, **`llama_model_free`**
+  - 컨텍스트: `llama_context_default_params`, **`llama_init_from_model`**, `llama_free`
   - 토크나이즈: `llama_tokenize`, `llama_vocab_*`
   - 추론: `llama_decode`, `llama_get_logits`, batch 유틸(`llama_batch_init` 등)
 
-> ⚠️ llama.cpp API는 버전마다 함수명이 바뀐다(예: `llama_load_model_from_file` vs 구버전). **반드시 실제 헤더의 함수명을 확인하고 맞출 것.** 추측으로 쓰지 않는다.
+> ⚠️ **API 이름 고정 (2026-08-13 확인):** 로컬 `llama.h`(SHA `5b474eb69`, 1611줄) 기준
+> `llama_load_model_from_file` / `llama_new_context_with_model` / `llama_free_model`은 **DEPRECATED**이고
+> 현재 이름은 **`llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`** 이다.
+> bindgen allowlist도 현행 이름으로 맞출 것. 추측으로 쓰지 않는다.
 
 ### 4.4 검증 테스트 작성
 
@@ -99,10 +136,15 @@ Rust 바이너리가 `llama.h` C API를 통해:
 
 ## 5. 완료 기준 (Definition of Done)
 
+연결 검증이 목적이다. **속도 하한·토큰 품질 기준은 없다.**
+
 - [ ] `cargo build -p golbang-sys` 링크 에러 없음
-- [ ] `cargo test -p golbang-sys` 가 gfx906에서 **실제 추론 1회** 통과
-- [ ] `rocminfo`/로그로 GPU(`gfx906`)에서 연산됨을 확인(CPU 폴백 아님)
+- [ ] `GOLBANG_TEST_MODEL`로 소형 GGUF를 지정해 `cargo test -p golbang-sys -- --nocapture` 통과
+- [ ] 테스트 프롬프트는 `"Hello"`
+- [ ] `llama_decode` 1회 후 argmax 토큰이 `[0, n_vocab)`
+- [ ] 로그에 HIP / gfx906이 보이고 CPU 폴백이 아님 (`n_gpu_layers` 명시)
 - [ ] 산출물 커밋
+- [ ] 이 문서 4.0 표의 SHA·빌드 시각이 구현에 쓴 값과 일치
 
 ---
 
