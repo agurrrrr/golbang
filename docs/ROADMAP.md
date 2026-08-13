@@ -26,10 +26,10 @@
 
 **목표:** OpenAI 호환 `/v1/chat/completions` 1개 요청을 SSE 스트리밍으로 응답한다.
 
-- [ ] `golbang-core`: 모델 래퍼, 토크나이저, 샘플러. `generate`는 토큰 1개 단위
-- [ ] Qwen ChatML 하드코딩. 실패 시 raw prompt 폴백 + 경고
-- [ ] `golbang-server`: axum + SSE
-- [ ] **완료 기준:** `choices[].delta.content` 토큰 단위, EOS/`max_tokens` 시 `data: [DONE]`, 빈 messages는 4xx
+- [x] `golbang-core`: 모델 래퍼, 토크나이저, 샘플러. `generate`는 토큰 1개 단위
+- [x] Qwen ChatML 하드코딩. 실패 시 raw prompt 폴백 + 경고
+- [x] `golbang-server`: axum + SSE
+- [x] **완료 기준:** `choices[].delta.content` 토큰 단위, EOS/`max_tokens` 시 `data: [DONE]`, 빈 messages는 4xx
 
 ## P2 — 동시성 코어: 스케줄 정책이 교체 가능한 배치 루프
 

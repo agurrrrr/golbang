@@ -149,6 +149,9 @@ fn main() {
         "cargo:rustc-env=GOLBANG_LLAMA_DIR={}",
         llama_dir.display()
     );
+    // Dependents read these as DEP_LLAMA_* (`links = "llama"`).
+    println!("cargo:bin={}", bin_dir.display());
+    println!("cargo:root={}", llama_dir.display());
 }
 
 fn git_stdout(repo: &Path, args: &[&str]) -> String {

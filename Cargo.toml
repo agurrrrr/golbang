@@ -31,6 +31,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# CLI / 샘플링
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+
 # 내부 크레이트
 golbang-core = { path = "golbang-core" }
 golbang-sys = { path = "golbang-sys" }

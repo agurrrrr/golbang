@@ -61,11 +61,11 @@ Qwen GGUF의 `tokenizer.chat_template`(jinja)를 이 API만으로 처리할 수 
 
 ### 4.1 golbang-core — 안전한 래퍼
 
-- [ ] `Model::load(path, params)` — `golbang-sys` unsafe 호출을 감싼 safe 생성자. RAII로 `Drop`에서 자원 해제.
-- [ ] 내부 상태(모델/컨텍스트/vocab)를 하나의 구조체로 캡슐화. `Send`는 되되, GPU 동시 접근은 이 단계에선 고려하지 않음(P2에서).
-- [ ] `encode(text) -> Vec<Token>`, `decode(tokens) -> String`.
-- [ ] `Sampler` — temperature, top-p, top-k 적용. logits 슬라이스를 받아 토큰 1개 반환.
-- [ ] `generate(prompt, params) -> impl Stream<Item = Token>`:
+- [x] `Model::load(path, params)` — `golbang-sys` unsafe 호출을 감싼 safe 생성자. RAII로 `Drop`에서 자원 해제.
+- [x] 내부 상태(모델/컨텍스트/vocab)를 하나의 구조체로 캡슐화. `Send`는 되되, GPU 동시 접근은 이 단계에선 고려하지 않음(P2에서).
+- [x] `encode(text) -> Vec<Token>`, `decode(tokens) -> String`.
+- [x] `Sampler` — temperature, top-p, top-k 적용. logits 슬라이스를 받아 토큰 1개 반환.
+- [x] `generate(prompt, params) -> impl Stream<Item = Token>`:
   - prefill(프롬프트 전체 decode 1회)
   - 반복: 마지막 토큰 decode → logits → sample → EOS면 종료, 아니면 토큰 방출
   - `max_tokens`, stop 조건 처리
@@ -73,48 +73,48 @@ Qwen GGUF의 `tokenizer.chat_template`(jinja)를 이 API만으로 처리할 수 
 
 ### 4.2 chat template (결정된 경로)
 
-- [ ] Qwen ChatML을 Rust로 하드코딩.
+- [x] Qwen ChatML을 Rust로 하드코딩.
   - 예: `<|im_start|>system\n…<|im_end|>\n<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`
-- [ ] 적용 실패(빈 메시지·알 수 없는 role 등) → 메시지를 이어 붙인 **raw prompt 폴백** + `tracing` 경고.
-- [ ] `llama_chat_apply_template`에 의존하지 않는다 (Qwen jinja 불가).
-- [ ] GGUF `tokenizer.chat_template` + minijinja는 **이 단계 범위 밖**. 이슈/후속 지시서에만 남긴다.
+- [x] 적용 실패(빈 메시지·알 수 없는 role 등) → 메시지를 이어 붙인 **raw prompt 폴백** + `tracing` 경고.
+- [x] `llama_chat_apply_template`에 의존하지 않는다 (Qwen jinja 불가).
+- [x] GGUF `tokenizer.chat_template` + minijinja는 **이 단계 범위 밖**. 이슈/후속 지시서에만 남긴다.
 
 ### 4.3 golbang-server — HTTP 계층
 
-- [ ] `axum` 라우터: `POST /v1/chat/completions`.
-- [ ] 요청 스키마(OpenAI 호환): `model`, `messages[]`, `temperature`, `top_p`, `max_tokens`, `stream`.
-- [ ] `stream: true` → SSE. `stream: false` → **비스트리밍 전체 JSON 응답으로 P1 범위에서 확정 지원** (선택이 아니라 기본 동작).
+- [x] `axum` 라우터: `POST /v1/chat/completions`.
+- [x] 요청 스키마(OpenAI 호환): `model`, `messages[]`, `temperature`, `top_p`, `max_tokens`, `stream`.
+- [x] `stream: true` → SSE. `stream: false` → **비스트리밍 전체 JSON 응답으로 P1 범위에서 확정 지원** (선택이 아니라 기본 동작).
   - OpenAI 호환 서버는 비스트리밍 응답도 기본 지원해야 하므로 P2로 미루지 않는다.
   - SSE와 동일한 `choices[].message.content` 스키마를 단일 JSON으로 반환.
-- [ ] SSE chunk 포맷: OpenAI `chat.completion.chunk` (`choices[].delta.content`). 종료 시 `data: [DONE]`.
-- [ ] 에러 응답: 모델 미로드 / 검증 실패 시 OpenAI 스타일 에러 JSON.
-- [ ] `messages`가 비어 있으면 **4xx** (본문에 이유를 명시).
+- [x] SSE chunk 포맷: OpenAI `chat.completion.chunk` (`choices[].delta.content`). 종료 시 `data: [DONE]`.
+- [x] 에러 응답: 모델 미로드 / 검증 실패 시 OpenAI 스타일 에러 JSON.
+- [x] `messages`가 비어 있으면 **4xx** (본문에 이유를 명시).
 
 ### 4.4 실행 진입점
 
-- [ ] `main.rs`: `--model` 경로, `--host/--port` 인자(clap 또는 env). 서버 기동 시 모델 1회 로드.
-- [ ] `tracing-subscriber`로 로깅. 요청/생성 토큰 수 로그.
+- [x] `main.rs`: `--model` 경로, `--host/--port` 인자(clap 또는 env). 서버 기동 시 모델 1회 로드.
+- [x] `tracing-subscriber`로 로깅. 요청/생성 토큰 수 로그.
 
 ### 4.5 검증
 
-- [ ] 서버 기동 후
+- [x] 서버 기동 후
   `curl -N -X POST localhost:PORT/v1/chat/completions -d '{"model":"...","messages":[{"role":"user","content":"안녕"}],"stream":true}'`
-- [ ] 각 SSE 이벤트의 `choices[].delta.content`가 **토큰 단위**로 오는지 확인.
-- [ ] EOS 또는 `max_tokens`에서 `data: [DONE]`으로 종료.
-- [ ] `{"messages":[]}` → 4xx.
-- [ ] `stream:false`로 전체 JSON 응답 확인 (P1 기본 지원).
+- [x] 각 SSE 이벤트의 `choices[].delta.content`가 **토큰 단위**로 오는지 확인.
+- [x] EOS 또는 `max_tokens`에서 `data: [DONE]`으로 종료.
+- [x] `{"messages":[]}` → 4xx.
+- [x] `stream:false`로 전체 JSON 응답 확인 (P1 기본 지원).
 
 ---
 
 ## 5. 완료 기준 (Definition of Done)
 
-- [ ] `cargo build` 전체 크레이트 통과
-- [ ] `curl` SSE에서 `choices[].delta.content`가 **토큰 단위**로 출력
-- [ ] EOS/`max_tokens`에서 정상 종료 + `data: [DONE]`
-- [ ] 빈 `messages` → 4xx
-- [ ] `stream:false` 비스트리밍 JSON 응답도 정상 동작
-- [ ] ChatML 하드코딩 경로가 기본. 실패 시 raw 폴백 + 경고 로그가 남음
-- [ ] 산출물 커밋
+- [x] `cargo build` 전체 크레이트 통과
+- [x] `curl` SSE에서 `choices[].delta.content`가 **토큰 단위**로 출력
+- [x] EOS/`max_tokens`에서 정상 종료 + `data: [DONE]`
+- [x] 빈 `messages` → 4xx
+- [x] `stream:false` 비스트리밍 JSON 응답도 정상 동작
+- [x] ChatML 하드코딩 경로가 기본. 실패 시 raw 폴백 + 경고 로그가 남음
+- [x] 산출물 커밋
 
 ---
 

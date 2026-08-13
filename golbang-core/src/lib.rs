@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Safe wrappers over `golbang-sys`. Unsafe stays in this crate's FFI calls;
+//! the public surface is RAII + iterators.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod chat;
+mod error;
+mod generate;
+mod model;
+mod sampler;
+mod tokenizer;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use chat::{apply_chat_template, AppliedPrompt, ChatMessage};
+pub use error::Error;
+pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
+pub use model::{LoadParams, Model};
+pub use sampler::{Sampler, SamplerParams};
+pub use tokenizer::{Token, Tokenizer};

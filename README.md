@@ -68,6 +68,29 @@ cargo build -p golbang-sys
 cargo test  -p golbang-sys -- --nocapture
 ```
 
+## P1 서버 (단일 요청 SSE)
+
+기본 포트는 **8088** (`:8080` llama-server와 겹치지 않게). `n_ctx` 기본 256 — 같은 GPU에 다른 서버가 있으면 올리지 말 것.
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+export GOLBANG_TEST_MODEL=/home/agurrrrr/code/local-llm/models/Qwen3-0.6B-Q4_K_M.gguf
+
+cargo run -p golbang-server -- --model "$GOLBANG_TEST_MODEL" --port 8088
+
+# 스트리밍
+curl -N -X POST http://127.0.0.1:8088/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":true,"max_tokens":32}'
+
+# 비스트리밍
+curl -sS -X POST http://127.0.0.1:8088/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":false,"max_tokens":32}'
+```
+
+`cargo test --workspace` 는 `GOLBANG_TEST_MODEL` 이 있을 때 GPU E2E(SSE / JSON / 빈 messages 4xx)까지 돈다.
+
 ## 로드맵
 
 `docs/ROADMAP.md` 참조.
