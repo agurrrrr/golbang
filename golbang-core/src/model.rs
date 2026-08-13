@@ -161,6 +161,8 @@ impl Model {
             n_ctx = unsafe { llama_n_ctx(ctx) },
             n_ctx_seq = unsafe { llama_n_ctx_seq(ctx) },
             n_seq_max = unsafe { llama_n_seq_max(ctx) },
+            n_batch = unsafe { llama_n_batch(ctx) },
+            n_ubatch = unsafe { llama_n_ubatch(ctx) },
             n_vocab,
             n_layer = unsafe { llama_model_n_layer(model) },
             "model ready"
@@ -246,6 +248,10 @@ impl Model {
 
     pub fn n_batch(&self) -> u32 {
         unsafe { llama_n_batch(self.ctx) }
+    }
+
+    pub fn n_ubatch(&self) -> u32 {
+        unsafe { llama_n_ubatch(self.ctx) }
     }
 
     pub fn tokenizer(&self) -> Tokenizer<'_> {

@@ -14,7 +14,7 @@ use crate::batch::BatchBuilder;
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
-use crate::policy::{SchedulePolicy, SlotView, WaitingJobView};
+use crate::policy::{IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
 use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 
 #[derive(Debug)]
@@ -169,7 +169,17 @@ async fn run_loop(
     }
 
     let mut slots: Vec<Slot> = (0..n).map(|i| Slot::new(SlotId(i as u32))).collect();
-    let builder = BatchBuilder::new(engine.n_batch() as usize);
+    let n_batch = engine.n_batch().max(1) as usize;
+    let n_ubatch = engine.n_ubatch().max(1) as usize;
+    let builder = BatchBuilder::new(n_batch);
+    let budget = resolve_budget(policy.budget(), n_batch, n_ubatch, n);
+    tracing::info!(
+        n_batch,
+        n_ubatch,
+        prefill_max = budget.prefill_max,
+        decode_max = budget.decode_max,
+        "scheduler budget"
+    );
     let n_ctx_seq = engine.n_ctx_seq();
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut iter = 0u64;
@@ -219,7 +229,7 @@ async fn run_loop(
                 .map(|s| s.id)
                 .collect();
         }
-        let plan = builder.plan(&slots, &order, policy.budget());
+        let plan = builder.plan(&slots, &order, budget);
 
         if plan.is_empty() {
             if !has_active(&slots) && waiting.is_empty() {
@@ -275,6 +285,23 @@ async fn run_loop(
         maybe_log_prefill_progress(&mut slots);
         sample_and_emit(&mut slots, &plan, &logits, &engine, n_ctx_seq, &metrics);
         evict_finished(&mut slots, &engine, iter, &metrics);
+    }
+}
+
+/// The P3 32/16 default is a unit-test placeholder. A live context should
+/// fill `n_batch` (single slot) or `n_ubatch` (shared GPU), matching llama-server.
+fn resolve_budget(
+    requested: IterationBudget,
+    n_batch: usize,
+    n_ubatch: usize,
+    n_parallel: usize,
+) -> IterationBudget {
+    if requested == IterationBudget::default() {
+        return IterationBudget::for_context(n_batch, n_ubatch, n_parallel);
+    }
+    IterationBudget {
+        prefill_max: requested.prefill_max.min(n_batch).max(1),
+        decode_max: requested.decode_max.max(1),
     }
 }
 
@@ -746,6 +773,28 @@ mod tests {
         )
     }
 
+    #[test]
+    fn default_budget_follows_single_slot_n_batch() {
+        let b = resolve_budget(IterationBudget::default(), 5800, 1024, 1);
+        assert_eq!(b.prefill_max, 5800);
+        assert_eq!(b.decode_max, 1);
+    }
+
+    #[test]
+    fn explicit_budget_is_clamped_to_n_batch() {
+        let b = resolve_budget(
+            IterationBudget {
+                prefill_max: 99999,
+                decode_max: 4,
+            },
+            5800,
+            1024,
+            1,
+        );
+        assert_eq!(b.prefill_max, 5800);
+        assert_eq!(b.decode_max, 4);
+    }
+
     #[tokio::test]
     async fn try_submit_rejects_when_full() {
         let (tx, _rx) = mpsc::channel(1);
@@ -865,7 +914,7 @@ mod gpu_tests {
 
         let serial = spawn_scheduler(
             engine.clone(),
-            Box::new(FifoPolicy),
+            Box::new(FifoPolicy::default()),
             SchedulerConfig {
                 n_parallel: 1,
                 queue_capacity: 4,
@@ -884,7 +933,7 @@ mod gpu_tests {
 
         let parallel = spawn_scheduler(
             engine,
-            Box::new(FifoPolicy),
+            Box::new(FifoPolicy::default()),
             SchedulerConfig {
                 n_parallel: 2,
                 queue_capacity: 2,
@@ -941,7 +990,7 @@ mod gpu_tests {
         let engine = Arc::new(Engine::new(model));
         let spawned = spawn_scheduler(
             engine,
-            Box::new(FifoPolicy),
+            Box::new(FifoPolicy::default()),
             SchedulerConfig {
                 n_parallel: 1,
                 queue_capacity: 1,

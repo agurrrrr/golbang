@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use golbang_core::{
-    Engine, FifoPolicy, LoadParams, Model, ReasoningFormat, SchedulerConfig, spawn_scheduler,
+    Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
+    spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -139,7 +140,11 @@ async fn main() -> Result<()> {
     .with_context(|| format!("load {}", model_path.display()))?;
 
     let policy: Box<dyn golbang_core::SchedulePolicy> = match args.policy.as_str() {
-        "fifo" => Box::new(FifoPolicy),
+        "fifo" => Box::new(FifoPolicy::with_budget(IterationBudget::for_context(
+            model.n_batch() as usize,
+            model.n_ubatch() as usize,
+            n_parallel as usize,
+        ))),
         other => anyhow::bail!("unknown policy {other} (P2 ships fifo only)"),
     };
 

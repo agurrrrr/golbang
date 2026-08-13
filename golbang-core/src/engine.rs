@@ -35,6 +35,10 @@ impl Engine {
         self.lock().n_batch()
     }
 
+    pub fn n_ubatch(&self) -> u32 {
+        self.lock().n_ubatch()
+    }
+
     pub fn n_vocab(&self) -> i32 {
         self.lock().n_vocab()
     }

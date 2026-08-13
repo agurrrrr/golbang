@@ -23,7 +23,7 @@ pub use engine::Engine;
 pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
 pub use model::{LoadParams, Model};
-pub use policy::{FifoPolicy, SchedulePolicy, SlotView, WaitingJobView};
+pub use policy::{FifoPolicy, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
 pub use prefix_cache::{PrefixStore, SlotPrefixCache, common_prefix_len};
 pub use reasoning::{ReasoningDelta, ReasoningFormat, ReasoningParser};
 pub use sampler::{Sampler, SamplerParams};

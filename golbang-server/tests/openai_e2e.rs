@@ -38,7 +38,7 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
     let engine = Arc::new(Engine::new(model));
     let spawned = spawn_scheduler(
         engine,
-        Box::new(FifoPolicy),
+        Box::new(FifoPolicy::default()),
         SchedulerConfig {
             n_parallel,
             queue_capacity: queue_size,
