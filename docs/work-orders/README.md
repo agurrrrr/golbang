@@ -14,6 +14,7 @@
 2. **P1 템플릿:** Qwen ChatML 하드코딩. 실패 시 raw 폴백 + 경고. jinja는 후속.
 3. **P2 성공:** P1 대비 후발 TTFT 개선 + llama-server와 동일 조건 기록. 처리량 승리는 필수 아님.
 4. **P4:** 선택. P0~P3 완료 + gfx906 커널 매크로 스모크 + 프로파일이 특정 커널을 지목할 때만.
+   그 프로파일은 P6(#29). P5(#28) 다턴 prefix가 P4보다 먼저다.
 
 ## 하이브리드의 역할 (요약)
 
@@ -36,7 +37,7 @@ llama-server도 이미 continuous batching(슬롯 + 통합 batch + `llama_decode
 | FFI 진입점 | `llama.h` C API 존재 (`llama_decode`, `llama_tokenize` 등) |
 | 기존 자산 | `/home/agurrrrr/code/local-llm/llama.cpp` (빌드 산출물 `.so` 존재) |
 | GGUF 모델 | `/home/agurrrrr/code/local-llm/models` (Qwen 계열 GGUF) |
-| 벤치 기록 | `docs/bench/` — `p2.md`, `p3.md` (각 지시서 완료 시 채움) |
+| 벤치 기록 | `docs/bench/` — `p2.md`, `p3.md`, `p5.md`, `p6.md` (각 지시서 완료 시 채움) |
 
 ## 단계별 지시서
 
@@ -46,6 +47,8 @@ llama-server도 이미 continuous batching(슬롯 + 통합 batch + `llama_decode
 | **P1** | [P1-single-request-e2e.md](P1-single-request-e2e.md) | OpenAI 호환 `/v1/chat/completions` 1건을 SSE 스트리밍으로 응답 | `choices[].delta.content` 토큰 단위 + `[DONE]` + 빈 messages 4xx | #24 |
 | **P2** | [P2-concurrency-core.md](P2-concurrency-core.md) | 정책 교체 가능한 스케줄 루프 + 제어면 | P1 대비 후발 TTFT 개선 + llama-server 기록 (처리량 승리 필수 아님) | #25 |
 | **P3** | [P3-performance.md](P3-performance.md) | prefix cache, chunked prefill, 메트릭 | 동일 GGUF/`-c`/`-np`/`-ctk`/`-ctv`/클럭 벤치 | #26 |
+| **P5** | [P5-multiturn-prefix-cache.md](P5-multiturn-prefix-cache.md) | 다턴에서 prefix KV 생존 (커널 0줄) | 2턴째 `cache_n>0`, TTFT=suffix | #28 |
+| **P6** | [P6-rocprof-hip-kernels.md](P6-rocprof-hip-kernels.md) | rocprof 지목 커널만 HIP C++ | 순위표 + (조건부) 패치 1개 | #29 |
 | **P4** | [P4-rust-kernels.md](P4-rust-kernels.md) | (장기·선택) hot-path 커널 Rust+HIP 점진 재작성 | 특정 커널 Rust 치환 + 성능 회귀 없음 | #27 |
 
 ## 진행 규칙

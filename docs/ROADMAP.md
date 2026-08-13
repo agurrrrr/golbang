@@ -1,7 +1,7 @@
 # golbang 로드맵
 
-> 각 단계(P0~P4)는 **독립적으로 검증 가능**하다. 앞 단계가 끝나야 다음 단계로 진행.
-> 상세 실행은 `docs/work-orders/`를 따른다.
+> 각 단계(P0~P6)는 **독립적으로 검증 가능**하다. 앞 단계가 끝나야 다음 단계로 진행.
+> 상세 실행은 `docs/work-orders/`를 따른다. P4는 선택이며 P5·P6보다 뒤다.
 
 ## 고정 결정 (2026-08-13, 작업 #272 합의)
 
@@ -46,12 +46,30 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 
 ## P3 — 성능 & 안정화
 
-- [ ] **먼저** `llama_memory_seq_*` 복사 스파이크. 불가면 슬롯 내 시스템 프롬프트 재사용으로 축소
-- [ ] prefix caching (스파이크가 허용하는 범위)
-- [ ] chunked prefill (정책에 예산으로 추가)
-- [ ] `/metrics`
+- [x] **먼저** `llama_memory_seq_*` 복사 스파이크. 불가 → 슬롯 내 재사용으로 축소 (#26)
+- [x] prefix caching (slot-local만. 생산 다턴 `cache_n=0`은 P5)
+- [x] chunked prefill (정책에 예산으로 추가)
+- [x] `/metrics`
 - [ ] (선택) (B) cmake+hipcc 소스 빌드 — ADR의 재현성 빌드는 여기
-- [ ] **완료 기준:** 동일 GGUF / `-c` / `-np` / `-ctk` / `-ctv` / GPU 클럭으로 llama-server 벤치 기록
+- [x] **완료 기준:** 동일 GGUF / `-c` / `-np` / `-ctk` / `-ctv` / GPU 클럭으로 llama-server 벤치 기록
+      (`docs/bench/p3.md`. 생산 실측은 위키 `dsv4-run-notes`)
+
+## P5 — 다턴 prefix cache (커널 0줄)
+
+**목표:** 같은 대화의 다음 턴에서 prefix KV가 슬롯에 남아 suffix만 prefill한다.
+
+- [ ] Stop/Length evict 후 `clear_seq` 하지 않음
+- [ ] 생성 토큰 ID를 슬롯 캐시에 누적
+- [ ] bind 시 LCP만큼 `n_past`, suffix KV만 `llama_memory_seq_rm`
+- [ ] **완료 기준:** 2턴째 `cache_n > 0`, 3k대 TTFT가 suffix만큼. 이슈 #28
+
+## P6 — rocprof → 지목 커널만 HIP C++
+
+**목표:** P3 §4.5를 실제로 한다. Rust 커널이 아니다.
+
+- [ ] gfx906 rocprof, prefill/decode 순위표 (`docs/bench/p6.md`)
+- [ ] 지목되면 커널 1개 HIP C++. 아니면 중단 사유만
+- [ ] **완료 기준:** 순위표 + (조건부) 패치·회귀 없음. 이슈 #29
 
 ## P4 — (장기·선택) 순수 Rust 커널
 
@@ -59,9 +77,9 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 
 착수 전 gate (전부 필수):
 
-- [ ] P0~P3 완료
+- [x] P0~P3 완료
+- [ ] P6(#29) rocprof가 병목을 특정 커널로 지목 (아니면 열지 않음)
 - [ ] gfx906에서 rocm-rs 커널 매크로 스모크 (no-op / vector add)
-- [ ] 프로파일이 병목을 특정 커널로 지목 (오케스트레이션이면 스케줄러를 먼저)
 - [ ] **완료 기준:** 특정 커널 Rust 치환 + 성능 회귀 없음
 
 ---
@@ -74,4 +92,6 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 | P1 | OpenAI 호환 단일 스트리밍 | curl SSE + 4xx |
 | P2 | 동시성 코어 — 교체 가능한 스케줄 루프 | P1 대비 TTFT + llama-server 기록 |
 | P3 | 성능 최적화 | 공정 조건 벤치 |
-| P4 | Rust 커널 일부 (선택) | gate 통과 후, 회귀 없음 |
+| P5 | 다턴 prefix KV 생존 | 2턴째 `cache_n>0`, TTFT=suffix |
+| P6 | rocprof + HIP C++ 1커널 | 순위표, 지목 시에만 패치 |
+| P4 | Rust 커널 일부 (선택) | P6 이후 gate, 회귀 없음 |
