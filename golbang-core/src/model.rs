@@ -10,14 +10,31 @@ use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
 use crate::tokenizer::{Token, Tokenizer};
 
+/// Matches llama.cpp `LLM_FFN_EXPS_REGEX` — expert tensors left on CPU by `-ncmoe`.
+const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+
 /// Load options. `n_ctx` is **per sequence**. Total KV is `n_ctx * n_seq_max`
 /// so P1's 256-token slot stays 256 when `--n-parallel` grows.
 /// Keep both small when another llama-server already holds most of VRAM.
+///
+/// `n_cpu_moe` pins expert weights of the first N layers to CPU (`-ncmoe`).
+/// Required to fit large MoE GGUFs (e.g. DSV4 IQ2_M ~85 GiB) on 32 GiB VRAM.
+/// `n_batch`/`n_ubatch` of 0 mean "same as `n_ctx`" — override for long context.
 #[derive(Clone, Debug)]
 pub struct LoadParams {
     pub n_gpu_layers: i32,
     pub n_ctx: u32,
     pub n_seq_max: u32,
+    /// First N MoE layers' expert tensors stay on CPU. 0 = off.
+    pub n_cpu_moe: u32,
+    /// `LLAMA_FLASH_ATTN_TYPE_{AUTO,DISABLED,ENABLED}`.
+    pub flash_attn: i32,
+    /// Logical decode batch. 0 = `n_ctx`.
+    pub n_batch: u32,
+    /// Physical ubatch. 0 = `n_batch`.
+    pub n_ubatch: u32,
+    /// 0 = llama.cpp default thread count.
+    pub n_threads: i32,
 }
 
 impl Default for LoadParams {
@@ -26,6 +43,11 @@ impl Default for LoadParams {
             n_gpu_layers: 99,
             n_ctx: 256,
             n_seq_max: 1,
+            n_cpu_moe: 0,
+            flash_attn: LLAMA_FLASH_ATTN_TYPE_AUTO,
+            n_batch: 0,
+            n_ubatch: 0,
+            n_threads: 0,
         }
     }
 }
@@ -61,17 +83,37 @@ impl Model {
         let n_ctx_seq = params.n_ctx.max(1);
         let n_seq_max = params.n_seq_max.max(1);
         let n_ctx_total = n_ctx_seq.saturating_mul(n_seq_max);
+        let n_batch = if params.n_batch == 0 {
+            n_ctx_seq
+        } else {
+            params.n_batch.max(1)
+        };
+        let n_ubatch = if params.n_ubatch == 0 {
+            n_batch
+        } else {
+            params.n_ubatch.max(1).min(n_batch)
+        };
         tracing::info!(
             path = %path.display(),
             n_ctx_seq,
             n_ctx_total,
             n_seq_max,
+            n_batch,
+            n_ubatch,
             n_gpu_layers = params.n_gpu_layers,
+            n_cpu_moe = params.n_cpu_moe,
+            flash_attn = params.flash_attn,
             "loading GGUF"
         );
 
         let mut mparams = unsafe { llama_model_default_params() };
         mparams.n_gpu_layers = params.n_gpu_layers;
+
+        // Patterns must stay alive until `llama_model_load_from_file` returns.
+        let cpu_moe = CpuMoeOverrides::new(params.n_cpu_moe);
+        if let Some(ptr) = cpu_moe.as_ptr() {
+            mparams.tensor_buft_overrides = ptr;
+        }
 
         let model = unsafe { llama_model_load_from_file(c_path.as_ptr(), mparams) };
         if model.is_null() {
@@ -97,9 +139,14 @@ impl Model {
 
         let mut cparams = unsafe { llama_context_default_params() };
         cparams.n_ctx = n_ctx_total;
-        cparams.n_batch = n_ctx_seq;
-        cparams.n_ubatch = n_ctx_seq;
+        cparams.n_batch = n_batch;
+        cparams.n_ubatch = n_ubatch;
         cparams.n_seq_max = n_seq_max;
+        cparams.flash_attn_type = params.flash_attn;
+        if params.n_threads > 0 {
+            cparams.n_threads = params.n_threads;
+            cparams.n_threads_batch = params.n_threads;
+        }
 
         let ctx = unsafe { llama_init_from_model(model, cparams) };
         if ctx.is_null() {
@@ -363,6 +410,70 @@ unsafe extern "C" fn forward_llama_log(level: ggml_log_level, text: *const c_cha
     match level {
         GGML_LOG_LEVEL_ERROR => tracing::error!(target: "llama", "{trimmed}"),
         GGML_LOG_LEVEL_WARN => tracing::warn!(target: "llama", "{trimmed}"),
+        GGML_LOG_LEVEL_INFO => tracing::info!(target: "llama", "{trimmed}"),
         _ => tracing::debug!(target: "llama", "{trimmed}"),
+    }
+}
+
+/// NULL-terminated `tensor_buft_overrides` that pin MoE expert tensors to CPU.
+/// Owns the CStrings so the pointers stay valid through `llama_model_load_from_file`.
+struct CpuMoeOverrides {
+    _patterns: Vec<CString>,
+    overrides: Vec<llama_model_tensor_buft_override>,
+}
+
+impl CpuMoeOverrides {
+    fn new(n_cpu_moe: u32) -> Self {
+        if n_cpu_moe == 0 {
+            return Self {
+                _patterns: Vec::new(),
+                overrides: Vec::new(),
+            };
+        }
+        let cpu_buft = unsafe { ggml_backend_cpu_buffer_type() };
+        let mut patterns = Vec::with_capacity(n_cpu_moe as usize);
+        let mut overrides = Vec::with_capacity(n_cpu_moe as usize + 1);
+        for i in 0..n_cpu_moe {
+            let pat = CString::new(format!("blk\\.{i}{FFN_EXPS_REGEX}"))
+                .expect("MoE override pattern is ASCII");
+            overrides.push(llama_model_tensor_buft_override {
+                pattern: pat.as_ptr(),
+                buft: cpu_buft,
+            });
+            patterns.push(pat);
+        }
+        overrides.push(llama_model_tensor_buft_override {
+            pattern: ptr::null(),
+            buft: ptr::null_mut(),
+        });
+        Self {
+            _patterns: patterns,
+            overrides,
+        }
+    }
+
+    fn as_ptr(&self) -> Option<*const llama_model_tensor_buft_override> {
+        if self.overrides.is_empty() {
+            None
+        } else {
+            Some(self.overrides.as_ptr())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FFN_EXPS_REGEX;
+
+    #[test]
+    fn cpu_moe_block_regex_matches_llama_cpp() {
+        assert_eq!(
+            format!("blk\\.{i}{FFN_EXPS_REGEX}", i = 0),
+            r"blk\.0\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+        );
+        assert_eq!(
+            format!("blk\\.{i}{FFN_EXPS_REGEX}", i = 31),
+            r"blk\.31\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+        );
     }
 }

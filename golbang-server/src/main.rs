@@ -34,6 +34,26 @@ struct Args {
     #[arg(long, env = "GOLBANG_N_GPU_LAYERS", default_value_t = 99)]
     n_gpu_layers: i32,
 
+    /// Keep MoE expert tensors of the first N layers on CPU (`-ncmoe`).
+    #[arg(long, env = "GOLBANG_N_CPU_MOE", default_value_t = 0)]
+    n_cpu_moe: u32,
+
+    /// Flash attention: auto | on | off
+    #[arg(long, env = "GOLBANG_FLASH_ATTN", default_value = "auto")]
+    flash_attn: String,
+
+    /// Logical llama n_batch. 0 = n_ctx.
+    #[arg(long, env = "GOLBANG_N_BATCH", default_value_t = 0)]
+    n_batch: u32,
+
+    /// Physical llama n_ubatch. 0 = n_batch.
+    #[arg(long, env = "GOLBANG_N_UBATCH", default_value_t = 0)]
+    n_ubatch: u32,
+
+    /// llama decode threads. 0 = library default.
+    #[arg(long, env = "GOLBANG_N_THREADS", default_value_t = 0)]
+    n_threads: i32,
+
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
     n_parallel: u32,
@@ -63,6 +83,16 @@ fn resolve_model(args: &Args) -> Result<PathBuf> {
     anyhow::bail!("--model / GOLBANG_MODEL / GOLBANG_TEST_MODEL is required");
 }
 
+fn parse_flash_attn(s: &str) -> Result<i32> {
+    // llama.h: AUTO=-1, DISABLED=0, ENABLED=1
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" | "-1" => Ok(-1),
+        "on" | "1" | "true" | "enabled" => Ok(1),
+        "off" | "0" | "false" | "disabled" => Ok(0),
+        other => anyhow::bail!("--flash-attn must be auto|on|off, got {other}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -80,12 +110,18 @@ async fn main() -> Result<()> {
         .to_string();
 
     let n_parallel = args.n_parallel.max(1);
+    let flash_attn = parse_flash_attn(&args.flash_attn)?;
     let model = Model::load(
         &model_path,
         LoadParams {
             n_gpu_layers: args.n_gpu_layers,
             n_ctx: args.n_ctx,
             n_seq_max: n_parallel,
+            n_cpu_moe: args.n_cpu_moe,
+            flash_attn,
+            n_batch: args.n_batch,
+            n_ubatch: args.n_ubatch,
+            n_threads: args.n_threads,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;

@@ -115,6 +115,8 @@ fn main() {
         .allowlist_function("ggml_backend_dev_description")
         .allowlist_function("ggml_backend_dev_type")
         .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_cpu_buffer_type")
+        .allowlist_function("ggml_backend_dev_buffer_type")
         .allowlist_type("ggml_log_level")
         .allowlist_type("ggml_backend_dev_type")
         .allowlist_var("GGML_LOG_.*")

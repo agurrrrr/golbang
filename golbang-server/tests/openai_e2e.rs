@@ -102,6 +102,7 @@ async fn openai_sse_json_and_empty_messages() {
                 n_ctx: 256,
                 n_gpu_layers: 99,
                 n_seq_max: 2,
+                ..Default::default()
             },
         )
     })
@@ -203,6 +204,7 @@ async fn decode_busy_returns_503_immediately() {
                 n_ctx: 256,
                 n_gpu_layers: 99,
                 n_seq_max: 1,
+                ..Default::default()
             },
         )
     })

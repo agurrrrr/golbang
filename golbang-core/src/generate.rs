@@ -285,6 +285,7 @@ mod gpu_tests {
                 n_ctx: 256,
                 n_gpu_layers: 99,
                 n_seq_max: 1,
+                ..Default::default()
             },
         )
         .expect("load");
