@@ -9,23 +9,27 @@ mod generate;
 mod model;
 mod policy;
 mod prefix_cache;
+mod reasoning;
 mod sampler;
 mod scheduler;
 mod slot;
 mod tokenizer;
 
 pub use batch::{BatchBuilder, BatchPlan, BatchToken};
-pub use chat::{apply_chat_template, AppliedPrompt, ChatMessage};
+pub use chat::{
+    AppliedPrompt, ChatApplyOpts, ChatMessage, apply_chat_template, apply_chat_template_with,
+};
 pub use engine::Engine;
 pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
 pub use model::{LoadParams, Model};
 pub use policy::{FifoPolicy, SchedulePolicy, SlotView, WaitingJobView};
-pub use prefix_cache::{common_prefix_len, PrefixStore, SlotPrefixCache};
+pub use prefix_cache::{PrefixStore, SlotPrefixCache, common_prefix_len};
+pub use reasoning::{ReasoningDelta, ReasoningFormat, ReasoningParser};
 pub use sampler::{Sampler, SamplerParams};
 pub use scheduler::{
-    spawn_scheduler, Job, SchedulerConfig, SchedulerHandle, SchedulerMetrics, SpawnedScheduler,
-    SubmitError,
+    Job, SchedulerConfig, SchedulerHandle, SchedulerMetrics, SpawnedScheduler, SubmitError,
+    spawn_scheduler,
 };
 pub use slot::{Slot, SlotEvent, SlotId, SlotPhase};
 pub use tokenizer::{Token, Tokenizer};

@@ -1,6 +1,9 @@
-//! Qwen ChatML, hardcoded. `llama_chat_apply_template` is not a jinja parser
-//! and cannot apply the GGUF `tokenizer.chat_template` for Qwen. minijinja is later.
+//! Chat templates: Qwen ChatML (P1 default) and GGUF jinja (`--jinja`).
+//!
+//! `llama_chat_apply_template` is not a jinja parser. When `--jinja` is on we
+//! apply `tokenizer.chat_template` with minijinja (same idea as llama-server).
 
+use minijinja::{Environment, UndefinedBehavior, Value, context};
 use tracing::warn;
 
 /// One chat turn. Roles accepted by ChatML: `system`, `user`, `assistant`.
@@ -10,11 +13,21 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Result of applying a template. `used_chatml == false` means raw-join fallback.
+/// Result of applying a template. `used_chatml` / `used_jinja` record which path ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppliedPrompt {
     pub prompt: String,
     pub used_chatml: bool,
+    pub used_jinja: bool,
+}
+
+/// How to format messages. Default is hardcoded ChatML.
+#[derive(Clone, Debug, Default)]
+pub struct ChatApplyOpts {
+    pub jinja: bool,
+    pub template: Option<String>,
+    pub bos_token: String,
+    pub enable_thinking: bool,
 }
 
 const IM_START: &str = "<|im_start|>";
@@ -23,19 +36,98 @@ const IM_END: &str = "<|im_end|>";
 /// Apply Qwen ChatML. Empty messages or an unknown role → concatenate contents
 /// and log a warning (P1 decision).
 pub fn apply_chat_template(messages: &[ChatMessage]) -> AppliedPrompt {
+    apply_chat_template_with(messages, &ChatApplyOpts::default())
+}
+
+pub fn apply_chat_template_with(messages: &[ChatMessage], opts: &ChatApplyOpts) -> AppliedPrompt {
+    if opts.jinja {
+        if let Some(tmpl) = opts.template.as_deref().filter(|s| !s.is_empty()) {
+            match apply_jinja(tmpl, messages, opts) {
+                Ok(prompt) => {
+                    return AppliedPrompt {
+                        prompt,
+                        used_chatml: false,
+                        used_jinja: true,
+                    };
+                }
+                Err(reason) => {
+                    warn!(reason, "jinja apply failed; falling back to ChatML");
+                }
+            }
+        } else {
+            warn!("--jinja set but GGUF has no chat_template; falling back to ChatML");
+        }
+    }
+
     match try_chatml(messages) {
         Ok(prompt) => AppliedPrompt {
             prompt,
             used_chatml: true,
+            used_jinja: false,
         },
         Err(reason) => {
             warn!(reason, "ChatML apply failed; using raw prompt fallback");
             AppliedPrompt {
                 prompt: raw_join(messages),
                 used_chatml: false,
+                used_jinja: false,
             }
         }
     }
+}
+
+fn apply_jinja(
+    template: &str,
+    messages: &[ChatMessage],
+    opts: &ChatApplyOpts,
+) -> std::result::Result<String, String> {
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> Result<Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    env.add_filter(
+        "from_json",
+        |s: String| -> Result<Value, minijinja::Error> {
+            let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+            })?;
+            Ok(Value::from_serialize(v))
+        },
+    );
+
+    env.add_template("chat", template)
+        .map_err(|e| format!("compile chat template: {e}"))?;
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| format!("load chat template: {e}"))?;
+
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            })
+        })
+        .collect();
+
+    tmpl.render(context! {
+        messages => msgs,
+        bos_token => opts.bos_token.clone(),
+        eos_token => "",
+        add_generation_prompt => true,
+        thinking => opts.enable_thinking,
+        enable_thinking => opts.enable_thinking,
+    })
+    .map_err(|e| format!("render chat template: {e}"))
 }
 
 fn try_chatml(messages: &[ChatMessage]) -> std::result::Result<String, &'static str> {
@@ -92,6 +184,7 @@ mod tests {
     fn user_only_gets_assistant_prefix() {
         let applied = apply_chat_template(&[msg("user", "안녕")]);
         assert!(applied.used_chatml);
+        assert!(!applied.used_jinja);
         assert_eq!(
             applied.prompt,
             "<|im_start|>user\n안녕<|im_end|>\n<|im_start|>assistant\n"
@@ -112,8 +205,16 @@ mod tests {
     fn trailing_assistant_skips_generation_prefix() {
         let applied = apply_chat_template(&[msg("user", "hi"), msg("assistant", "hey")]);
         assert!(applied.used_chatml);
-        assert!(applied.prompt.ends_with("<|im_start|>assistant\nhey<|im_end|>\n"));
-        assert!(!applied.prompt.ends_with("<|im_start|>assistant\n<|im_start|>assistant\n"));
+        assert!(
+            applied
+                .prompt
+                .ends_with("<|im_start|>assistant\nhey<|im_end|>\n")
+        );
+        assert!(
+            !applied
+                .prompt
+                .ends_with("<|im_start|>assistant\n<|im_start|>assistant\n")
+        );
     }
 
     #[test]
@@ -128,5 +229,43 @@ mod tests {
         let applied = apply_chat_template(&[]);
         assert!(!applied.used_chatml);
         assert!(applied.prompt.is_empty());
+    }
+
+    #[test]
+    fn dsv4_jinja_thinking_on() {
+        let tmpl = include_str!("../tests/fixtures/dsv4_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[msg("user", "hi")],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                bos_token: "<｜begin▁of▁sentence｜>".into(),
+                enable_thinking: true,
+            },
+        );
+        assert!(applied.used_jinja);
+        assert_eq!(
+            applied.prompt,
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜><think>"
+        );
+    }
+
+    #[test]
+    fn dsv4_jinja_thinking_off() {
+        let tmpl = include_str!("../tests/fixtures/dsv4_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[msg("system", "be brief"), msg("user", "hi")],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                bos_token: "<｜begin▁of▁sentence｜>".into(),
+                enable_thinking: false,
+            },
+        );
+        assert!(applied.used_jinja);
+        assert_eq!(
+            applied.prompt,
+            "<｜begin▁of▁sentence｜>be brief<｜User｜>hi<｜Assistant｜></think>"
+        );
     }
 }

@@ -8,10 +8,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use golbang_core::{
-    spawn_scheduler, Engine, FifoPolicy, LoadParams, Model, SchedulerConfig,
-};
-use golbang_server::{router, AppState};
+use golbang_core::{Engine, FifoPolicy, LoadParams, Model, SchedulerConfig, spawn_scheduler};
+use golbang_server::{AppState, ChatRuntime, router};
 use tokio::net::TcpListener;
 
 fn lock_gpu() -> std::fs::File {
@@ -51,6 +49,8 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
         scheduler: spawned.handle,
         model_name: "qwen-test".into(),
         default_timeout: None,
+        chat: ChatRuntime::default(),
+        api_keys: Vec::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -113,10 +113,7 @@ async fn openai_sse_json_and_empty_messages() {
     let port = serve(model, 2, 2).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
-    let (empty_st, empty_txt) = curl_json(
-        &url,
-        r#"{"model":"qwen","messages":[],"stream":true}"#,
-    );
+    let (empty_st, empty_txt) = curl_json(&url, r#"{"model":"qwen","messages":[],"stream":true}"#);
     assert!(
         empty_st == 400 || (400..500).contains(&empty_st),
         "empty messages should be 4xx, got {empty_st}:\n{empty_txt}"

@@ -1,0 +1,35 @@
+[Unit]
+Description=golbang OpenAI server - DeepSeek-V4-Flash-0731 UD-IQ2_M (MI50)
+After=network.target
+Conflicts=llama-server.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=ROCBLAS_USE_HIPBLASLT=0
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp/build/bin
+Environment=RUST_LOG=info
+# n-ubatch=1024: llama-server uses -b/-ub 5800, but this llama.cpp SHA needs ~5 GiB
+# compute at ubatch=5800 and OOMs next to 60k KV on 32 GiB. n-batch stays 5800.
+ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
+  --model /home/agurrrrr/code/local-llm/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  --host 0.0.0.0 --port 8080 \
+  --n-gpu-layers 99 --n-cpu-moe 32 --flash-attn on \
+  --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 8 \
+  --n-parallel 1 --queue-size 1 \
+  --jinja --reasoning-format deepseek \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target

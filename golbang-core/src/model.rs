@@ -183,6 +183,54 @@ impl Model {
         self.n_vocab
     }
 
+    /// GGUF `tokenizer.chat_template`, if present.
+    pub fn chat_template(&self) -> Option<String> {
+        unsafe {
+            let p = llama_model_chat_template(self.model, ptr::null());
+            if !p.is_null() {
+                let s = CStr::from_ptr(p).to_string_lossy();
+                if !s.is_empty() {
+                    return Some(s.into_owned());
+                }
+            }
+            let key = CString::new("tokenizer.chat_template").ok()?;
+            let mut buf = vec![0u8; 32 * 1024];
+            let mut n = llama_model_meta_val_str(
+                self.model,
+                key.as_ptr(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            );
+            if n < 0 {
+                let need = (-n) as usize + 1;
+                buf.resize(need, 0);
+                n = llama_model_meta_val_str(
+                    self.model,
+                    key.as_ptr(),
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                );
+            }
+            if n > 0 {
+                Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// BOS piece with special tokens unparsed. Empty if the vocab has no BOS.
+    pub fn bos_token_str(&self) -> String {
+        let tok = unsafe { llama_vocab_bos(self.vocab) };
+        if tok < 0 {
+            return String::new();
+        }
+        match self.tokenizer().token_to_piece(tok, true) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(_) => String::new(),
+        }
+    }
+
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_n_ctx(self.ctx) }
     }
@@ -248,11 +296,7 @@ impl Model {
                 return 0;
             }
             let max = llama_memory_seq_pos_max(mem, seq_id);
-            if max < 0 {
-                0
-            } else {
-                (max + 1) as u32
-            }
+            if max < 0 { 0 } else { (max + 1) as u32 }
         }
     }
 
@@ -395,7 +439,11 @@ fn init_backend() {
     });
 }
 
-unsafe extern "C" fn forward_llama_log(level: ggml_log_level, text: *const c_char, _ud: *mut c_void) {
+unsafe extern "C" fn forward_llama_log(
+    level: ggml_log_level,
+    text: *const c_char,
+    _ud: *mut c_void,
+) {
     if text.is_null() {
         return;
     }

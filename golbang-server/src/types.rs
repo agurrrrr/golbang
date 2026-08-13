@@ -68,6 +68,8 @@ pub struct Choice {
 pub struct AssistantMessage {
     pub role: &'static str,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +101,8 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 pub fn validate_request(req: &ChatCompletionRequest) -> Result<(), String> {

@@ -4,19 +4,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use golbang_core::{
-    apply_chat_template, CancellationToken, GenerateParams, Job, SlotEvent,
+    CancellationToken, ChatApplyOpts, GenerateParams, Job, ReasoningParser, SlotEvent,
+    apply_chat_template_with,
 };
 
+use crate::AppState;
 use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
     Delta, Usage,
 };
-use crate::AppState;
 
 pub fn completion_id() -> String {
     let n = SystemTime::now()
@@ -33,14 +34,22 @@ pub fn unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn generate_params(req: &ChatCompletionRequest) -> GenerateParams {
+pub fn generate_params(req: &ChatCompletionRequest, state: &AppState) -> GenerateParams {
+    let mut stop = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
+    if state.chat.use_jinja {
+        for extra in ["<｜User｜>", "<｜end▁of▁sentence｜>"] {
+            if !stop.iter().any(|s| s == extra) {
+                stop.push(extra.to_string());
+            }
+        }
+    }
     GenerateParams {
         max_tokens: req.max_tokens.unwrap_or(256).max(1),
         temperature: req.temperature.unwrap_or(1.0).max(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(0),
         seed: req.seed.unwrap_or(0),
-        stop: req.stop.clone().map(|s| s.into_vec()).unwrap_or_default(),
+        stop,
     }
 }
 
@@ -55,10 +64,24 @@ fn core_messages(messages: Vec<ChatMessage>) -> Vec<golbang_core::ChatMessage> {
     messages.into_iter().map(Into::into).collect()
 }
 
-fn prompt_from(req: &ChatCompletionRequest) -> String {
+fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
     let messages = core_messages(req.messages.clone());
-    let applied = apply_chat_template(&messages);
-    if !applied.used_chatml {
+    let applied = apply_chat_template_with(
+        &messages,
+        &ChatApplyOpts {
+            jinja: state.chat.use_jinja,
+            template: state.chat.template.clone(),
+            bos_token: state.chat.bos_token.clone(),
+            enable_thinking: state.chat.enable_thinking,
+        },
+    );
+    if applied.used_jinja {
+        tracing::debug!(
+            thinking = state.chat.enable_thinking,
+            prompt_chars = applied.prompt.len(),
+            "applied GGUF jinja chat template"
+        );
+    } else if !applied.used_chatml {
         tracing::warn!("serving request with raw prompt fallback");
     }
     applied.prompt
@@ -71,13 +94,14 @@ pub fn stream_completion(
     let id = completion_id();
     let created = unix_ts();
     let model_name = model_name(&req, &state);
-    let params = generate_params(&req);
-    let prompt = prompt_from(&req);
+    let params = generate_params(&req, &state);
+    let prompt = prompt_from(&req, &state);
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let (sse_tx, sse_rx) = mpsc::channel::<Event>(16);
     let cancel = CancellationToken::new();
     let cancel_on_drop = cancel.clone();
+    let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
@@ -101,6 +125,7 @@ pub fn stream_completion(
             Delta {
                 role: Some("assistant"),
                 content: None,
+                ..Default::default()
             },
             None,
         )
@@ -119,6 +144,10 @@ pub fn stream_completion(
                     if t.piece.is_empty() {
                         continue;
                     }
+                    let split = parser.push(&t.piece);
+                    if split.is_empty() {
+                        continue;
+                    }
                     send_chunk(
                         &sse_tx,
                         &id,
@@ -126,13 +155,30 @@ pub fn stream_completion(
                         &model_name,
                         Delta {
                             role: None,
-                            content: Some(t.piece),
+                            content: split.content,
+                            reasoning_content: split.reasoning,
                         },
                         None,
                     )
                     .await
                 }
                 SlotEvent::Finished { reason, .. } => {
+                    let split = parser.finish();
+                    if !split.is_empty() {
+                        let _ = send_chunk(
+                            &sse_tx,
+                            &id,
+                            created,
+                            &model_name,
+                            Delta {
+                                role: None,
+                                content: split.content,
+                                reasoning_content: split.reasoning,
+                            },
+                            None,
+                        )
+                        .await;
+                    }
                     let r = send_chunk(
                         &sse_tx,
                         &id,
@@ -151,7 +197,9 @@ pub fn stream_completion(
                     let payload = serde_json::json!({
                         "error": { "message": e.to_string(), "type": "server_error" }
                     });
-                    let _ = sse_tx.send(Event::default().data(payload.to_string())).await;
+                    let _ = sse_tx
+                        .send(Event::default().data(payload.to_string()))
+                        .await;
                     let _ = sse_tx.send(Event::default().data("[DONE]")).await;
                     break;
                 }
@@ -197,12 +245,13 @@ pub async fn complete(
     let id = completion_id();
     let created = unix_ts();
     let model_name = model_name(&req, &state);
-    let params = generate_params(&req);
-    let prompt = prompt_from(&req);
+    let params = generate_params(&req, &state);
+    let prompt = prompt_from(&req, &state);
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
+    let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
@@ -218,18 +267,34 @@ pub async fn complete(
     }
 
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut finish = None;
     let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u32;
 
     while let Some(ev) = ev_rx.recv().await {
         match ev {
-            SlotEvent::Token(t) => content.push_str(&t.piece),
+            SlotEvent::Token(t) => {
+                let split = parser.push(&t.piece);
+                if let Some(r) = split.reasoning {
+                    reasoning.push_str(&r);
+                }
+                if let Some(c) = split.content {
+                    content.push_str(&c);
+                }
+            }
             SlotEvent::Finished {
                 reason,
                 prompt_tokens: p,
                 completion_tokens: c,
             } => {
+                let split = parser.finish();
+                if let Some(r) = split.reasoning {
+                    reasoning.push_str(&r);
+                }
+                if let Some(c) = split.content {
+                    content.push_str(&c);
+                }
                 finish = Some(reason.as_str().to_string());
                 prompt_tokens = p;
                 completion_tokens = c;
@@ -256,6 +321,11 @@ pub async fn complete(
             message: crate::types::AssistantMessage {
                 role: "assistant",
                 content,
+                reasoning_content: if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning)
+                },
             },
             finish_reason: finish,
         }],

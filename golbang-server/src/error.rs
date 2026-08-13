@@ -1,7 +1,7 @@
-use axum::http::header::{HeaderValue, RETRY_AFTER};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::http::StatusCode;
+use axum::http::header::{HeaderValue, RETRY_AFTER};
+use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 #[derive(Debug)]
@@ -36,6 +36,15 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             kind: "server_error",
+            param: None,
+        }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            kind: "authentication_error",
             param: None,
         }
     }

@@ -6,9 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use golbang_core::{
-    spawn_scheduler, Engine, FifoPolicy, LoadParams, Model, SchedulerConfig,
+    Engine, FifoPolicy, LoadParams, Model, ReasoningFormat, SchedulerConfig, spawn_scheduler,
 };
-use golbang_server::{router, AppState};
+use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -69,6 +69,18 @@ struct Args {
     /// Schedule policy. Only `fifo` is built in (P2).
     #[arg(long, env = "GOLBANG_POLICY", default_value = "fifo")]
     policy: String,
+
+    /// Apply GGUF `tokenizer.chat_template` with minijinja (llama-server `--jinja`).
+    #[arg(long, env = "GOLBANG_JINJA", default_value_t = false)]
+    jinja: bool,
+
+    /// none | deepseek | deepseek-legacy | auto. deepseek/auto extract `<think>`.
+    #[arg(long, env = "GOLBANG_REASONING_FORMAT", default_value = "none")]
+    reasoning_format: String,
+
+    /// Require `Authorization: Bearer …` or `X-Api-Key`. Repeat or comma-separate.
+    #[arg(long, env = "GOLBANG_API_KEY")]
+    api_key: Vec<String>,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -131,6 +143,43 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown policy {other} (P2 ships fifo only)"),
     };
 
+    let reasoning_format =
+        ReasoningFormat::parse(&args.reasoning_format).map_err(anyhow::Error::msg)?;
+    let enable_thinking = reasoning_format.extracts();
+    let chat_template = if args.jinja {
+        model.chat_template()
+    } else {
+        None
+    };
+    let bos_token = if args.jinja {
+        model.bos_token_str()
+    } else {
+        String::new()
+    };
+    if args.jinja {
+        match chat_template.as_deref() {
+            Some(t) => tracing::info!(
+                bytes = t.len(),
+                bos = %bos_token,
+                thinking = enable_thinking,
+                reasoning = reasoning_format.as_str(),
+                "jinja chat template loaded from GGUF"
+            ),
+            None => tracing::warn!("--jinja set but GGUF has no tokenizer.chat_template"),
+        }
+    }
+
+    let api_keys: Vec<String> = args
+        .api_key
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !api_keys.is_empty() {
+        tracing::info!(n = api_keys.len(), "api key auth enabled");
+    }
+
     let engine = Arc::new(Engine::new(model));
     let spawned = spawn_scheduler(
         engine,
@@ -146,6 +195,14 @@ async fn main() -> Result<()> {
         scheduler: spawned.handle,
         model_name,
         default_timeout: args.timeout_secs.map(Duration::from_secs),
+        chat: ChatRuntime {
+            use_jinja: args.jinja,
+            template: chat_template,
+            bos_token,
+            reasoning_format,
+            enable_thinking,
+        },
+        api_keys,
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
