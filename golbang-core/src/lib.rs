@@ -14,6 +14,7 @@ mod sampler;
 mod scheduler;
 mod slot;
 mod tokenizer;
+mod tools;
 
 pub use batch::{BatchBuilder, BatchPlan, BatchToken};
 pub use chat::{
@@ -34,3 +35,4 @@ pub use scheduler::{
 pub use slot::{Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 pub use tokenizer::{Token, Tokenizer};
 pub use tokio_util::sync::CancellationToken;
+pub use tools::{ParsedTools, ToolCall, ToolCallParser, parse_tool_calls};

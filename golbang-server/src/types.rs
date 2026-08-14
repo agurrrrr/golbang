@@ -13,13 +13,90 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
     pub stop: Option<Stop>,
+    #[serde(default)]
+    pub tools: Vec<serde_json::Value>,
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+impl ChatCompletionRequest {
+    pub fn tools_enabled(&self) -> bool {
+        if self.tools.is_empty() {
+            return false;
+        }
+        match &self.tool_choice {
+            Some(v) if v.as_str() == Some("none") => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_content")]
     pub content: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<IncomingToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct IncomingToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub function: IncomingFunction,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IncomingFunction {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+fn deserialize_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s,
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                } else if let Some(s) = p.as_str() {
+                    out.push_str(s);
+                }
+            }
+            out
+        }
+        Some(other) => other.to_string(),
+    })
+}
+
+fn arguments_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "{}".into(),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                "{}".into()
+            } else {
+                s.to_string()
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +120,19 @@ impl From<ChatMessage> for golbang_core::ChatMessage {
         Self {
             role: m.role,
             content: m.content,
+            name: m.name,
+            reasoning_content: m.reasoning_content,
+            tool_calls: m
+                .tool_calls
+                .into_iter()
+                .filter(|tc| !tc.function.name.trim().is_empty())
+                .map(|tc| golbang_core::ToolCall {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments: arguments_to_string(&tc.function.arguments),
+                })
+                .collect(),
+            tool_call_id: m.tool_call_id,
         }
     }
 }
@@ -102,6 +192,43 @@ pub struct AssistantMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<OutgoingToolCall>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OutgoingToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub function: OutgoingFunction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OutgoingFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl From<golbang_core::ToolCall> for OutgoingToolCall {
+    fn from(tc: golbang_core::ToolCall) -> Self {
+        Self {
+            id: if tc.id.is_empty() {
+                "call_1".into()
+            } else {
+                tc.id
+            },
+            type_: "function",
+            function: OutgoingFunction {
+                name: tc.name,
+                arguments: if tc.arguments.is_empty() {
+                    "{}".into()
+                } else {
+                    tc.arguments
+                },
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +264,26 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeltaToolCall {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<&'static str>,
+    pub function: DeltaFunction,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 pub fn validate_request(req: &ChatCompletionRequest) -> Result<(), String> {
@@ -162,6 +309,8 @@ mod tests {
             seed: None,
             stream: true,
             stop: None,
+            tools: vec![],
+            tool_choice: None,
         };
         assert_eq!(
             validate_request(&req).unwrap_err(),
@@ -176,6 +325,10 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "안녕".into(),
+                name: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+                tool_call_id: None,
             }],
             temperature: None,
             top_p: None,
@@ -184,8 +337,42 @@ mod tests {
             seed: None,
             stream: false,
             stop: None,
+            tools: vec![],
+            tool_choice: None,
         };
         assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn tools_request_deserializes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"user","content":"이전 작업 조회해봐"}],
+                "tools":[{"type":"function","function":{"name":"get_history","parameters":{"type":"object"}}}],
+                "tool_choice":"auto",
+                "stream":true
+            }"#,
+        )
+        .unwrap();
+        assert!(req.tools_enabled());
+        assert_eq!(req.tools[0]["function"]["name"], "get_history");
+    }
+
+    #[test]
+    fn null_content_and_tool_role_ok() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[
+                    {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_history","arguments":"{\"project_name\":\"test\"}"}}]},
+                    {"role":"tool","tool_call_id":"call_1","content":"ok"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages[0].content, "");
+        assert_eq!(req.messages[0].tool_calls[0].function.name, "get_history");
+        assert_eq!(req.messages[1].role, "tool");
+        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]

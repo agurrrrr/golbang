@@ -9,14 +9,14 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use golbang_core::{
     CancellationToken, ChatApplyOpts, GenerateParams, Job, ReasoningParser, SlotEvent,
-    apply_chat_template_with,
+    ToolCallParser, apply_chat_template_with,
 };
 
 use crate::AppState;
 use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
-    Delta, Timings, Usage,
+    Delta, DeltaFunction, DeltaToolCall, OutgoingToolCall, Timings, Usage,
 };
 
 pub fn completion_id() -> String {
@@ -66,6 +66,11 @@ fn core_messages(messages: Vec<ChatMessage>) -> Vec<golbang_core::ChatMessage> {
 
 fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
     let messages = core_messages(req.messages.clone());
+    let tools = if req.tools_enabled() {
+        req.tools.clone()
+    } else {
+        Vec::new()
+    };
     let applied = apply_chat_template_with(
         &messages,
         &ChatApplyOpts {
@@ -73,11 +78,14 @@ fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
             template: state.chat.template.clone(),
             bos_token: state.chat.bos_token.clone(),
             enable_thinking: state.chat.enable_thinking,
+            tools,
         },
     );
     if applied.used_jinja {
         tracing::debug!(
             thinking = state.chat.enable_thinking,
+            n_tools = req.tools.len(),
+            tools_enabled = req.tools_enabled(),
             prompt_chars = applied.prompt.len(),
             "applied GGUF jinja chat template"
         );
@@ -85,6 +93,34 @@ fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
         tracing::warn!("serving request with raw prompt fallback");
     }
     applied.prompt
+}
+
+fn outgoing_tool_calls(calls: Vec<golbang_core::ToolCall>) -> Vec<OutgoingToolCall> {
+    calls.into_iter().map(OutgoingToolCall::from).collect()
+}
+
+fn tool_call_deltas(calls: &[OutgoingToolCall]) -> Vec<DeltaToolCall> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, tc)| DeltaToolCall {
+            index: i as u32,
+            id: Some(tc.id.clone()),
+            type_: Some("function"),
+            function: DeltaFunction {
+                name: Some(tc.function.name.clone()),
+                arguments: Some(tc.function.arguments.clone()),
+            },
+        })
+        .collect()
+}
+
+fn finish_reason_for(reason: &str, has_tools: bool) -> String {
+    if has_tools && reason != "cancelled" && reason != "timeout" {
+        "tool_calls".into()
+    } else {
+        reason.to_string()
+    }
 }
 
 pub fn stream_completion(
@@ -102,6 +138,7 @@ pub fn stream_completion(
     let cancel = CancellationToken::new();
     let cancel_on_drop = cancel.clone();
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
+    let mut tools = ToolCallParser::new();
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
@@ -146,7 +183,11 @@ pub fn stream_completion(
                         continue;
                     }
                     let split = parser.push(&t.piece);
-                    if split.is_empty() {
+                    let content = match split.content {
+                        Some(c) => tools.push(&c),
+                        None => None,
+                    };
+                    if split.reasoning.is_none() && content.is_none() {
                         continue;
                     }
                     send_chunk(
@@ -156,8 +197,9 @@ pub fn stream_completion(
                         &model_name,
                         Delta {
                             role: None,
-                            content: split.content,
+                            content,
                             reasoning_content: split.reasoning,
+                            ..Default::default()
                         },
                         None,
                         None,
@@ -168,7 +210,11 @@ pub fn stream_completion(
                     reason, timings, ..
                 } => {
                     let split = parser.finish();
-                    if !split.is_empty() {
+                    if let Some(c) = split.content {
+                        let _ = tools.push(&c);
+                    }
+                    let parsed = tools.finish();
+                    if split.reasoning.is_some() || !parsed.content.is_empty() {
                         let _ = send_chunk(
                             &sse_tx,
                             &id,
@@ -176,28 +222,49 @@ pub fn stream_completion(
                             &model_name,
                             Delta {
                                 role: None,
-                                content: split.content,
+                                content: nonempty_owned(parsed.content),
                                 reasoning_content: split.reasoning,
+                                ..Default::default()
                             },
                             None,
                             None,
                         )
                         .await;
                     }
+                    let outgoing = outgoing_tool_calls(parsed.calls);
+                    if !outgoing.is_empty() {
+                        let names: Vec<&str> =
+                            outgoing.iter().map(|t| t.function.name.as_str()).collect();
+                        tracing::info!(?names, n = outgoing.len(), "parsed tool_calls");
+                        let _ = send_chunk(
+                            &sse_tx,
+                            &id,
+                            created,
+                            &model_name,
+                            Delta {
+                                tool_calls: Some(tool_call_deltas(&outgoing)),
+                                ..Default::default()
+                            },
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                    let finish = finish_reason_for(reason.as_str(), !outgoing.is_empty());
                     let r = send_chunk(
                         &sse_tx,
                         &id,
                         created,
                         &model_name,
                         Delta::default(),
-                        Some(reason.as_str().to_string()),
+                        Some(finish.clone()),
                         Some(Timings::from(timings)),
                     )
                     .await;
                     let _ = sse_tx.send(Event::default().data("[DONE]")).await;
                     tracing::info!(
                         streamed = n,
-                        finish = reason.as_str(),
+                        finish = finish.as_str(),
                         prompt_n = timings.prompt_n,
                         prompt_tps = format!("{:.2}", timings.prompt_per_second()),
                         predicted_n = timings.predicted_n,
@@ -254,6 +321,10 @@ async fn send_chunk(
     tx.send(Event::default().data(data)).await.map_err(|_| ())
 }
 
+fn nonempty_owned(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
 pub async fn complete(
     state: AppState,
     req: ChatCompletionRequest,
@@ -268,6 +339,7 @@ pub async fn complete(
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
+    let mut tools = ToolCallParser::new();
 
     let mut job = Job::new(prompt, params, cancel, ev_tx);
     job.timeout = state.default_timeout;
@@ -284,6 +356,7 @@ pub async fn complete(
 
     let mut content = String::new();
     let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u32;
@@ -297,7 +370,9 @@ pub async fn complete(
                     reasoning.push_str(&r);
                 }
                 if let Some(c) = split.content {
-                    content.push_str(&c);
+                    if let Some(safe) = tools.push(&c) {
+                        content.push_str(&safe);
+                    }
                 }
             }
             SlotEvent::Finished {
@@ -311,9 +386,12 @@ pub async fn complete(
                     reasoning.push_str(&r);
                 }
                 if let Some(c) = split.content {
-                    content.push_str(&c);
+                    let _ = tools.push(&c);
                 }
-                finish = Some(reason.as_str().to_string());
+                let parsed = tools.finish();
+                content.push_str(&parsed.content);
+                tool_calls = outgoing_tool_calls(parsed.calls);
+                finish = Some(finish_reason_for(reason.as_str(), !tool_calls.is_empty()));
                 prompt_tokens = p;
                 completion_tokens = c;
                 timings = Some(Timings::from(t));
@@ -321,6 +399,14 @@ pub async fn complete(
             }
             SlotEvent::Failed(e) => return Err(e.into()),
         }
+    }
+
+    if !tool_calls.is_empty() {
+        let names: Vec<&str> = tool_calls
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        tracing::info!(?names, n = tool_calls.len(), "parsed tool_calls");
     }
 
     if let Some(t) = timings {
@@ -356,6 +442,7 @@ pub async fn complete(
                 } else {
                     Some(reasoning)
                 },
+                tool_calls,
             },
             finish_reason: finish,
         }],

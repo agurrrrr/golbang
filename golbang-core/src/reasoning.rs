@@ -8,6 +8,17 @@
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
+/// llama.cpp DSV4 also ends thinking on the tool-call open tag so a missing
+/// `</think>` does not swallow the invoke into `reasoning_content`.
+const EXTRA_THINK_ENDS: &[&str] = &[
+    "<｜DSML｜tool_calls>",
+    "<｜DSML｜function_calls>",
+    "<tool_call>",
+    "<tools_call>",
+    "<function=",
+    "<|tool▁calls▁begin|>",
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReasoningFormat {
     #[default]
@@ -127,14 +138,18 @@ impl ReasoningParser {
                 Phase::Content => OPEN,
                 Phase::Think => CLOSE,
             };
-            if let Some(idx) = self.hold.find(tag) {
+            if let Some((idx, matched, consume)) = next_phase_marker(&self.hold, self.phase, tag) {
                 let before = self.hold[..idx].to_string();
-                let after = self.hold[idx + tag.len()..].to_string();
+                let after = if consume {
+                    self.hold[idx + matched.len()..].to_string()
+                } else {
+                    self.hold[idx..].to_string()
+                };
                 match self.phase {
                     Phase::Content => {
                         content.push_str(&before);
                         if inline {
-                            content.push_str(tag);
+                            content.push_str(matched);
                         }
                         self.phase = Phase::Think;
                     }
@@ -142,7 +157,9 @@ impl ReasoningParser {
                         reasoning.push_str(&before);
                         if inline {
                             content.push_str(&before);
-                            content.push_str(tag);
+                            if consume {
+                                content.push_str(matched);
+                            }
                         }
                         self.phase = Phase::Content;
                     }
@@ -165,7 +182,7 @@ impl ReasoningParser {
                 break;
             }
 
-            let keep = suffix_that_is_tag_prefix(&self.hold, tag);
+            let keep = suffix_that_is_any_tag_prefix(&self.hold, self.phase, tag);
             let emit_len = self.hold.len() - keep;
             if emit_len > 0 {
                 let emit = self.hold[..emit_len].to_string();
@@ -192,6 +209,35 @@ impl ReasoningParser {
 
 fn nonempty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
+}
+
+fn next_phase_marker<'a>(
+    hold: &'a str,
+    phase: Phase,
+    primary: &'a str,
+) -> Option<(usize, &'a str, bool)> {
+    let mut best: Option<(usize, &'a str, bool)> = hold.find(primary).map(|i| (i, primary, true));
+    if matches!(phase, Phase::Think) {
+        for extra in EXTRA_THINK_ENDS {
+            if let Some(i) = hold.find(extra) {
+                match best {
+                    Some((bi, _, _)) if bi <= i => {}
+                    _ => best = Some((i, *extra, false)),
+                }
+            }
+        }
+    }
+    best
+}
+
+fn suffix_that_is_any_tag_prefix(hay: &str, phase: Phase, primary: &str) -> usize {
+    let mut keep = suffix_that_is_tag_prefix(hay, primary);
+    if matches!(phase, Phase::Think) {
+        for extra in EXTRA_THINK_ENDS {
+            keep = keep.max(suffix_that_is_tag_prefix(hay, extra));
+        }
+    }
+    keep
 }
 
 fn suffix_that_is_tag_prefix(hay: &str, tag: &str) -> usize {
@@ -245,6 +291,17 @@ mod tests {
         let d = p.push("x<think>y</think>z");
         assert_eq!(d.reasoning.as_deref(), Some("y"));
         assert_eq!(d.content.as_deref(), Some("xz"));
+    }
+
+    #[test]
+    fn tool_open_ends_think_and_stays_in_content() {
+        let mut p = ReasoningParser::new(ReasoningFormat::Deepseek, true);
+        let d = p.push("hmm<tool_call>{\"name\":\"x\"}</tool_call>");
+        assert_eq!(d.reasoning.as_deref(), Some("hmm"));
+        assert_eq!(
+            d.content.as_deref(),
+            Some("<tool_call>{\"name\":\"x\"}</tool_call>")
+        );
     }
 
     #[test]

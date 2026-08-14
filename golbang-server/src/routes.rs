@@ -1,11 +1,11 @@
+use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
+use crate::AppState;
 use crate::error::ApiError;
 use crate::sse;
-use crate::types::{validate_request, ChatCompletionRequest};
-use crate::AppState;
+use crate::types::{ChatCompletionRequest, validate_request};
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -18,6 +18,8 @@ pub async fn chat_completions(
     tracing::info!(
         stream = req.stream,
         n_messages = req.messages.len(),
+        n_tools = req.tools.len(),
+        tools_enabled = req.tools_enabled(),
         max_tokens = ?req.max_tokens,
         "chat.completions"
     );
