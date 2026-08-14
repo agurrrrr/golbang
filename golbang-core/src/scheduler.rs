@@ -454,7 +454,7 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engin
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
                 job.n_past += *take;
-                if job.prompt_pos >= job.prompt_tokens.len() {
+                if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
                     if job.generation_started_at.is_none() {
                         job.generation_started_at = Some(Instant::now());
@@ -725,7 +725,7 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
         if job.last_progress_at.elapsed().as_millis() < MIN_MS {
             continue;
         }
-        let processed = (job.prompt_offset + job.prompt_pos) as u32;
+        let processed = job.prefill_cursor() as u32;
         let total = job.prompt_tokens.len() as u32;
         let progress = if total == 0 {
             1.0

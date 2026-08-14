@@ -95,10 +95,7 @@ impl BatchBuilder {
             let Some(job) = slot.job.as_ref() else {
                 continue;
             };
-            let remaining = job
-                .prompt_tokens
-                .len()
-                .saturating_sub(job.prompt_offset + job.prompt_pos);
+            let remaining = job.prefill_remaining();
             if remaining == 0 {
                 continue;
             }
@@ -109,7 +106,7 @@ impl BatchBuilder {
             // The first prefill token is `prompt_offset + prompt_pos`.
             let start_pos = job.n_past;
             for k in 0..take {
-                let idx = job.prompt_offset + job.prompt_pos + k;
+                let idx = job.prefill_cursor() + k;
                 let last = idx + 1 == job.prompt_tokens.len();
                 plan.tokens.push(BatchToken {
                     token: job.prompt_tokens[idx],

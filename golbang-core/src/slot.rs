@@ -205,6 +205,22 @@ impl ActiveJob {
         self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
+    /// Tokens already accounted for: reused prefix plus this request's prefill.
+    /// `prompt_pos` is only the suffix this job actually prefills.
+    pub fn prefill_cursor(&self) -> usize {
+        self.prompt_offset + self.prompt_pos
+    }
+
+    pub fn prefill_remaining(&self) -> usize {
+        self.prompt_tokens.len().saturating_sub(self.prefill_cursor())
+    }
+
+    /// True once the full prompt is resident, including a reused prefix.
+    /// `prompt_pos >= prompt_tokens.len()` is wrong when `prompt_offset > 0`.
+    pub fn prefill_done(&self) -> bool {
+        self.prefill_remaining() == 0
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(prompt_tokens: Vec<Token>) -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -272,6 +288,38 @@ impl Slot {
 mod tests {
     use super::*;
     use crate::generate::GenerateParams;
+
+    #[test]
+    fn prefill_done_uses_offset_plus_pos() {
+        let mut job = ActiveJob::for_test(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        job.prompt_offset = 5;
+        job.prompt_pos = 0;
+        assert_eq!(job.prefill_cursor(), 5);
+        assert_eq!(job.prefill_remaining(), 3);
+        assert!(!job.prefill_done());
+        assert!(
+            job.prompt_pos < job.prompt_tokens.len(),
+            "old apply_plan gate stays false after a reused prefix"
+        );
+
+        job.prompt_pos = 3;
+        assert_eq!(job.prefill_cursor(), 8);
+        assert_eq!(job.prefill_remaining(), 0);
+        assert!(job.prefill_done());
+        assert!(
+            job.prompt_pos < job.prompt_tokens.len(),
+            "suffix-only pos never reaches prompt_tokens.len() on a reused turn"
+        );
+    }
+
+    #[test]
+    fn prefill_done_first_request_has_no_offset() {
+        let mut job = ActiveJob::for_test(vec![1, 2, 3]);
+        assert!(!job.prefill_done());
+        job.prompt_pos = 3;
+        assert!(job.prefill_done());
+        assert_eq!(job.prefill_cursor(), 3);
+    }
 
     #[test]
     fn from_parts_seeds_n_past_from_reuse_len() {
