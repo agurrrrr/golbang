@@ -60,6 +60,22 @@ struct Args {
     #[arg(long, env = "GOLBANG_N_RS_SEQ", default_value_t = 1)]
     n_rs_seq: u32,
 
+    /// Disable mmap (`llama_model_params.load_mode = NONE`). llama-server `--no-mmap`.
+    #[arg(long, env = "GOLBANG_NO_MMAP", default_value_t = false)]
+    no_mmap: bool,
+
+    /// Reported model id (llama-server `-a`). Default is the GGUF file name.
+    #[arg(long, env = "GOLBANG_ALIAS")]
+    alias: Option<String>,
+
+    /// Override GGUF `tokenizer.chat_template` (llama-server `--chat-template-file`).
+    #[arg(long, env = "GOLBANG_CHAT_TEMPLATE_FILE")]
+    chat_template_file: Option<PathBuf>,
+
+    /// Default Qwen3.8 jinja `reasoning_effort`: xhigh | medium | low.
+    #[arg(long, env = "GOLBANG_REASONING_EFFORT")]
+    reasoning_effort: Option<String>,
+
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
     n_parallel: u32,
@@ -111,6 +127,33 @@ fn parse_flash_attn(s: &str) -> Result<i32> {
     }
 }
 
+fn normalize_reasoning_effort(s: Option<&str>) -> Option<String> {
+    match s.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "xhigh" | "high" => Some("xhigh".into()),
+            "medium" => Some("medium".into()),
+            "low" => Some("low".into()),
+            other => {
+                tracing::warn!(other, "unknown --reasoning-effort; using template default");
+                None
+            }
+        },
+    }
+}
+
+fn load_chat_template(args: &Args, model: &Model) -> Result<Option<String>> {
+    if let Some(path) = &args.chat_template_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read --chat-template-file {}", path.display()))?;
+        if text.trim().is_empty() {
+            anyhow::bail!("--chat-template-file {} is empty", path.display());
+        }
+        return Ok(Some(text));
+    }
+    Ok(model.chat_template())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -121,11 +164,17 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let model_path = resolve_model(&args)?;
-    let model_name = model_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("golbang")
-        .to_string();
+    let model_name = args
+        .alias
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            model_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("golbang")
+                .to_string()
+        });
 
     let n_parallel = args.n_parallel.max(1);
     let flash_attn = parse_flash_attn(&args.flash_attn)?;
@@ -141,6 +190,7 @@ async fn main() -> Result<()> {
             n_ubatch: args.n_ubatch,
             n_threads: args.n_threads,
             n_rs_seq: args.n_rs_seq,
+            use_mmap: !args.no_mmap,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
@@ -157,8 +207,9 @@ async fn main() -> Result<()> {
     let reasoning_format =
         ReasoningFormat::parse(&args.reasoning_format).map_err(anyhow::Error::msg)?;
     let enable_thinking = reasoning_format.extracts();
+    let reasoning_effort = normalize_reasoning_effort(args.reasoning_effort.as_deref());
     let chat_template = if args.jinja {
-        model.chat_template()
+        load_chat_template(&args, &model)?
     } else {
         None
     };
@@ -174,9 +225,11 @@ async fn main() -> Result<()> {
                 bos = %bos_token,
                 thinking = enable_thinking,
                 reasoning = reasoning_format.as_str(),
-                "jinja chat template loaded from GGUF"
+                reasoning_effort = reasoning_effort.as_deref().unwrap_or("template-default"),
+                from_file = args.chat_template_file.is_some(),
+                "jinja chat template loaded"
             ),
-            None => tracing::warn!("--jinja set but GGUF has no tokenizer.chat_template"),
+            None => tracing::warn!("--jinja set but no chat template (GGUF or --chat-template-file)"),
         }
     }
 
@@ -212,6 +265,7 @@ async fn main() -> Result<()> {
             bos_token,
             reasoning_format,
             enable_thinking,
+            reasoning_effort,
         },
         api_keys,
     };

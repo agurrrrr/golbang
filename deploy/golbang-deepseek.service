@@ -1,7 +1,7 @@
 [Unit]
 Description=golbang OpenAI server - DeepSeek-V4-Flash-0731 UD-IQ2_M (MI50)
 After=network.target
-Conflicts=llama-server.service
+Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-qwen38.service
 
 [Service]
 Type=simple

@@ -18,6 +18,8 @@ pub struct ChatRuntime {
     pub bos_token: String,
     pub reasoning_format: ReasoningFormat,
     pub enable_thinking: bool,
+    /// Default Qwen3.8 `reasoning_effort`. Request field overrides.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone)]

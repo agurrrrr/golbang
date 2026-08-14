@@ -38,6 +38,8 @@ pub struct LoadParams {
     /// Recurrent-state snapshots per seq (`llama_context_params.n_rs_seq`).
     /// DSV4 cannot `seq_rm` a suffix without at least 1. 0 = library default.
     pub n_rs_seq: u32,
+    /// `true` → `LLAMA_LOAD_MODE_MMAP` (llama default). `false` is `--no-mmap`.
+    pub use_mmap: bool,
 }
 
 impl Default for LoadParams {
@@ -53,6 +55,7 @@ impl Default for LoadParams {
             n_threads: 0,
             // DSV4 suffix rm needs ≥1 snapshot (~12 MiB). Other archs clamp to 0.
             n_rs_seq: 1,
+            use_mmap: true,
         }
     }
 }
@@ -109,11 +112,17 @@ impl Model {
             n_cpu_moe = params.n_cpu_moe,
             flash_attn = params.flash_attn,
             n_rs_seq = params.n_rs_seq,
+            use_mmap = params.use_mmap,
             "loading GGUF"
         );
 
         let mut mparams = unsafe { llama_model_default_params() };
         mparams.n_gpu_layers = params.n_gpu_layers;
+        mparams.load_mode = if params.use_mmap {
+            LLAMA_LOAD_MODE_MMAP
+        } else {
+            LLAMA_LOAD_MODE_NONE
+        };
 
         // Patterns must stay alive until `llama_model_load_from_file` returns.
         let cpu_moe = CpuMoeOverrides::new(params.n_cpu_moe);
@@ -324,7 +333,8 @@ impl Model {
             return None;
         }
         let mut buf = vec![0u8; n];
-        let wrote = unsafe { llama_state_seq_get_data_ext(self.ctx, buf.as_mut_ptr(), n, seq_id, flags) };
+        let wrote =
+            unsafe { llama_state_seq_get_data_ext(self.ctx, buf.as_mut_ptr(), n, seq_id, flags) };
         if wrote == 0 {
             return None;
         }
@@ -353,7 +363,11 @@ impl Model {
                 return 0;
             }
             let max = llama_memory_seq_pos_max(mem, seq_id);
-            if max < 0 { 0 } else { (max + 1) as u32 }
+            if max < 0 {
+                0
+            } else {
+                (max + 1) as u32
+            }
         }
     }
 

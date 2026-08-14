@@ -3,7 +3,7 @@
 //! `llama_chat_apply_template` is not a jinja parser. When `--jinja` is on we
 //! apply `tokenizer.chat_template` with minijinja (same idea as llama-server).
 
-use minijinja::{Environment, UndefinedBehavior, Value, context};
+use minijinja::{context, Environment, UndefinedBehavior, Value};
 use tracing::warn;
 
 use crate::tools::ToolCall;
@@ -34,6 +34,8 @@ pub struct ChatApplyOpts {
     pub template: Option<String>,
     pub bos_token: String,
     pub enable_thinking: bool,
+    /// Qwen3.8 jinja: `xhigh` | `medium` | `low`. `None` → template default (`xhigh`).
+    pub reasoning_effort: Option<String>,
     /// OpenAI `tools` array. Empty = do not inject the template tools header.
     pub tools: Vec<serde_json::Value>,
 }
@@ -120,6 +122,18 @@ fn apply_jinja(
     let msgs: Vec<serde_json::Value> = messages.iter().map(message_to_jinja).collect();
     let tools = opts.tools.clone();
 
+    // Qwen3.8 uses `reasoning_effort|default('xhigh')`. A present `none`
+    // does not trigger default and the template raises.
+    let reasoning_effort = match opts
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(effort) => Value::from(effort),
+        None => Value::UNDEFINED,
+    };
+
     tmpl.render(context! {
         messages => msgs,
         tools => tools,
@@ -128,6 +142,7 @@ fn apply_jinja(
         add_generation_prompt => true,
         thinking => opts.enable_thinking,
         enable_thinking => opts.enable_thinking,
+        reasoning_effort => reasoning_effort,
     })
     .map_err(|e| format!("render chat template: {e}"))
 }
@@ -147,21 +162,20 @@ fn message_to_jinja(m: &ChatMessage) -> serde_json::Value {
         obj["tool_call_id"] = serde_json::json!(id);
     }
     if !m.tool_calls.is_empty() {
-        obj["tool_calls"] = serde_json::json!(
-            m.tool_calls
-                .iter()
-                .map(|tc| {
-                    serde_json::json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                        }
-                    })
+        obj["tool_calls"] = serde_json::json!(m
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }
                 })
-                .collect::<Vec<_>>()
-        );
+            })
+            .collect::<Vec<_>>());
     }
     obj
 }
@@ -242,16 +256,12 @@ mod tests {
     fn trailing_assistant_skips_generation_prefix() {
         let applied = apply_chat_template(&[msg("user", "hi"), msg("assistant", "hey")]);
         assert!(applied.used_chatml);
-        assert!(
-            applied
-                .prompt
-                .ends_with("<|im_start|>assistant\nhey<|im_end|>\n")
-        );
-        assert!(
-            !applied
-                .prompt
-                .ends_with("<|im_start|>assistant\n<|im_start|>assistant\n")
-        );
+        assert!(applied
+            .prompt
+            .ends_with("<|im_start|>assistant\nhey<|im_end|>\n"));
+        assert!(!applied
+            .prompt
+            .ends_with("<|im_start|>assistant\n<|im_start|>assistant\n"));
     }
 
     #[test]
@@ -343,6 +353,7 @@ mod tests {
                 bos_token: "<｜begin▁of▁sentence｜>".into(),
                 enable_thinking: true,
                 tools,
+                ..Default::default()
             },
         );
         assert!(applied.used_jinja);
@@ -363,6 +374,122 @@ mod tests {
         );
         assert!(
             applied.prompt.ends_with("<｜Assistant｜><think>"),
+            "bad gen prefix:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn qwen38_jinja_thinking_on_ends_with_think() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[msg("user", "hi")],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert!(applied.used_jinja, "jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied.prompt.ends_with("<|im_start|>assistant\n<think>\n"),
+            "bad gen prefix:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("Reasoning effort is set to xhigh"),
+            "missing default xhigh instruction:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn qwen38_jinja_thinking_off_closes_think() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[msg("user", "hi")],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: false,
+                ..Default::default()
+            },
+        );
+        assert!(applied.used_jinja, "jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied
+                .prompt
+                .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "thinking-off should emit empty think block:\n{}",
+            applied.prompt
+        );
+        assert!(
+            !applied.prompt.contains("Reasoning effort is set to xhigh"),
+            "thinking-off should skip effort instruction:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn qwen38_jinja_tools_and_developer() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_history",
+                "description": "Query project task history",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project_name": {"type": "string"}
+                    },
+                    "required": ["project_name"]
+                }
+            }
+        })];
+        let applied = apply_chat_template_with(
+            &[
+                msg("developer", "be brief"),
+                msg("user", "이전 작업 조회해봐"),
+            ],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: true,
+                reasoning_effort: Some("low".into()),
+                tools,
+                ..Default::default()
+            },
+        );
+        assert!(applied.used_jinja, "jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied.prompt.contains("<tools>"),
+            "missing tools header:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("get_history"),
+            "missing tool schema:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<tool_call>"),
+            "missing tool-call format:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("be brief"),
+            "developer system text missing:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("Reasoning effort is set to low"),
+            "low effort instruction missing:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.ends_with("<|im_start|>assistant\n<think>\n"),
             "bad gen prefix:\n{}",
             applied.prompt
         );

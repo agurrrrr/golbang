@@ -91,9 +91,10 @@ impl ReasoningParser {
         }
     }
 
-    /// If the prompt already opened `<think>` (DSV4 thinking mode), start in think.
+    /// If the prompt already opened `<think>` (DSV4, or Qwen templates that
+    /// close with `<think>\n`), start in think. Trailing whitespace is ignored.
     pub fn from_prompt(format: ReasoningFormat, prompt: &str) -> Self {
-        let start_in_think = format.extracts() && prompt.ends_with(OPEN);
+        let start_in_think = format.extracts() && prompt_opens_think(prompt);
         Self::new(format, start_in_think)
     }
 
@@ -208,7 +209,16 @@ impl ReasoningParser {
 }
 
 fn nonempty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Qwen3.6/3.8 jinja ends the prompt with `<think>\n`. DSV4 uses a bare `<think>`.
+fn prompt_opens_think(prompt: &str) -> bool {
+    prompt.trim_end().ends_with(OPEN)
 }
 
 fn next_phase_marker<'a>(
@@ -272,6 +282,28 @@ mod tests {
         let b = p.push("</think>2");
         assert!(b.reasoning.is_none());
         assert_eq!(b.content.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn qwen_think_open_with_trailing_newline() {
+        let mut p = ReasoningParser::from_prompt(
+            ReasoningFormat::Deepseek,
+            "<|im_start|>assistant\n<think>\n",
+        );
+        let a = p.push("hmm");
+        assert_eq!(a.reasoning.as_deref(), Some("hmm"));
+        assert!(a.content.is_none());
+    }
+
+    #[test]
+    fn qwen_thinking_off_empty_block_stays_in_content() {
+        let mut p = ReasoningParser::from_prompt(
+            ReasoningFormat::Deepseek,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        );
+        let a = p.push("hi");
+        assert!(a.reasoning.is_none());
+        assert_eq!(a.content.as_deref(), Some("hi"));
     }
 
     #[test]

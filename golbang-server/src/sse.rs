@@ -37,7 +37,12 @@ pub fn unix_ts() -> u64 {
 pub fn generate_params(req: &ChatCompletionRequest, state: &AppState) -> GenerateParams {
     let mut stop = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
     if state.chat.use_jinja {
-        for extra in ["<｜User｜>", "<｜end▁of▁sentence｜>"] {
+        for extra in [
+            "<｜User｜>",
+            "<｜end▁of▁sentence｜>",
+            "<|im_end|>",
+            "<|im_start|>",
+        ] {
             if !stop.iter().any(|s| s == extra) {
                 stop.push(extra.to_string());
             }
@@ -78,6 +83,10 @@ fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
             template: state.chat.template.clone(),
             bos_token: state.chat.bos_token.clone(),
             enable_thinking: state.chat.enable_thinking,
+            reasoning_effort: req
+                .reasoning_effort
+                .clone()
+                .or_else(|| state.chat.reasoning_effort.clone()),
             tools,
         },
     );

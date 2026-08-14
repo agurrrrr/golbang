@@ -532,7 +532,11 @@ fn trim_tool_gaps(s: &str) -> String {
 }
 
 fn nonempty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[cfg(test)]
@@ -614,18 +618,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_qwen38_tool_call_block() {
+        let text = r#"<tool_call>
+<function=get_history>
+<parameter=project_name>
+golbang
+</parameter>
+<parameter=limit>
+5
+</parameter>
+</function>
+</tool_call>"#;
+        let p = parse_tool_calls(text);
+        assert_eq!(p.calls.len(), 1);
+        assert_eq!(p.calls[0].name, "get_history");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["project_name"], "golbang");
+        assert_eq!(v["limit"], "5");
+    }
+
+    #[test]
     fn incremental_holds_partial_then_finishes() {
         let mut p = ToolCallParser::new();
         assert_eq!(p.push("hello ").as_deref(), Some("hello "));
         assert!(p.push("<tool").is_none());
-        assert!(
-            p.push("_call>\n<tool_name>get_history</tool_name>\n")
-                .is_none()
-        );
-        assert!(
-            p.push("<parameters>{\"project_name\":\"test\"}</parameters>\n")
-                .is_none()
-        );
+        assert!(p
+            .push("_call>\n<tool_name>get_history</tool_name>\n")
+            .is_none());
+        assert!(p
+            .push("<parameters>{\"project_name\":\"test\"}</parameters>\n")
+            .is_none());
         assert!(p.push("</tool_call>").is_none());
         let done = p.finish();
         assert!(done.content.is_empty());

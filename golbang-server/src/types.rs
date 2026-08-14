@@ -16,6 +16,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Vec<serde_json::Value>,
     pub tool_choice: Option<serde_json::Value>,
+    /// Qwen3.8 jinja: `xhigh` | `high` | `medium` | `low`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl ChatCompletionRequest {
@@ -311,6 +314,7 @@ mod tests {
             stop: None,
             tools: vec![],
             tool_choice: None,
+            reasoning_effort: None,
         };
         assert_eq!(
             validate_request(&req).unwrap_err(),
@@ -339,6 +343,7 @@ mod tests {
             stop: None,
             tools: vec![],
             tool_choice: None,
+            reasoning_effort: None,
         };
         assert!(validate_request(&req).is_ok());
     }
