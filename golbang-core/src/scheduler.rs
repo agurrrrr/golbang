@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::batch::BatchBuilder;
+use crate::batch::{BatchBuilder, BatchToken};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
@@ -261,6 +261,8 @@ async fn run_loop(
             }
             continue;
         }
+
+        snapshot_spec_slots(&mut slots, &engine, &plan);
 
         let engine_d = engine.clone();
         let tokens = plan.tokens.clone();
@@ -586,6 +588,72 @@ fn record_bucket(bucket: &[AtomicU64; 8], ms: u64) {
     bucket[idx].fetch_add(1, Ordering::Relaxed);
 }
 
+fn snapshot_spec_slots(slots: &mut [Slot], engine: &Engine, plan: &crate::batch::BatchPlan) {
+    for slot in slots.iter_mut() {
+        let Some(job) = slot.job.as_mut() else {
+            continue;
+        };
+        if job.drafts.is_empty()
+            || job.pending.is_none()
+            || !plan.logit_slots.iter().any(|id| *id == slot.id)
+        {
+            job.spec_ckpt_tgt = None;
+            job.spec_ckpt_mtp = None;
+            continue;
+        }
+        let seq = slot.id.0 as i32;
+        job.spec_ckpt_n_past = job.n_past;
+        job.spec_ckpt_tgt = engine.seq_state_get(seq);
+        job.spec_ckpt_mtp = engine.spec_state_get(seq);
+    }
+}
+
+fn replay_spec_prefix(slot: &mut Slot, engine: &Engine, drafts: &[Token], n_matched: usize) {
+    let seq = slot.id.0 as i32;
+    let Some(job) = slot.job.as_ref() else {
+        return;
+    };
+    let Some(pending) = job.pending else {
+        return;
+    };
+    let n0 = job.spec_ckpt_n_past;
+    if let Some(data) = job.spec_ckpt_tgt.as_deref() {
+        if engine.seq_state_set(seq, data) {
+            let _ = engine.rm_seq_from(seq, n0 as i32);
+        }
+    }
+    if let Some(data) = job.spec_ckpt_mtp.as_deref() {
+        if engine.spec_state_set(seq, data) {
+            let _ = engine.spec_rm_from(seq, n0 as i32);
+        }
+    }
+    let mut items = Vec::with_capacity(1 + n_matched);
+    items.push(BatchToken {
+        token: pending,
+        pos: n0 as i32,
+        seq_id: seq,
+        logits: n_matched == 0,
+    });
+    for (k, &d) in drafts.iter().take(n_matched).enumerate() {
+        items.push(BatchToken {
+            token: d,
+            pos: n0 as i32 + 1 + k as i32,
+            seq_id: seq,
+            logits: k + 1 == n_matched,
+        });
+    }
+    if let Err(e) = engine.decode_and_logits(&items) {
+        tracing::error!(slot = slot.id.0, error = %e, "spec replay decode failed");
+    } else {
+        tracing::debug!(
+            slot = slot.id.0,
+            n_matched,
+            n0,
+            "spec replay after failed seq_rm"
+        );
+    }
+}
+
 fn sample_and_emit(
     slots: &mut [Slot],
     plan: &crate::batch::BatchPlan,
@@ -660,25 +728,26 @@ fn verify_and_emit(
     n_ctx_seq: u32,
     metrics: Option<&SchedulerMetrics>,
 ) {
-    let Some(job) = slot.job.as_mut() else {
-        return;
-    };
-    if job.finish.is_some() {
-        return;
-    }
     let seq = slot.id.0 as i32;
     let n_verify = drafts.len();
-    let n_past_after = job.n_past;
-
-    let mut samples = Vec::with_capacity(rows.len());
-    for row in rows {
-        samples.push(job.sampler.sample(row));
-    }
-    let accepted = accept_drafts(&samples, drafts);
-    if accepted.is_empty() {
-        job.drafts.clear();
-        return;
-    }
+    let (accepted, n_past_after) = {
+        let Some(job) = slot.job.as_mut() else {
+            return;
+        };
+        if job.finish.is_some() {
+            return;
+        }
+        let mut samples = Vec::with_capacity(rows.len());
+        for row in rows {
+            samples.push(job.sampler.sample(row));
+        }
+        let accepted = accept_drafts(&samples, drafts);
+        if accepted.is_empty() {
+            job.drafts.clear();
+            return;
+        }
+        (accepted, job.n_past)
+    };
     let n_matched = accepted
         .iter()
         .zip(drafts.iter())
@@ -689,16 +758,9 @@ fn verify_and_emit(
     if n_matched < n_verify {
         let tgt_ok = engine.rm_seq_from(seq, keep_pos as i32);
         let mtp_ok = engine.spec_rm_from(seq, keep_pos as i32);
-        if !tgt_ok {
-            tracing::debug!(
-                slot = slot.id.0,
-                keep_pos,
-                n_matched,
-                n_verify,
-                "spec seq_rm failed; KV may include rejected drafts until next bind"
-            );
+        if !tgt_ok || !mtp_ok {
+            replay_spec_prefix(slot, engine, drafts, n_matched);
         }
-        let _ = (tgt_ok, mtp_ok);
     }
 
     engine.spec_accept(seq, n_matched as u16);
@@ -716,8 +778,12 @@ fn verify_and_emit(
         "spec accept"
     );
 
-    job.n_past = keep_pos;
-    job.drafts.clear();
+    if let Some(job) = slot.job.as_mut() {
+        job.n_past = keep_pos;
+        job.drafts.clear();
+        job.spec_ckpt_tgt = None;
+        job.spec_ckpt_mtp = None;
+    }
 
     for tok in accepted {
         let Some(job) = slot.job.as_mut() else {

@@ -114,6 +114,10 @@ pub(crate) struct ActiveJob {
     pub images: Vec<Vec<u8>>,
     /// `spec_begin` already ran for this job.
     pub spec_begun: bool,
+    /// Target/MTP snapshots taken before a speculative verify decode.
+    pub spec_ckpt_tgt: Option<Vec<u8>>,
+    pub spec_ckpt_mtp: Option<Vec<u8>>,
+    pub spec_ckpt_n_past: u32,
     pub sampler: Sampler,
     pub stop: Vec<String>,
     pub acc: String,
@@ -164,6 +168,9 @@ impl ActiveJob {
             generated: Vec::new(),
             images,
             spec_begun: false,
+            spec_ckpt_tgt: None,
+            spec_ckpt_mtp: None,
+            spec_ckpt_n_past: 0,
             sampler: Sampler::new(SamplerParams {
                 temperature: params.temperature,
                 top_p: params.top_p,
