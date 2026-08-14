@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use golbang_core::{
     Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
-    spawn_scheduler,
+    SpecParams, SpecType, parse_ggml_type, spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -103,6 +103,33 @@ struct Args {
     /// Require `Authorization: Bearer …` or `X-Api-Key`. Repeat or comma-separate.
     #[arg(long, env = "GOLBANG_API_KEY")]
     api_key: Vec<String>,
+
+    /// CLIP / projector GGUF (llama-server `--mmproj`). Enables image_url parts.
+    #[arg(long, env = "GOLBANG_MMPROJ")]
+    mmproj: Option<PathBuf>,
+
+    /// Speculative decoding, comma-separated: `draft-mtp`, `ngram-mod`.
+    #[arg(long, env = "GOLBANG_SPEC_TYPE", default_value = "")]
+    spec_type: String,
+
+    /// Max MTP draft tokens (llama-server `--spec-draft-n-max`).
+    #[arg(long, env = "GOLBANG_SPEC_DRAFT_N_MAX", default_value_t = 3)]
+    spec_draft_n_max: i32,
+
+    /// Min MTP draft probability (llama-server `--spec-draft-p-min`).
+    #[arg(long, env = "GOLBANG_SPEC_DRAFT_P_MIN", default_value_t = 0.90)]
+    spec_draft_p_min: f32,
+
+    /// MTP KV cache type (`q8_0` matches the production Qwen unit).
+    #[arg(long, env = "GOLBANG_SPEC_DRAFT_TYPE_K", default_value = "q8_0")]
+    spec_draft_type_k: String,
+
+    #[arg(long, env = "GOLBANG_SPEC_DRAFT_TYPE_V", default_value = "q8_0")]
+    spec_draft_type_v: String,
+
+    /// Load MTP tensors even without `--spec-type draft-mtp`.
+    #[arg(long, env = "GOLBANG_LOAD_MTP", default_value_t = false)]
+    load_mtp: bool,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -178,6 +205,23 @@ async fn main() -> Result<()> {
 
     let n_parallel = args.n_parallel.max(1);
     let flash_attn = parse_flash_attn(&args.flash_attn)?;
+    let spec_types = SpecType::parse_list(&args.spec_type).map_err(anyhow::Error::msg)?;
+    let spec = SpecParams {
+        types: spec_types,
+        n_max: args.spec_draft_n_max.max(0),
+        p_min: args.spec_draft_p_min.clamp(0.0, 1.0),
+        cache_type_k: parse_ggml_type(&args.spec_draft_type_k).map_err(anyhow::Error::msg)?,
+        cache_type_v: parse_ggml_type(&args.spec_draft_type_v).map_err(anyhow::Error::msg)?,
+    };
+    let load_mtp = args.load_mtp || spec.wants_mtp();
+    if spec.enabled() {
+        tracing::info!(
+            types = ?spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            n_max = spec.n_max,
+            p_min = spec.p_min,
+            "speculative decoding enabled"
+        );
+    }
     let model = Model::load(
         &model_path,
         LoadParams {
@@ -191,6 +235,9 @@ async fn main() -> Result<()> {
             n_threads: args.n_threads,
             n_rs_seq: args.n_rs_seq,
             use_mmap: !args.no_mmap,
+            load_mtp,
+            spec,
+            mmproj: args.mmproj.clone(),
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
@@ -229,7 +276,9 @@ async fn main() -> Result<()> {
                 from_file = args.chat_template_file.is_some(),
                 "jinja chat template loaded"
             ),
-            None => tracing::warn!("--jinja set but no chat template (GGUF or --chat-template-file)"),
+            None => {
+                tracing::warn!("--jinja set but no chat template (GGUF or --chat-template-file)")
+            }
         }
     }
 
@@ -244,6 +293,7 @@ async fn main() -> Result<()> {
         tracing::info!(n = api_keys.len(), "api key auth enabled");
     }
 
+    let vision = model.vision_enabled();
     let engine = Arc::new(Engine::new(model));
     let spawned = spawn_scheduler(
         engine,
@@ -268,6 +318,7 @@ async fn main() -> Result<()> {
             reasoning_effort,
         },
         api_keys,
+        vision,
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

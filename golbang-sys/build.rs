@@ -21,11 +21,15 @@ const HEADER_GIT_PATHS: &[(&str, &str)] = &[
     ("ggml/include/ggml-opt.h", "ggml-opt.h"),
     ("ggml/include/gguf.h", "gguf.h"),
     ("ggml/include/ggml-alloc.h", "ggml-alloc.h"),
+    ("src/llama-ext.h", "llama-ext.h"),
+    ("tools/mtmd/mtmd.h", "mtmd.h"),
+    ("tools/mtmd/mtmd-helper.h", "mtmd-helper.h"),
 ];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_DIR");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/llama_ext_shim.cpp");
 
     let llama_dir = PathBuf::from(
         env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| DEFAULT_LLAMA_DIR.to_string()),
@@ -75,7 +79,12 @@ fn main() {
     let header_dir = out_dir.join("sha-headers");
     fs::create_dir_all(&header_dir).expect("create sha-headers");
     for (git_path, file_name) in HEADER_GIT_PATHS {
-        extract_git_blob(&llama_dir, EXPECTED_SHA, git_path, &header_dir.join(file_name));
+        extract_git_blob(
+            &llama_dir,
+            EXPECTED_SHA,
+            git_path,
+            &header_dir.join(file_name),
+        );
     }
 
     let llama_h = header_dir.join("llama.h");
@@ -93,13 +102,36 @@ fn main() {
         panic!("extracted llama.h is missing current load API names");
     }
 
+    cc::Build::new()
+        .cpp(true)
+        .file("src/llama_ext_shim.cpp")
+        .include(&header_dir)
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-fPIC")
+        .warnings(false)
+        .compile("golbang_llama_ext");
+
+    let mtmd_h = header_dir.join("mtmd.h");
+    let mtmd_helper_h = header_dir.join("mtmd-helper.h");
+    if !mtmd_h.is_file() || !mtmd_helper_h.is_file() {
+        panic!(
+            "extracted mtmd headers missing from {}",
+            header_dir.display()
+        );
+    }
+
     let bindings = bindgen::Builder::default()
         .header(llama_h.to_string_lossy())
+        .header(mtmd_h.to_string_lossy())
+        .header(mtmd_helper_h.to_string_lossy())
         .clang_arg(format!("-I{}", header_dir.display()))
         .clang_arg("-std=c11")
         .allowlist_function("llama_.*")
         .allowlist_type("llama_.*")
         .allowlist_var("LLAMA_.*")
+        .allowlist_function("mtmd_.*")
+        .allowlist_type("mtmd_.*")
+        .allowlist_var("MTMD_.*")
         .allowlist_function("ggml_backend_load_all")
         .allowlist_function("ggml_backend_load_all_from_path")
         .allowlist_function("ggml_backend_load")
@@ -135,7 +167,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bin_dir.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,/opt/rocm/lib");
 
-    for lib in ["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-hip"] {
+    for lib in ["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-hip", "mtmd"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
     for lib in ["amdhip64", "hipblas", "rocblas"] {
@@ -143,14 +175,8 @@ fn main() {
     }
 
     println!("cargo:rustc-env=GOLBANG_LLAMA_SHA={EXPECTED_SHA}");
-    println!(
-        "cargo:rustc-env=GOLBANG_LLAMA_BIN={}",
-        bin_dir.display()
-    );
-    println!(
-        "cargo:rustc-env=GOLBANG_LLAMA_DIR={}",
-        llama_dir.display()
-    );
+    println!("cargo:rustc-env=GOLBANG_LLAMA_BIN={}", bin_dir.display());
+    println!("cargo:rustc-env=GOLBANG_LLAMA_DIR={}", llama_dir.display());
     // Dependents read these as DEP_LLAMA_* (`links = "llama"`).
     println!("cargo:bin={}", bin_dir.display());
     println!("cargo:root={}", llama_dir.display());
@@ -196,7 +222,10 @@ fn first_existing(paths: &[PathBuf]) -> PathBuf {
         .unwrap_or_else(|| {
             panic!(
                 "missing llama.cpp build artifact, looked for: {:?}",
-                paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+                paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
             )
         })
 }

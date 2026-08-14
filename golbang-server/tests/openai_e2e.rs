@@ -51,6 +51,7 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
         default_timeout: None,
         chat: ChatRuntime::default(),
         api_keys: Vec::new(),
+        vision: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();

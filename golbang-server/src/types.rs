@@ -1,3 +1,4 @@
+use golbang_core::MEDIA_MARKER;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -37,7 +38,7 @@ impl ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     #[serde(default, deserialize_with = "deserialize_content")]
-    pub content: String,
+    pub content: MessageContent,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -46,6 +47,22 @@ pub struct ChatMessage {
     pub tool_calls: Vec<IncomingToolCall>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+}
+
+/// Text plus image/audio sources (`data:` / path). Markers are already in `text`.
+#[derive(Clone, Debug, Default)]
+pub struct MessageContent {
+    pub text: String,
+    pub media: Vec<String>,
+}
+
+impl MessageContent {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            media: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -64,27 +81,52 @@ pub struct IncomingFunction {
     pub arguments: serde_json::Value,
 }
 
-fn deserialize_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_content<'de, D>(deserializer: D) -> Result<MessageContent, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let v = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(match v {
-        None | Some(serde_json::Value::Null) => String::new(),
-        Some(serde_json::Value::String(s)) => s,
-        Some(serde_json::Value::Array(parts)) => {
-            let mut out = String::new();
-            for p in parts {
-                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
-                    out.push_str(t);
-                } else if let Some(s) = p.as_str() {
-                    out.push_str(s);
-                }
-            }
-            out
-        }
-        Some(other) => other.to_string(),
+        None | Some(serde_json::Value::Null) => MessageContent::default(),
+        Some(serde_json::Value::String(s)) => MessageContent::text(s),
+        Some(serde_json::Value::Array(parts)) => flatten_content_parts(&parts),
+        Some(other) => MessageContent::text(other.to_string()),
     })
+}
+
+fn flatten_content_parts(parts: &[serde_json::Value]) -> MessageContent {
+    let mut text = String::new();
+    let mut media = Vec::new();
+    for p in parts {
+        let ty = p.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if ty == "image_url" || ty == "input_image" {
+            let url = p
+                .get("image_url")
+                .and_then(|u| u.get("url").or(Some(u)))
+                .and_then(|x| x.as_str())
+                .or_else(|| p.get("url").and_then(|x| x.as_str()))
+                .unwrap_or("");
+            if !url.is_empty() {
+                text.push_str(MEDIA_MARKER);
+                media.push(url.to_string());
+            }
+        } else if ty == "input_audio" {
+            let url = p
+                .pointer("/input_audio/data")
+                .or_else(|| p.pointer("/input_audio/url"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !url.is_empty() {
+                text.push_str(MEDIA_MARKER);
+                media.push(url.to_string());
+            }
+        } else if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+            text.push_str(t);
+        } else if let Some(s) = p.as_str() {
+            text.push_str(s);
+        }
+    }
+    MessageContent { text, media }
 }
 
 fn arguments_to_string(v: &serde_json::Value) -> String {
@@ -122,7 +164,7 @@ impl From<ChatMessage> for golbang_core::ChatMessage {
     fn from(m: ChatMessage) -> Self {
         Self {
             role: m.role,
-            content: m.content,
+            content: m.content.text,
             name: m.name,
             reasoning_content: m.reasoning_content,
             tool_calls: m
@@ -328,7 +370,7 @@ mod tests {
             model: Some("qwen".into()),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content: "안녕".into(),
+                content: MessageContent::text("안녕"),
                 name: None,
                 reasoning_content: None,
                 tool_calls: vec![],
@@ -374,10 +416,30 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(req.messages[0].content, "");
+        assert_eq!(req.messages[0].content.text, "");
         assert_eq!(req.messages[0].tool_calls[0].function.name, "get_history");
         assert_eq!(req.messages[1].role, "tool");
         assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn image_url_parts_become_media_markers() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{
+                    "role":"user",
+                    "content":[
+                        {"type":"text","text":"이게 뭐야?"},
+                        {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(req.messages[0].content.text.contains(MEDIA_MARKER));
+        assert!(req.messages[0].content.text.contains("이게 뭐야?"));
+        assert_eq!(req.messages[0].content.media.len(), 1);
+        assert!(req.messages[0].content.media[0].starts_with("data:"));
     }
 
     #[test]

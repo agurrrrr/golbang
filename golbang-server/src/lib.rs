@@ -29,6 +29,7 @@ pub struct AppState {
     pub default_timeout: Option<std::time::Duration>,
     pub chat: ChatRuntime,
     pub api_keys: Vec<String>,
+    pub vision: bool,
 }
 
 pub fn router(state: AppState) -> axum::Router {

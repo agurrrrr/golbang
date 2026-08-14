@@ -8,7 +8,9 @@ use golbang_sys::*;
 
 use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
+use crate::speculative::{NgramMod, SpecParams, SpecType, topk_mode};
 use crate::tokenizer::{Token, Tokenizer};
+use crate::vision::Vision;
 
 /// Matches llama.cpp `LLM_FFN_EXPS_REGEX` — expert tensors left on CPU by `-ncmoe`.
 const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
@@ -40,6 +42,11 @@ pub struct LoadParams {
     pub n_rs_seq: u32,
     /// `true` → `LLAMA_LOAD_MODE_MMAP` (llama default). `false` is `--no-mmap`.
     pub use_mmap: bool,
+    /// Load MTP / nextn tensors. Implied by `--spec-type draft-mtp`.
+    pub load_mtp: bool,
+    pub spec: SpecParams,
+    /// CLIP / projector GGUF (`--mmproj`). None = text only.
+    pub mmproj: Option<PathBuf>,
 }
 
 impl Default for LoadParams {
@@ -56,6 +63,9 @@ impl Default for LoadParams {
             // DSV4 suffix rm needs ≥1 snapshot (~12 MiB). Other archs clamp to 0.
             n_rs_seq: 1,
             use_mmap: true,
+            load_mtp: false,
+            spec: SpecParams::default(),
+            mmproj: None,
         }
     }
 }
@@ -65,9 +75,33 @@ impl Default for LoadParams {
 pub struct Model {
     model: *mut llama_model,
     ctx: *mut llama_context,
+    ctx_mtp: *mut llama_context,
     vocab: *const llama_vocab,
     n_vocab: i32,
+    n_embd: i32,
     path: PathBuf,
+    vision: Option<Vision>,
+    spec: SpecRuntime,
+}
+
+struct SpecRuntime {
+    params: SpecParams,
+    ngram: Option<NgramMod>,
+    pending_h: Vec<Vec<f32>>,
+    verify_h: Vec<Vec<f32>>,
+    verify_h_rows: Vec<i32>,
+}
+
+impl SpecRuntime {
+    fn disabled(n_seq: u32) -> Self {
+        Self {
+            params: SpecParams::default(),
+            ngram: None,
+            pending_h: vec![Vec::new(); n_seq.max(1) as usize],
+            verify_h: vec![Vec::new(); n_seq.max(1) as usize],
+            verify_h_rows: vec![0; n_seq.max(1) as usize],
+        }
+    }
 }
 
 unsafe impl Send for Model {}
@@ -101,6 +135,7 @@ impl Model {
         } else {
             params.n_ubatch.max(1).min(n_batch)
         };
+        let load_mtp = params.load_mtp || params.spec.wants_mtp();
         tracing::info!(
             path = %path.display(),
             n_ctx_seq,
@@ -113,11 +148,15 @@ impl Model {
             flash_attn = params.flash_attn,
             n_rs_seq = params.n_rs_seq,
             use_mmap = params.use_mmap,
+            load_mtp,
+            spec = ?params.spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            mmproj = params.mmproj.as_ref().map(|p| p.display().to_string()),
             "loading GGUF"
         );
 
         let mut mparams = unsafe { llama_model_default_params() };
         mparams.n_gpu_layers = params.n_gpu_layers;
+        mparams.load_mtp = load_mtp;
         mparams.load_mode = if params.use_mmap {
             LLAMA_LOAD_MODE_MMAP
         } else {
@@ -175,6 +214,78 @@ impl Model {
             });
         }
 
+        let n_embd = unsafe { llama_model_n_embd_out(model) }.max(1);
+        let n_nextn = unsafe { llama_model_n_layer_nextn(model) };
+
+        let mut ctx_mtp = ptr::null_mut();
+        let mut spec = SpecRuntime::disabled(n_seq_max);
+        spec.params = params.spec.clone();
+        if spec.params.wants_ngram() {
+            spec.ngram = Some(NgramMod::new(24, 4 * 1024 * 1024));
+        }
+        spec.pending_h = vec![vec![0.0f32; n_embd as usize]; n_seq_max as usize];
+        spec.verify_h = vec![Vec::new(); n_seq_max as usize];
+        spec.verify_h_rows = vec![0; n_seq_max as usize];
+
+        if spec.params.wants_mtp() {
+            if n_nextn <= 0 {
+                tracing::warn!(
+                    "--spec-type draft-mtp but GGUF has n_layer_nextn=0; MTP drafts off"
+                );
+                spec.params.types.retain(|t| *t != SpecType::DraftMtp);
+            } else {
+                let mut mparams_ctx = unsafe { llama_context_default_params() };
+                mparams_ctx.n_ctx = n_ctx_total;
+                mparams_ctx.n_batch = n_batch;
+                mparams_ctx.n_ubatch = n_ubatch;
+                mparams_ctx.n_seq_max = n_seq_max;
+                mparams_ctx.flash_attn_type = params.flash_attn;
+                mparams_ctx.n_rs_seq = 0;
+                mparams_ctx.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                mparams_ctx.ctx_other = ctx;
+                mparams_ctx.type_k = spec.params.cache_type_k as ggml_type;
+                mparams_ctx.type_v = spec.params.cache_type_v as ggml_type;
+                if params.n_threads > 0 {
+                    mparams_ctx.n_threads = params.n_threads;
+                    mparams_ctx.n_threads_batch = params.n_threads;
+                }
+                ctx_mtp = unsafe { llama_init_from_model(model, mparams_ctx) };
+                if ctx_mtp.is_null() {
+                    tracing::warn!("failed to create MTP context; draft-mtp disabled");
+                    spec.params.types.retain(|t| *t != SpecType::DraftMtp);
+                } else {
+                    unsafe {
+                        golbang_llama_set_embeddings_nextn(ctx, true, false);
+                        golbang_llama_set_embeddings_nextn(ctx_mtp, true, true);
+                    }
+                    tracing::info!(
+                        n_nextn,
+                        n_embd,
+                        n_max = spec.params.n_max,
+                        p_min = spec.params.p_min,
+                        "MTP draft context ready"
+                    );
+                }
+            }
+        }
+
+        let vision = match &params.mmproj {
+            Some(mm) => match Vision::load(mm, model, params.n_threads, params.flash_attn) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    unsafe {
+                        if !ctx_mtp.is_null() {
+                            llama_free(ctx_mtp);
+                        }
+                        llama_free(ctx);
+                        llama_model_free(model);
+                    }
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         tracing::info!(
             n_ctx = unsafe { llama_n_ctx(ctx) },
             n_ctx_seq = unsafe { llama_n_ctx_seq(ctx) },
@@ -183,15 +294,22 @@ impl Model {
             n_ubatch = unsafe { llama_n_ubatch(ctx) },
             n_vocab,
             n_layer = unsafe { llama_model_n_layer(model) },
+            n_nextn,
+            mtp = !ctx_mtp.is_null(),
+            vision = vision.is_some(),
             "model ready"
         );
 
         Ok(Self {
             model,
             ctx,
+            ctx_mtp,
             vocab,
             n_vocab,
+            n_embd,
             path: path.to_path_buf(),
+            vision,
+            spec,
         })
     }
 
@@ -201,6 +319,18 @@ impl Model {
 
     pub fn n_vocab(&self) -> i32 {
         self.n_vocab
+    }
+
+    pub fn spec_enabled(&self) -> bool {
+        self.spec.params.enabled()
+    }
+
+    pub fn spec_n_max(&self) -> i32 {
+        self.spec.params.n_max.max(0)
+    }
+
+    pub fn vision_enabled(&self) -> bool {
+        self.vision.is_some()
     }
 
     /// GGUF `tokenizer.chat_template`, if present.
@@ -363,11 +493,7 @@ impl Model {
                 return 0;
             }
             let max = llama_memory_seq_pos_max(mem, seq_id);
-            if max < 0 {
-                0
-            } else {
-                (max + 1) as u32
-            }
+            if max < 0 { 0 } else { (max + 1) as u32 }
         }
     }
 
@@ -475,11 +601,313 @@ impl Model {
     pub fn generate(&mut self, prompt: &str, params: GenerateParams) -> Result<Generate<'_>> {
         Generate::start(self, prompt, params)
     }
+
+    pub fn spec_begin(&mut self, seq_id: i32, prompt: &[Token]) {
+        if let Some(ng) = self.spec.ngram.as_mut() {
+            ng.ingest(prompt);
+        }
+        self.spec_reset_hidden(seq_id);
+    }
+
+    pub fn spec_reset_seq(&mut self, seq_id: i32) {
+        self.spec_reset_hidden(seq_id);
+        if !self.ctx_mtp.is_null() {
+            unsafe {
+                let mem = llama_get_memory(self.ctx_mtp);
+                if !mem.is_null() {
+                    llama_memory_seq_rm(mem, seq_id, -1, -1);
+                }
+            }
+        }
+    }
+
+    fn spec_reset_hidden(&mut self, seq_id: i32) {
+        let i = seq_id as usize;
+        if let Some(h) = self.spec.pending_h.get_mut(i) {
+            h.fill(0.0);
+        }
+        if let Some(r) = self.spec.verify_h_rows.get_mut(i) {
+            *r = 0;
+        }
+        if let Some(h) = self.spec.verify_h.get_mut(i) {
+            h.clear();
+        }
+    }
+
+    /// After a target decode of `items`, catch MTP up (qwen35 single-head path).
+    pub fn spec_process(&mut self, items: &[crate::batch::BatchToken]) -> Result<()> {
+        if self.ctx_mtp.is_null() || items.is_empty() {
+            return Ok(());
+        }
+        if items.iter().any(|it| it.token < 0) {
+            return Ok(());
+        }
+        let n_embd = self.n_embd as usize;
+        let n = items.len();
+        let mut h_tgt = vec![0.0f32; n * n_embd];
+        for i in 0..n {
+            let p = unsafe { golbang_llama_get_embeddings_nextn_ith(self.ctx, i as i32) };
+            if p.is_null() {
+                return Err(Error::Null("golbang_llama_get_embeddings_nextn_ith"));
+            }
+            let row = unsafe { std::slice::from_raw_parts(p, n_embd) };
+            h_tgt[i * n_embd..(i + 1) * n_embd].copy_from_slice(row);
+        }
+
+        let mut embd = vec![0.0f32; n * n_embd];
+        if n > 1 {
+            embd[n_embd..].copy_from_slice(&h_tgt[..(n - 1) * n_embd]);
+        }
+        let mut seen = vec![false; self.spec.pending_h.len()];
+        for (i, it) in items.iter().enumerate() {
+            let sid = it.seq_id as usize;
+            if sid < seen.len() && !seen[sid] {
+                seen[sid] = true;
+                if let Some(h) = self.spec.pending_h.get(sid) {
+                    if h.len() == n_embd {
+                        embd[i * n_embd..(i + 1) * n_embd].copy_from_slice(h);
+                    }
+                }
+            }
+        }
+
+        self.decode_mtp(items, &embd)?;
+
+        for sid in 0..self.spec.pending_h.len() {
+            let idxs: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.seq_id == sid as i32)
+                .map(|(i, _)| i)
+                .collect();
+            if idxs.is_empty() {
+                continue;
+            }
+            let n_rows = idxs.len();
+            let mut vh = vec![0.0f32; n_rows * n_embd];
+            for (r, &bi) in idxs.iter().enumerate() {
+                vh[r * n_embd..(r + 1) * n_embd]
+                    .copy_from_slice(&h_tgt[bi * n_embd..(bi + 1) * n_embd]);
+            }
+            if let Some(last) = idxs.last() {
+                self.spec.pending_h[sid] = h_tgt[last * n_embd..(last + 1) * n_embd].to_vec();
+            }
+            self.spec.verify_h[sid] = vh;
+            self.spec.verify_h_rows[sid] = n_rows as i32;
+        }
+        Ok(())
+    }
+
+    pub fn spec_accept(&mut self, seq_id: i32, n_accepted: u16) {
+        let i = seq_id as usize;
+        let n_rows = self.spec.verify_h_rows.get(i).copied().unwrap_or(0);
+        if n_rows <= 0 {
+            return;
+        }
+        let n_embd = self.n_embd as usize;
+        let i_h = (n_accepted as i32).min(n_rows - 1) as usize;
+        if let Some(vh) = self.spec.verify_h.get(i) {
+            if vh.len() >= (i_h + 1) * n_embd {
+                if let Some(dst) = self.spec.pending_h.get_mut(i) {
+                    dst.clear();
+                    dst.extend_from_slice(&vh[i_h * n_embd..(i_h + 1) * n_embd]);
+                }
+            }
+        }
+    }
+
+    pub fn spec_draft(
+        &mut self,
+        seq_id: i32,
+        prompt: &[Token],
+        id_last: Token,
+        n_past: i32,
+        n_max: i32,
+    ) -> Vec<Token> {
+        let n_max = n_max.max(0) as usize;
+        if n_max == 0 {
+            return Vec::new();
+        }
+
+        if let Some(ng) = self.spec.ngram.as_ref() {
+            let drafted = ng.draft(prompt, id_last, n_max.max(48), 1);
+            let drafted: Vec<Token> = drafted.into_iter().take(n_max).collect();
+            if !drafted.is_empty() {
+                return drafted;
+            }
+        }
+
+        if self.ctx_mtp.is_null() || !self.spec.params.wants_mtp() {
+            return Vec::new();
+        }
+
+        let n_embd = self.n_embd as usize;
+        let sid = seq_id as usize;
+        let Some(mut h) = self.spec.pending_h.get(sid).cloned() else {
+            return Vec::new();
+        };
+        if h.len() != n_embd {
+            h = vec![0.0; n_embd];
+        }
+
+        let p_min = self.spec.params.p_min;
+        let mut drafted = Vec::new();
+        let mut tok = id_last;
+        let mut pos = n_past;
+        let mut embd = h;
+
+        for _step in 0..n_max {
+            let item = crate::batch::BatchToken {
+                token: tok,
+                pos,
+                seq_id,
+                logits: true,
+            };
+            if let Err(e) = self.decode_mtp(&[item], &embd) {
+                tracing::warn!(error = %e, "MTP draft decode failed");
+                break;
+            }
+            let logits = match self.logits_ith_ctx(self.ctx_mtp, -1) {
+                Ok(l) => l.to_vec(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "MTP draft logits missing");
+                    break;
+                }
+            };
+            let (id, p) = topk_mode(&logits, 10);
+            if p < p_min {
+                break;
+            }
+            drafted.push(id);
+
+            let hp = unsafe { golbang_llama_get_embeddings_nextn_ith(self.ctx_mtp, -1) };
+            if hp.is_null() {
+                break;
+            }
+            embd = unsafe { std::slice::from_raw_parts(hp, n_embd) }.to_vec();
+            tok = id;
+            pos += 1;
+        }
+        drafted
+    }
+
+    pub fn spec_rm_from(&mut self, seq_id: i32, p0: i32) -> bool {
+        if self.ctx_mtp.is_null() {
+            return true;
+        }
+        unsafe {
+            let mem = llama_get_memory(self.ctx_mtp);
+            if mem.is_null() {
+                return false;
+            }
+            llama_memory_seq_rm(mem, seq_id, p0, -1)
+        }
+    }
+
+    pub fn spec_state_get(&mut self, seq_id: i32) -> Option<Vec<u8>> {
+        if self.ctx_mtp.is_null() {
+            return None;
+        }
+        let flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        let n = unsafe { llama_state_seq_get_size_ext(self.ctx_mtp, seq_id, flags) };
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n];
+        let wrote = unsafe {
+            llama_state_seq_get_data_ext(self.ctx_mtp, buf.as_mut_ptr(), n, seq_id, flags)
+        };
+        if wrote == 0 {
+            return None;
+        }
+        buf.truncate(wrote);
+        Some(buf)
+    }
+
+    pub fn spec_state_set(&mut self, seq_id: i32, data: &[u8]) -> bool {
+        if self.ctx_mtp.is_null() || data.is_empty() {
+            return false;
+        }
+        let flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        let n = unsafe {
+            llama_state_seq_set_data_ext(self.ctx_mtp, data.as_ptr(), data.len(), seq_id, flags)
+        };
+        n > 0
+    }
+
+    pub fn vision_eval(&mut self, seq_id: i32, prompt: &str, images: &[Vec<u8>]) -> Result<u32> {
+        let n_batch = self.n_batch() as i32;
+        let ctx = self.ctx;
+        let vision = self.vision.as_mut().ok_or(Error::VisionDisabled)?;
+        vision.eval_prompt(ctx, prompt, images, seq_id, n_batch)
+    }
+
+    fn decode_mtp(&mut self, items: &[crate::batch::BatchToken], embd: &[f32]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let n_embd = self.n_embd as usize;
+        if embd.len() != items.len() * n_embd {
+            return Err(Error::Decode(-2));
+        }
+        let n = items.len() as i32;
+        let mut batch = unsafe { llama_batch_init(n, n_embd as i32, 1) };
+        if batch.embd.is_null() || batch.pos.is_null() || batch.seq_id.is_null() {
+            unsafe { llama_batch_free(batch) };
+            return Err(Error::Null("llama_batch_init mtp"));
+        }
+        let mut token_buf: Vec<Token> = items.iter().map(|it| it.token).collect();
+        batch.token = token_buf.as_mut_ptr();
+        unsafe {
+            std::ptr::copy_nonoverlapping(embd.as_ptr(), batch.embd, embd.len());
+        }
+        for (i, it) in items.iter().enumerate() {
+            unsafe {
+                *batch.pos.add(i) = it.pos;
+                *batch.n_seq_id.add(i) = 1;
+                let seqs = *batch.seq_id.add(i);
+                if seqs.is_null() {
+                    batch.token = ptr::null_mut();
+                    llama_batch_free(batch);
+                    return Err(Error::Null("llama_batch.seq_id mtp"));
+                }
+                *seqs.add(0) = it.seq_id;
+                *batch.logits.add(i) = i8::from(it.logits);
+            }
+        }
+        batch.n_tokens = n;
+        let rc = unsafe { llama_decode(self.ctx_mtp, batch) };
+        batch.token = ptr::null_mut();
+        unsafe { llama_batch_free(batch) };
+        if rc != 0 {
+            return Err(Error::Decode(rc));
+        }
+        Ok(())
+    }
+
+    fn logits_ith_ctx(&self, ctx: *mut llama_context, i: i32) -> Result<&[f32]> {
+        unsafe {
+            let ptr = llama_get_logits_ith(ctx, i);
+            if ptr.is_null() {
+                return Err(Error::Null("llama_get_logits_ith"));
+            }
+            Ok(std::slice::from_raw_parts(ptr, self.n_vocab as usize))
+        }
+    }
+
+    pub fn last_logits_vec(&self) -> Result<Vec<f32>> {
+        Ok(self.logits()?.to_vec())
+    }
 }
 
 impl Drop for Model {
     fn drop(&mut self) {
+        self.vision = None;
         unsafe {
+            if !self.ctx_mtp.is_null() {
+                llama_free(self.ctx_mtp);
+                self.ctx_mtp = ptr::null_mut();
+            }
             if !self.ctx.is_null() {
                 llama_free(self.ctx);
                 self.ctx = ptr::null_mut();

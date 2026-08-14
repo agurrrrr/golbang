@@ -18,6 +18,14 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+unsafe extern "C" {
+    pub fn golbang_llama_set_embeddings_nextn(ctx: *mut llama_context, value: bool, masked: bool);
+    pub fn golbang_llama_get_embeddings_nextn(ctx: *mut llama_context) -> *mut f32;
+    pub fn golbang_llama_get_embeddings_nextn_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
+    pub fn golbang_llama_set_nextn_layer_offset(ctx: *mut llama_context, offset: i32);
+    pub fn golbang_llama_get_ctx_other(ctx: *mut llama_context) -> *mut llama_context;
+}
+
 /// llama.cpp commit bindgen and the linked `.so` were verified against.
 pub const LLAMA_CPP_SHA: &str = env!("GOLBANG_LLAMA_SHA");
 
@@ -38,6 +46,11 @@ mod api_names {
         let _logits = llama_get_logits;
         let _n_layer = llama_model_n_layer;
         let _n_vocab = llama_vocab_n_tokens;
+        let _n_nextn = llama_model_n_layer_nextn;
+        let _set_h = golbang_llama_set_embeddings_nextn;
+        let _get_h = golbang_llama_get_embeddings_nextn;
+        let _mtmd = mtmd_init_from_file;
+        let _bmp = mtmd_helper_bitmap_init_from_buf;
         assert_eq!(LLAMA_CPP_SHA, "5b474eb69dac2d7c26ba8855310d3b60e02a5c4f");
     }
 }

@@ -22,6 +22,10 @@ pub enum Error {
     Cancelled,
     #[error("request timed out")]
     Timeout,
+    #[error("vision: {0}")]
+    Vision(String),
+    #[error("image input requires --mmproj")]
+    VisionDisabled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -104,9 +104,16 @@ pub(crate) struct ActiveJob {
     pub n_prompt: u32,
     pub max_tokens: u32,
     pub pending: Option<Token>,
+    /// Speculative draft tokens to verify on the next decode (after `pending`).
+    pub drafts: Vec<Token>,
     /// Sampled token IDs this request (not including EOG). Used to grow the
     /// slot prefix cache so the next turn's LCP covers the assistant reply.
     pub generated: Vec<Token>,
+    /// Raw image/audio file bytes for `--mmproj` prefill.
+    #[allow(dead_code)]
+    pub images: Vec<Vec<u8>>,
+    /// `spec_begin` already ran for this job.
+    pub spec_begun: bool,
     pub sampler: Sampler,
     pub stop: Vec<String>,
     pub acc: String,
@@ -136,6 +143,7 @@ impl ActiveJob {
         timeout: Option<Duration>,
         events: mpsc::UnboundedSender<SlotEvent>,
         n_ctx_seq: u32,
+        images: Vec<Vec<u8>>,
     ) -> Self {
         let n_prompt = tokens.len() as u32;
         let remaining = n_ctx_seq.saturating_sub(n_prompt).max(1);
@@ -152,7 +160,10 @@ impl ActiveJob {
             n_prompt,
             max_tokens,
             pending: None,
+            drafts: Vec::new(),
             generated: Vec::new(),
+            images,
+            spec_begun: false,
             sampler: Sampler::new(SamplerParams {
                 temperature: params.temperature,
                 top_p: params.top_p,
@@ -212,7 +223,9 @@ impl ActiveJob {
     }
 
     pub fn prefill_remaining(&self) -> usize {
-        self.prompt_tokens.len().saturating_sub(self.prefill_cursor())
+        self.prompt_tokens
+            .len()
+            .saturating_sub(self.prefill_cursor())
     }
 
     /// True once the full prompt is resident, including a reused prefix.
@@ -233,6 +246,7 @@ impl ActiveJob {
             None,
             tx,
             256,
+            Vec::new(),
         )
     }
 }
@@ -335,6 +349,7 @@ mod tests {
             None,
             tx,
             256,
+            Vec::new(),
         );
         assert_eq!(job.prompt_offset, 2);
         assert_eq!(job.n_past, 2, "n_past seeded at reuse_len");
@@ -354,6 +369,7 @@ mod tests {
             None,
             tx,
             256,
+            Vec::new(),
         );
         assert_eq!(job.prompt_offset, 0);
         assert_eq!(job.n_past, 0);

@@ -66,6 +66,15 @@ pub fn render(scheduler: &SchedulerHandle) -> String {
         "golbang_predicted_tokens_per_second {pred_tps:.4}\n"
     ));
 
+    let draft_n = load(&m.draft_tokens_total);
+    let draft_acc = load(&m.draft_accepted_total);
+    out.push_str("# HELP golbang_draft_tokens_total Speculative draft tokens proposed.\n");
+    out.push_str("# TYPE golbang_draft_tokens_total counter\n");
+    out.push_str(&format!("golbang_draft_tokens_total {draft_n}\n"));
+    out.push_str("# HELP golbang_draft_accepted_total Speculative draft tokens accepted.\n");
+    out.push_str("# TYPE golbang_draft_accepted_total counter\n");
+    out.push_str(&format!("golbang_draft_accepted_total {draft_acc}\n"));
+
     out.push_str("# HELP golbang_ttft_ms Time to first token (histogram).\n");
     out.push_str("# TYPE golbang_ttft_ms histogram\n");
     bucket_lines("golbang_ttft_ms", &m.ttft_bucket_ms, &mut out);

@@ -16,6 +16,8 @@ use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
 use crate::policy::{IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
 use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
+use crate::speculative::accept_drafts;
+use crate::tokenizer::Token;
 
 #[derive(Debug)]
 pub enum SubmitError {
@@ -58,6 +60,8 @@ pub struct Job {
     pub cancel: CancellationToken,
     pub timeout: Option<Duration>,
     pub events: mpsc::UnboundedSender<SlotEvent>,
+    /// Decoded image bytes for `--mmproj` (one per `<__media__>` marker).
+    pub images: Vec<Vec<u8>>,
 }
 
 impl Job {
@@ -75,6 +79,7 @@ impl Job {
             cancel,
             timeout: None,
             events,
+            images: Vec::new(),
         }
     }
 }
@@ -104,6 +109,9 @@ pub struct SchedulerMetrics {
     /// Accumulated prefill / decode wall time (microseconds).
     pub prompt_us_total: AtomicU64,
     pub predicted_us_total: AtomicU64,
+    /// Speculative draft tokens proposed / accepted (not counting the bonus).
+    pub draft_tokens_total: AtomicU64,
+    pub draft_accepted_total: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -386,6 +394,13 @@ fn join_waiting(
 }
 
 fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool {
+    let seq = slot.id.0 as i32;
+    engine.spec_reset_seq(seq);
+
+    if !job.images.is_empty() {
+        return bind_vision_slot(slot, job, engine, n_ctx_seq);
+    }
+
     let tokens = match engine.encode(&job.prompt) {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => {
@@ -407,7 +422,6 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
     }
     // P5: keep resident KV for the LCP. DSV4 cannot seq_rm a long generated
     // suffix (n_rs_seq is 1), so we restore the prefill checkpoint then trim.
-    let seq = slot.id.0 as i32;
     let gpu_n = engine.n_past_seq(seq);
     let ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
     let hint_n = gpu_n.max(ckpt_n);
@@ -423,6 +437,7 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         job.timeout,
         job.events,
         n_ctx_seq,
+        job.images,
     ));
     if let Some(active) = slot.job.as_ref() {
         let progress = if n_prompt == 0 {
@@ -445,6 +460,86 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         "slot bound"
     );
     true
+}
+
+fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool {
+    if !engine.vision_enabled() {
+        let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
+        return false;
+    }
+    let seq = slot.id.0 as i32;
+    engine.clear_seq(seq);
+    slot.prefix_cache.reset();
+    slot.prefix_ckpt = None;
+
+    let n_past = match engine.vision_eval(seq, &job.prompt, &job.images) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = job.events.send(SlotEvent::Failed(e));
+            return false;
+        }
+    };
+    if n_past >= n_ctx_seq {
+        let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
+            prompt: n_past,
+            n_ctx: n_ctx_seq,
+        }));
+        return false;
+    }
+    let tokens = match engine.encode(&job.prompt) {
+        Ok(t) if !t.is_empty() => t,
+        _ => vec![0; n_past.max(1) as usize],
+    };
+    let req = job.request_id;
+    let n_img = job.images.len();
+    slot.occupy(ActiveJob::from_parts(
+        job.request_id,
+        tokens,
+        0,
+        job.params,
+        job.cancel,
+        job.timeout,
+        job.events,
+        n_ctx_seq,
+        job.images,
+    ));
+    if let Some(active) = slot.job.as_mut() {
+        active.n_past = n_past;
+        active.n_prompt = n_past;
+        active.prompt_offset = n_past as usize;
+        active.prompt_pos = 0;
+        slot.phase = SlotPhase::Decoding;
+        let _ = active.events.send(SlotEvent::PromptProgress {
+            n_tokens: n_past,
+            progress: 1.0,
+            tps: 0.0,
+        });
+    }
+    if let Err(e) = sample_from_existing_logits(slot, engine, n_ctx_seq) {
+        if let Some(job) = slot.job.take() {
+            let _ = job.events.send(SlotEvent::Failed(e));
+        }
+        slot.phase = SlotPhase::Empty;
+        return false;
+    }
+    tracing::info!(
+        slot = slot.id.0,
+        request_id = req,
+        n_past,
+        n_images = n_img,
+        "vision slot bound"
+    );
+    true
+}
+
+fn sample_from_existing_logits(
+    slot: &mut Slot,
+    engine: &Engine,
+    n_ctx_seq: u32,
+) -> crate::error::Result<()> {
+    let row = engine.last_logits()?;
+    emit_sampled(slot, engine, std::slice::from_ref(&row), n_ctx_seq, None);
+    Ok(())
 }
 
 fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engine) {
@@ -499,23 +594,149 @@ fn sample_and_emit(
     n_ctx_seq: u32,
     metrics: &SchedulerMetrics,
 ) {
-    for (row_i, slot_id) in plan.logit_slots.iter().enumerate() {
-        let Some(row) = logits.get(row_i) else {
-            continue;
-        };
-        let Some(slot) = slots.iter_mut().find(|s| s.id == *slot_id) else {
-            continue;
-        };
-        let Some(job) = slot.job.as_mut() else {
-            continue;
-        };
-        if job.finish.is_some() {
+    let mut i = 0;
+    while i < plan.logit_slots.len() {
+        let slot_id = plan.logit_slots[i];
+        let mut j = i + 1;
+        while j < plan.logit_slots.len() && plan.logit_slots[j] == slot_id {
+            j += 1;
+        }
+        let rows = &logits[i.min(logits.len())..j.min(logits.len())];
+        i = j;
+        if rows.is_empty() {
             continue;
         }
+        let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) else {
+            continue;
+        };
+        if slot.job.as_ref().is_none_or(|j| j.finish.is_some()) {
+            continue;
+        }
+        emit_sampled(slot, engine, rows, n_ctx_seq, Some(metrics));
+    }
+}
 
-        // P3 §4.3: TTFT is the first emitted token's latency from join.
-        // ITL is the per-token inter-arrival time for subsequent tokens.
-        let now = Instant::now();
+fn emit_sampled(
+    slot: &mut Slot,
+    engine: &Engine,
+    rows: &[Vec<f32>],
+    n_ctx_seq: u32,
+    metrics: Option<&SchedulerMetrics>,
+) {
+    let n_verify = rows.len().saturating_sub(1);
+    let drafts: Vec<Token> = slot
+        .job
+        .as_ref()
+        .map(|j| j.drafts.iter().copied().take(n_verify).collect())
+        .unwrap_or_default();
+
+    if n_verify > 0 && !drafts.is_empty() {
+        verify_and_emit(slot, engine, rows, &drafts, n_ctx_seq, metrics);
+        return;
+    }
+
+    let Some(row) = rows.first() else {
+        return;
+    };
+    let Some(job) = slot.job.as_mut() else {
+        return;
+    };
+    if job.finish.is_some() {
+        return;
+    }
+    record_token_latency(job, metrics);
+    let token = job.sampler.sample(row);
+    if !push_token(slot, engine, token, n_ctx_seq) {
+        return;
+    }
+    maybe_fill_drafts(slot, engine, n_ctx_seq);
+}
+
+fn verify_and_emit(
+    slot: &mut Slot,
+    engine: &Engine,
+    rows: &[Vec<f32>],
+    drafts: &[Token],
+    n_ctx_seq: u32,
+    metrics: Option<&SchedulerMetrics>,
+) {
+    let Some(job) = slot.job.as_mut() else {
+        return;
+    };
+    if job.finish.is_some() {
+        return;
+    }
+    let seq = slot.id.0 as i32;
+    let n_verify = drafts.len();
+    let n_past_after = job.n_past;
+
+    let mut samples = Vec::with_capacity(rows.len());
+    for row in rows {
+        samples.push(job.sampler.sample(row));
+    }
+    let accepted = accept_drafts(&samples, drafts);
+    if accepted.is_empty() {
+        job.drafts.clear();
+        return;
+    }
+    let n_matched = accepted
+        .iter()
+        .zip(drafts.iter())
+        .take_while(|(a, d)| *a == *d)
+        .count();
+    let keep_pos = n_past_after.saturating_sub((n_verify - n_matched) as u32);
+
+    if n_matched < n_verify {
+        let tgt_ok = engine.rm_seq_from(seq, keep_pos as i32);
+        let mtp_ok = engine.spec_rm_from(seq, keep_pos as i32);
+        if !tgt_ok {
+            tracing::debug!(
+                slot = slot.id.0,
+                keep_pos,
+                n_matched,
+                n_verify,
+                "spec seq_rm failed; KV may include rejected drafts until next bind"
+            );
+        }
+        let _ = (tgt_ok, mtp_ok);
+    }
+
+    engine.spec_accept(seq, n_matched as u16);
+    if let Some(m) = metrics {
+        m.draft_tokens_total
+            .fetch_add(n_verify as u64, Ordering::Relaxed);
+        m.draft_accepted_total
+            .fetch_add(n_matched as u64, Ordering::Relaxed);
+    }
+    tracing::debug!(
+        slot = slot.id.0,
+        n_draft = n_verify,
+        n_matched,
+        n_emit = accepted.len(),
+        "spec accept"
+    );
+
+    job.n_past = keep_pos;
+    job.drafts.clear();
+
+    for tok in accepted {
+        let Some(job) = slot.job.as_mut() else {
+            break;
+        };
+        if job.finish.is_some() {
+            break;
+        }
+        record_token_latency(job, metrics);
+        if !push_token(slot, engine, tok, n_ctx_seq) {
+            break;
+        }
+    }
+    maybe_fill_drafts(slot, engine, n_ctx_seq);
+}
+
+fn record_token_latency(job: &mut ActiveJob, metrics: Option<&SchedulerMetrics>) {
+    let now = Instant::now();
+    if let Some(metrics) = metrics {
         if job.n_generated == 0 {
             let ms = now.duration_since(job.started).as_millis() as u64;
             record_bucket(&metrics.ttft_bucket_ms, ms);
@@ -526,52 +747,88 @@ fn sample_and_emit(
             let ms = now.duration_since(job.last_token_at).as_millis() as u64;
             record_bucket(&metrics.itl_bucket_ms, ms);
         }
-        job.last_token_at = now;
-
-        let token = job.sampler.sample(row);
-        if engine.is_eog(token) {
-            let _ = job.utf8.flush();
-            job.finish = Some(FinishReason::Stop);
-            continue;
-        }
-
-        let bytes = match engine.token_to_piece(token) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = job.events.send(SlotEvent::Failed(e));
-                job.finish = Some(FinishReason::Stop);
-                continue;
-            }
-        };
-        let mut piece = job.utf8.push(&bytes);
-        job.n_generated += 1;
-        job.generated.push(token);
-        job.pending = Some(token);
-        slot.phase = SlotPhase::Decoding;
-        maybe_log_decode_progress(slot.id.0, job);
-
-        if job.n_generated >= job.max_tokens {
-            piece.push_str(&job.utf8.flush());
-            job.finish = Some(FinishReason::Length);
-        } else if !job.stop.is_empty() {
-            job.acc.push_str(&piece);
-            if job
-                .stop
-                .iter()
-                .any(|s| !s.is_empty() && job.acc.contains(s))
-            {
-                job.finish = Some(FinishReason::Stop);
-            }
-        }
-
-        if job.n_past + 1 > n_ctx_seq && job.finish.is_none() {
-            job.finish = Some(FinishReason::Length);
-        }
-
-        let _ = job
-            .events
-            .send(SlotEvent::Token(GeneratedToken { token, piece }));
+    } else if job.n_generated == 0 && job.generation_started_at.is_none() {
+        job.generation_started_at = Some(now);
     }
+    job.last_token_at = now;
+}
+
+/// Emit one sampled token. `pending` becomes this token (not yet in KV if it
+/// is a bonus / correction). Returns false if the job finished without emit.
+fn push_token(slot: &mut Slot, engine: &Engine, token: Token, n_ctx_seq: u32) -> bool {
+    let Some(job) = slot.job.as_mut() else {
+        return false;
+    };
+    if engine.is_eog(token) {
+        let _ = job.utf8.flush();
+        job.finish = Some(FinishReason::Stop);
+        job.pending = None;
+        job.drafts.clear();
+        return false;
+    }
+    let bytes = match engine.token_to_piece(token) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = job.events.send(SlotEvent::Failed(e));
+            job.finish = Some(FinishReason::Stop);
+            return false;
+        }
+    };
+    let mut piece = job.utf8.push(&bytes);
+    job.n_generated += 1;
+    job.generated.push(token);
+    job.pending = Some(token);
+    slot.phase = SlotPhase::Decoding;
+    maybe_log_decode_progress(slot.id.0, job);
+
+    if job.n_generated >= job.max_tokens {
+        piece.push_str(&job.utf8.flush());
+        job.finish = Some(FinishReason::Length);
+    } else if !job.stop.is_empty() {
+        job.acc.push_str(&piece);
+        if job
+            .stop
+            .iter()
+            .any(|s| !s.is_empty() && job.acc.contains(s))
+        {
+            job.finish = Some(FinishReason::Stop);
+        }
+    }
+    if job.n_past + 1 > n_ctx_seq && job.finish.is_none() {
+        job.finish = Some(FinishReason::Length);
+    }
+    let _ = job
+        .events
+        .send(SlotEvent::Token(GeneratedToken { token, piece }));
+    true
+}
+
+fn maybe_fill_drafts(slot: &mut Slot, engine: &Engine, n_ctx_seq: u32) {
+    let seq = slot.id.0 as i32;
+    let Some(job) = slot.job.as_mut() else {
+        return;
+    };
+    job.drafts.clear();
+    if !engine.spec_enabled() || job.finish.is_some() {
+        return;
+    }
+    let Some(id_last) = job.pending else {
+        return;
+    };
+    if !job.spec_begun {
+        engine.spec_begin(seq, &job.prompt_tokens);
+        job.spec_begun = true;
+    }
+    let mut hist = job.prompt_tokens.clone();
+    if job.generated.len() > 1 {
+        hist.extend_from_slice(&job.generated[..job.generated.len() - 1]);
+    }
+    let remain = n_ctx_seq.saturating_sub(job.n_past.saturating_add(1)) as i32;
+    let n_max = engine.spec_n_max().min(remain.saturating_sub(1)).max(0);
+    if n_max <= 0 {
+        return;
+    }
+    job.drafts = engine.spec_draft(seq, &hist, id_last, job.n_past as i32, n_max);
 }
 
 fn evict_cancelled(slots: &mut [Slot], engine: &Engine, iter: u64, metrics: &SchedulerMetrics) {

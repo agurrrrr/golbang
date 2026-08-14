@@ -43,6 +43,18 @@ impl Engine {
         self.lock().n_vocab()
     }
 
+    pub fn spec_enabled(&self) -> bool {
+        self.lock().spec_enabled()
+    }
+
+    pub fn spec_n_max(&self) -> i32 {
+        self.lock().spec_n_max()
+    }
+
+    pub fn vision_enabled(&self) -> bool {
+        self.lock().vision_enabled()
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<Token>> {
         self.lock().encode(text)
     }
@@ -87,6 +99,53 @@ impl Engine {
                 rows.push(model.logits_ith(i as i32)?.to_vec());
             }
         }
+        if let Err(e) = model.spec_process(items) {
+            tracing::warn!(error = %e, "MTP process() failed; drafts may degrade");
+        }
         Ok(rows)
+    }
+
+    pub fn last_logits(&self) -> Result<Vec<f32>> {
+        self.lock().last_logits_vec()
+    }
+
+    pub fn spec_begin(&self, seq_id: i32, prompt: &[Token]) {
+        self.lock().spec_begin(seq_id, prompt);
+    }
+
+    pub fn spec_reset_seq(&self, seq_id: i32) {
+        self.lock().spec_reset_seq(seq_id);
+    }
+
+    pub fn spec_draft(
+        &self,
+        seq_id: i32,
+        prompt: &[Token],
+        id_last: Token,
+        n_past: i32,
+        n_max: i32,
+    ) -> Vec<Token> {
+        self.lock()
+            .spec_draft(seq_id, prompt, id_last, n_past, n_max)
+    }
+
+    pub fn spec_accept(&self, seq_id: i32, n_accepted: u16) {
+        self.lock().spec_accept(seq_id, n_accepted);
+    }
+
+    pub fn spec_rm_from(&self, seq_id: i32, p0: i32) -> bool {
+        self.lock().spec_rm_from(seq_id, p0)
+    }
+
+    pub fn spec_state_get(&self, seq_id: i32) -> Option<Vec<u8>> {
+        self.lock().spec_state_get(seq_id)
+    }
+
+    pub fn spec_state_set(&self, seq_id: i32, data: &[u8]) -> bool {
+        self.lock().spec_state_set(seq_id, data)
+    }
+
+    pub fn vision_eval(&self, seq_id: i32, prompt: &str, images: &[Vec<u8>]) -> Result<u32> {
+        self.lock().vision_eval(seq_id, prompt, images)
     }
 }

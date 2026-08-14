@@ -78,6 +78,19 @@ impl BatchBuilder {
             });
             plan.logit_slots.push(id);
             decode_taken += 1;
+            for (k, &draft) in job.drafts.iter().enumerate() {
+                if plan.tokens.len() >= cap || decode_taken >= budget.decode_max {
+                    break;
+                }
+                plan.tokens.push(BatchToken {
+                    token: draft,
+                    pos: job.n_past as i32 + k as i32 + 1,
+                    seq_id: id.0 as i32,
+                    logits: true,
+                });
+                plan.logit_slots.push(id);
+                decode_taken += 1;
+            }
         }
 
         // Prefill pass — each slot consumes at most `budget.prefill_max` tokens
@@ -205,7 +218,11 @@ mod tests {
             decode_max: 16,
         };
         let plan = BatchBuilder::new(4096).plan(&[slot], &[SlotId(2)], budget);
-        assert_eq!(plan.tokens.len(), 32, "prefill capped at budget.prefill_max");
+        assert_eq!(
+            plan.tokens.len(),
+            32,
+            "prefill capped at budget.prefill_max"
+        );
         assert_eq!(plan.prefill_consumed, vec![(SlotId(2), 32)]);
     }
 
@@ -230,5 +247,23 @@ mod tests {
         let plan = BatchBuilder::new(4096).plan(&slots, &order, budget);
         assert_eq!(plan.tokens.len(), 3, "decode capped at budget.decode_max");
         assert_eq!(plan.logit_slots.len(), 3);
+    }
+
+    #[test]
+    fn decode_includes_pending_then_drafts() {
+        let mut slot = Slot::new(SlotId(0));
+        slot.phase = SlotPhase::Decoding;
+        let mut job = crate::slot::ActiveJob::for_test(vec![]);
+        job.n_past = 10;
+        job.pending = Some(7);
+        job.drafts = vec![8, 9];
+        slot.job = Some(job);
+        let plan = BatchBuilder::new(16).plan(&[slot], &[SlotId(0)], IterationBudget::default());
+        let toks: Vec<i32> = plan.tokens.iter().map(|t| t.token).collect();
+        assert_eq!(toks, vec![7, 8, 9]);
+        let pos: Vec<i32> = plan.tokens.iter().map(|t| t.pos).collect();
+        assert_eq!(pos, vec![10, 11, 12]);
+        assert_eq!(plan.logit_slots, vec![SlotId(0), SlotId(0), SlotId(0)]);
+        assert!(plan.tokens.iter().all(|t| t.logits));
     }
 }

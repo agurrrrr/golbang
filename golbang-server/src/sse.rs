@@ -9,7 +9,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use golbang_core::{
     CancellationToken, ChatApplyOpts, GenerateParams, Job, ReasoningParser, SlotEvent,
-    ToolCallParser, apply_chat_template_with,
+    ToolCallParser, apply_chat_template_with, load_media_bytes,
 };
 
 use crate::AppState;
@@ -67,6 +67,49 @@ pub fn model_name(req: &ChatCompletionRequest, state: &AppState) -> String {
 
 fn core_messages(messages: Vec<ChatMessage>) -> Vec<golbang_core::ChatMessage> {
     messages.into_iter().map(Into::into).collect()
+}
+
+fn collect_images(req: &ChatCompletionRequest) -> Result<Vec<Vec<u8>>, ApiError> {
+    let mut out = Vec::new();
+    for m in &req.messages {
+        for src in &m.content.media {
+            let bytes = load_media_bytes(src)
+                .map_err(|e| ApiError::invalid_request(e.to_string(), Some("messages")))?;
+            out.push(bytes);
+        }
+    }
+    Ok(out)
+}
+
+fn submit_job(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    prompt: String,
+    params: GenerateParams,
+    cancel: CancellationToken,
+    ev_tx: mpsc::UnboundedSender<SlotEvent>,
+) -> Result<(), ApiError> {
+    let images = collect_images(req)?;
+    if !images.is_empty() && !state.vision {
+        return Err(ApiError::invalid_request(
+            "image input requires the server to be started with --mmproj",
+            Some("messages"),
+        ));
+    }
+    let mut job = Job::new(prompt, params, cancel, ev_tx);
+    job.timeout = state.default_timeout;
+    job.images = images;
+    if let Err(e) = state.scheduler.try_submit(job) {
+        if matches!(e, golbang_core::SubmitError::Full) {
+            state
+                .scheduler
+                .metrics
+                .service_unavailable_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
@@ -149,18 +192,7 @@ pub fn stream_completion(
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
     let mut tools = ToolCallParser::new();
 
-    let mut job = Job::new(prompt, params, cancel, ev_tx);
-    job.timeout = state.default_timeout;
-    if let Err(e) = state.scheduler.try_submit(job) {
-        if matches!(e, golbang_core::SubmitError::Full) {
-            state
-                .scheduler
-                .metrics
-                .service_unavailable_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        return Err(e.into());
-    }
+    submit_job(&state, &req, prompt, params, cancel, ev_tx)?;
 
     tokio::spawn(async move {
         if send_chunk(
@@ -382,18 +414,7 @@ pub async fn complete(
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
     let mut tools = ToolCallParser::new();
 
-    let mut job = Job::new(prompt, params, cancel, ev_tx);
-    job.timeout = state.default_timeout;
-    if let Err(e) = state.scheduler.try_submit(job) {
-        if matches!(e, golbang_core::SubmitError::Full) {
-            state
-                .scheduler
-                .metrics
-                .service_unavailable_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        return Err(e.into());
-    }
+    submit_job(&state, &req, prompt, params, cancel, ev_tx)?;
 
     let mut content = String::new();
     let mut reasoning = String::new();
