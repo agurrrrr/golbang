@@ -424,6 +424,18 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         job.events,
         n_ctx_seq,
     ));
+    if let Some(active) = slot.job.as_ref() {
+        let progress = if n_prompt == 0 {
+            1.0
+        } else {
+            f64::from(reuse_len as u32) / f64::from(n_prompt)
+        };
+        let _ = active.events.send(SlotEvent::PromptProgress {
+            n_tokens: reuse_len as u32,
+            progress,
+            tps: 0.0,
+        });
+    }
     tracing::info!(
         slot = slot.id.0,
         request_id = req,
@@ -612,8 +624,19 @@ fn finish_slot(
                     "n_past vs seq_pos_max+1"
                 );
             }
+            // Cancel/Timeout keep whatever was actually decoded (full prompt
+            // or a mid-prefill prefix). llama-server does the same: the next
+            // bind's LCP continues instead of throwing 10+ minutes of work.
             slot.prefix_cache
                 .remember(&job.prompt_tokens, &job.generated, job.n_past);
+            tracing::info!(
+                slot = id.0,
+                request_id = job.request_id,
+                reason = reason.as_str(),
+                n_past = job.n_past,
+                ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0),
+                "prefix kv retained"
+            );
         } else {
             engine.clear_seq(id.0 as i32);
             slot.prefix_cache.reset();
@@ -702,20 +725,18 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
         if job.last_progress_at.elapsed().as_millis() < MIN_MS {
             continue;
         }
-        let processed = job.prompt_pos as u32;
-        let remaining = job
-            .prompt_tokens
-            .len()
-            .saturating_sub(job.prompt_offset + job.prompt_pos) as u32;
-        let total = processed.saturating_add(remaining);
+        let processed = (job.prompt_offset + job.prompt_pos) as u32;
+        let total = job.prompt_tokens.len() as u32;
         let progress = if total == 0 {
             1.0
         } else {
             f64::from(processed) / f64::from(total)
         };
         let secs = elapsed.as_secs_f64();
+        // tok/s is only the work this request actually prefills (not cache_n).
+        let prefilled = job.prompt_pos as u32;
         let tps = if secs > 0.0 {
-            f64::from(processed) / secs
+            f64::from(prefilled) / secs
         } else {
             0.0
         };
@@ -727,6 +748,11 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
             tps,
             "prompt processing, n_tokens = {processed}, progress = {progress:.2}, t = {secs:.2} s / {tps:.2} tokens per second"
         );
+        let _ = job.events.send(SlotEvent::PromptProgress {
+            n_tokens: processed,
+            progress,
+            tps,
+        });
         job.last_progress_at = Instant::now();
         job.last_progress_n = processed;
     }
@@ -786,7 +812,13 @@ fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
 }
 
 fn keeps_prefix_kv(reason: FinishReason) -> bool {
-    matches!(reason, FinishReason::Stop | FinishReason::Length)
+    // Decode errors still clear: KV may be inconsistent. Cancel/Timeout are
+    // clean stops — the resident prefix is valid and the next identical
+    // (or continuation) prompt must be able to reuse it.
+    matches!(
+        reason,
+        FinishReason::Stop | FinishReason::Length | FinishReason::Cancelled | FinishReason::Timeout
+    )
 }
 
 fn capture_prefix_checkpoint(slot: &mut Slot, engine: &Engine) {
@@ -925,11 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_length_keep_kv_failures_do_not() {
+    fn stop_length_cancel_and_timeout_keep_kv() {
         assert!(keeps_prefix_kv(FinishReason::Stop));
         assert!(keeps_prefix_kv(FinishReason::Length));
-        assert!(!keeps_prefix_kv(FinishReason::Cancelled));
-        assert!(!keeps_prefix_kv(FinishReason::Timeout));
+        assert!(keeps_prefix_kv(FinishReason::Cancelled));
+        assert!(keeps_prefix_kv(FinishReason::Timeout));
     }
 
     #[tokio::test]
@@ -1021,6 +1053,7 @@ mod gpu_tests {
                     break;
                 }
                 SlotEvent::Failed(e) => panic!("job failed: {e}"),
+                SlotEvent::PromptProgress { .. } => {}
             }
         }
         (ttft.unwrap_or_else(|| t0.elapsed()), n, reason)
@@ -1148,10 +1181,16 @@ mod gpu_tests {
             tx,
         );
         spawned.handle.try_submit(job).expect("submit");
-        let first = tokio::time::timeout(Duration::from_secs(30), rx.recv())
-            .await
-            .expect("first event")
-            .expect("event");
+        let first = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(ev) = rx.recv().await {
+                if !matches!(ev, SlotEvent::PromptProgress { .. }) {
+                    return ev;
+                }
+            }
+            panic!("channel closed before first token");
+        })
+        .await
+        .expect("first event");
         assert!(matches!(first, SlotEvent::Token(_)), "got {first:?}");
         cancel.cancel();
         let end = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1196,7 +1235,7 @@ mod gpu_tests {
             match ev {
                 SlotEvent::Finished { timings, .. } => return timings,
                 SlotEvent::Failed(e) => panic!("job failed: {e}"),
-                SlotEvent::Token(_) => {}
+                SlotEvent::Token(_) | SlotEvent::PromptProgress { .. } => {}
             }
         }
         panic!("channel closed without finish");

@@ -5,8 +5,9 @@
 //! **slot-local reuse** path: each slot keeps the KV of its own prefix so a
 //! re-bound job that shares the same prefix does not re-prefill it.
 //!
-//! P5: Stop/Length leave that KV resident. `remember` stores prompt + generated
-//! token IDs so the next bind's LCP can include the previous assistant turn.
+//! P5: Stop/Length/Cancel/Timeout leave that KV resident. `remember` stores
+//! prompt + generated token IDs so the next bind's LCP can include the
+//! previous assistant turn, or a mid-prefill prefix after a client drop.
 //! A global cross-slot store is still NOT implemented — `PrefixStore` stays
 //! inactive; no `llama_memory_seq_cp` between slots.
 
@@ -192,5 +193,23 @@ mod tests {
         c.remember(&t(&[1, 2, 3, 4]), &[], 4);
         assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3, 4, 5]), 2), 0);
         assert!(c.tokens.is_empty());
+    }
+
+    #[test]
+    fn cancel_mid_prefill_reuses_decoded_prefix() {
+        let mut c = SlotPrefixCache::new();
+        let prompt = t(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        // Same request cancelled after 6 prompt tokens landed in KV.
+        c.remember(&prompt, &[], 6);
+        assert_eq!(c.reuse_for_bind(&prompt, 6), 6);
+    }
+
+    #[test]
+    fn cancel_after_full_prefill_leaves_logits_token() {
+        let mut c = SlotPrefixCache::new();
+        let prompt = t(&[1, 2, 3, 4, 5]);
+        c.remember(&prompt, &t(&[6, 7]), 7);
+        // Retry of the same prompt: keep all but one cell for logits.
+        assert_eq!(c.reuse_for_bind(&prompt, 7), 4);
     }
 }

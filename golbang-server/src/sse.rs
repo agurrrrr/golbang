@@ -284,6 +284,38 @@ pub fn stream_completion(
                     let _ = sse_tx.send(Event::default().data("[DONE]")).await;
                     break;
                 }
+                SlotEvent::PromptProgress {
+                    n_tokens,
+                    progress,
+                    tps,
+                } => {
+                    // Comment + empty delta: axum KeepAlive is not enough for
+                    // clients that only reset idle timers on `data:` events.
+                    let comment = format!(
+                        "prompt processing n_tokens={n_tokens} progress={progress:.2} tps={tps:.1}"
+                    );
+                    if sse_tx
+                        .send(Event::default().comment(comment))
+                        .await
+                        .is_err()
+                    {
+                        cancel_on_drop.cancel();
+                        tracing::info!(
+                            "client gone during prefill; cancel accepted, prefix kv retained"
+                        );
+                        break;
+                    }
+                    send_chunk(
+                        &sse_tx,
+                        &id,
+                        created,
+                        &model_name,
+                        Delta::default(),
+                        None,
+                        None,
+                    )
+                    .await
+                }
             };
             if send.is_err() {
                 cancel_on_drop.cancel();
@@ -398,6 +430,7 @@ pub async fn complete(
                 break;
             }
             SlotEvent::Failed(e) => return Err(e.into()),
+            SlotEvent::PromptProgress { .. } => {}
         }
     }
 

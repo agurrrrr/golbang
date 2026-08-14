@@ -15,6 +15,13 @@ use crate::tokenizer::Token;
 #[derive(Debug)]
 pub enum SlotEvent {
     Token(GeneratedToken),
+    /// Prefill still running. HTTP uses this as an SSE heartbeat so a long
+    /// prompt does not look idle to the client.
+    PromptProgress {
+        n_tokens: u32,
+        progress: f64,
+        tps: f64,
+    },
     Finished {
         reason: FinishReason,
         prompt_tokens: u32,
