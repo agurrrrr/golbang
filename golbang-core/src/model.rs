@@ -332,7 +332,8 @@ impl Model {
         Some(buf)
     }
 
-    /// Restore a snapshot from [`seq_state_get`].
+    /// Restore a snapshot from [`seq_state_get`]. PARTIAL_ONLY skips ISWA
+    /// non-SWA base — caller must `rm_seq_from(seq, ckpt_n)` afterwards.
     pub fn seq_state_set(&mut self, seq_id: i32, data: &[u8]) -> bool {
         if data.is_empty() {
             return false;

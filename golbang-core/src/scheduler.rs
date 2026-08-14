@@ -885,6 +885,15 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
         slot.prefix_ckpt = None;
         return 0;
     }
+    // PARTIAL_ONLY skips ISWA non-SWA base. seq_rm(ckpt_n, -1) is past SWA
+    // pos_max so DSV4 drops leftover base without n_rs_seq; prefix stays.
+    if !engine.rm_seq_from(seq, ckpt_n as i32) {
+        tracing::warn!(
+            slot = slot.id.0,
+            ckpt_n,
+            "prefix restore leftover sweep failed"
+        );
+    }
     let kept = reuse_len.min(ckpt_n as usize);
     if trim_seq_to(engine, seq, kept) {
         tracing::info!(
@@ -892,6 +901,7 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
             reuse_len = kept,
             ckpt_n,
             gpu_n,
+            gpu_after = engine.n_past_seq(seq),
             "prefix restored from checkpoint"
         );
         return kept;
@@ -911,12 +921,12 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
 
 fn trim_seq_to(engine: &Engine, seq: i32, n: usize) -> bool {
     let gpu = engine.n_past_seq(seq);
-    if gpu == n as u32 {
-        return true;
-    }
     if gpu < n as u32 {
         return false;
     }
+    // gpu == n is not "already done". After a PARTIAL restore, SWA pos_max+1
+    // equals n while orphaned non-SWA base cells at pos >= n still occupy
+    // slots. seq_rm(n, -1) is a no-op when nothing is there.
     engine.rm_seq_from(seq, n as i32) && engine.n_past_seq(seq) == n as u32
 }
 
