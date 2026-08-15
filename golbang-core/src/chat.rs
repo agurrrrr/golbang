@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn dsv4_jinja_tool_call_history_accepts_string_arguments() {
+    fn dsv4_jinja_tool_call_history_parsed_object_arguments() {
         let tmpl = include_str!("../tests/fixtures/dsv4_chat_template.jinja");
         let applied = apply_chat_template_with(
             &[
@@ -636,6 +636,61 @@ mod tests {
                 .prompt
                 .contains("<｜DSML｜parameter name=\"project_name\" string=\"true\">golbang"),
             "arguments must survive as DSML parameters:\n{}",
+            applied.prompt
+        );
+    }
+
+    /// `arguments_for_jinja` keeps unparseable JSON as a raw string; the Qwen
+    /// template then raises (chat:150) and we must fall back to ChatML instead
+    /// of panicking or rendering a half-baked jinja prompt. ChatML drops
+    /// `tool_calls` (content only), so pin the response + generation prefix.
+    #[test]
+    fn qwen38_jinja_invalid_tool_arguments_fall_back_to_chatml() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[
+                msg("user", "351 작업 상세 조회해"),
+                assistant_tool_call("get_task_detail", "not-json{"),
+                ChatMessage {
+                    role: "tool".into(),
+                    content: "ok".into(),
+                    tool_call_id: Some("call_1".into()),
+                    ..Default::default()
+                },
+            ],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !applied.used_jinja,
+            "unparseable arguments must raise in the template:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.used_chatml,
+            "must fall back to ChatML:\n{}",
+            applied.prompt
+        );
+        // ChatML has no jinja tool markup — only role + content.
+        assert!(
+            applied
+                .prompt
+                .contains(&format!("{IM_START}tool\nok{IM_END}\n")),
+            "tool response must survive the fallback:\n{}",
+            applied.prompt
+        );
+        assert!(
+            !applied.prompt.contains("<function=get_task_detail>"),
+            "ChatML must drop tool_calls:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.ends_with(&format!("{IM_START}assistant\n")),
+            "bad generation prefix:\n{}",
             applied.prompt
         );
     }
