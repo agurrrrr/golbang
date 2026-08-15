@@ -34,6 +34,10 @@ pub struct GenerateParams {
     pub top_k: i32,
     pub seed: u64,
     pub stop: Vec<String>,
+    /// 0 = do not force `</think>`. Counts generated tokens while thinking.
+    pub reasoning_budget: u32,
+    /// Prompt already closed with `<think>` (Qwen3.8 / DSV4 jinja).
+    pub start_in_think: bool,
 }
 
 impl Default for GenerateParams {
@@ -45,6 +49,8 @@ impl Default for GenerateParams {
             top_k: 0,
             seed: 0,
             stop: Vec::new(),
+            reasoning_budget: 0,
+            start_in_think: false,
         }
     }
 }
@@ -70,7 +76,11 @@ pub struct Generate<'m> {
 }
 
 impl<'m> Generate<'m> {
-    pub(crate) fn start(model: &'m mut Model, prompt: &str, params: GenerateParams) -> Result<Self> {
+    pub(crate) fn start(
+        model: &'m mut Model,
+        prompt: &str,
+        params: GenerateParams,
+    ) -> Result<Self> {
         if prompt.is_empty() {
             return Err(Error::EmptyPrompt);
         }
@@ -236,9 +246,7 @@ impl Utf8Buf {
                     }
                     return String::new();
                 }
-                let out = std::str::from_utf8(&self.buf[..valid])
-                    .unwrap()
-                    .to_owned();
+                let out = std::str::from_utf8(&self.buf[..valid]).unwrap().to_owned();
                 self.buf.drain(..valid);
                 out
             }

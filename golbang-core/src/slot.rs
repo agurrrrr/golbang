@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken, Utf8Buf};
+use crate::reasoning::ThinkBudget;
 use crate::sampler::{Sampler, SamplerParams};
 use crate::tokenizer::Token;
 
@@ -141,6 +142,9 @@ pub(crate) struct ActiveJob {
     pub stop: Vec<String>,
     pub acc: String,
     pub(crate) utf8: Utf8Buf,
+    pub think: ThinkBudget,
+    pub reasoning_budget: u32,
+    pub start_in_think: bool,
     pub cancel: CancellationToken,
     pub deadline: Option<Instant>,
     pub events: mpsc::UnboundedSender<SlotEvent>,
@@ -208,6 +212,9 @@ impl ActiveJob {
             stop: params.stop,
             acc: String::new(),
             utf8: Utf8Buf::default(),
+            think: ThinkBudget::disabled(),
+            reasoning_budget: params.reasoning_budget,
+            start_in_think: params.start_in_think,
             cancel,
             deadline,
             events,

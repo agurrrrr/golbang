@@ -63,6 +63,11 @@ impl Engine {
         self.lock().encode(text)
     }
 
+    /// Tokenize without BOS. Used for `</think>` forcing (`parse_special`).
+    pub fn tokenize_special(&self, text: &str) -> Result<Vec<Token>> {
+        self.lock().tokenizer().encode(text, false, true)
+    }
+
     pub fn token_to_piece(&self, token: Token) -> Result<Vec<u8>> {
         self.lock().tokenizer().token_to_piece(token, true)
     }

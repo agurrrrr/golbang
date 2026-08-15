@@ -20,6 +20,8 @@ pub struct ChatRuntime {
     pub enable_thinking: bool,
     /// Default Qwen3.8 `reasoning_effort`. Request field overrides.
     pub reasoning_effort: Option<String>,
+    /// Default think-token cap. 0 = unlimited. Request field overrides.
+    pub reasoning_budget: u32,
 }
 
 #[derive(Clone)]

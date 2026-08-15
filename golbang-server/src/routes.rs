@@ -25,7 +25,7 @@ pub async fn chat_completions(
     );
 
     if req.stream {
-        return Ok(sse::stream_completion(state, req)?.into_response());
+        return Ok(sse::stream_completion(state, req)?);
     }
 
     let completion = sse::complete(state, req).await?;

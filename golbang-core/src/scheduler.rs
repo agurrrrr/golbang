@@ -283,7 +283,11 @@ async fn run_loop(
                         .iter_mut()
                         .find(|s| s.id == id)
                         .and_then(|s| s.job.as_mut())
-                        .map(|j| j.sampler.sample(row))
+                        .map(|j| {
+                            j.think
+                                .forced_token()
+                                .unwrap_or_else(|| j.sampler.sample(row))
+                        })
                 })
                 .unwrap_or(0)
             }) {
@@ -461,6 +465,7 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         n_ctx_seq,
         job.images,
     ));
+    arm_think_budget(slot, engine);
     if let Some(active) = slot.job.as_ref() {
         let progress = if n_prompt == 0 {
             1.0
@@ -525,6 +530,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         n_ctx_seq,
         job.images,
     ));
+    arm_think_budget(slot, engine);
     if let Some(active) = slot.job.as_mut() {
         active.n_past = n_past;
         active.n_prompt = n_past;
@@ -555,6 +561,38 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
     true
 }
 
+fn arm_think_budget(slot: &mut Slot, engine: &Engine) {
+    let Some(job) = slot.job.as_mut() else {
+        return;
+    };
+    let limit = job.reasoning_budget;
+    if limit == 0 {
+        return;
+    }
+    match engine.tokenize_special("</think>\n\n") {
+        Ok(toks) if !toks.is_empty() => {
+            job.think = crate::reasoning::ThinkBudget::new(limit, job.start_in_think, toks);
+            tracing::info!(
+                slot = slot.id.0,
+                request_id = job.request_id,
+                start_in_think = job.start_in_think,
+                budget = limit,
+                close_n = job.think.close_len(),
+                "reasoning budget armed"
+            );
+        }
+        Ok(_) => tracing::warn!(
+            slot = slot.id.0,
+            "reasoning-budget: empty </think> tokenization; disabled"
+        ),
+        Err(e) => tracing::warn!(
+            slot = slot.id.0,
+            error = %e,
+            "reasoning-budget: tokenize </think> failed"
+        ),
+    }
+}
+
 fn sample_from_existing_logits(
     slot: &mut Slot,
     engine: &Engine,
@@ -562,7 +600,10 @@ fn sample_from_existing_logits(
 ) -> crate::error::Result<()> {
     let row = engine.last_logits()?;
     let token = match slot.job.as_mut() {
-        Some(job) => job.sampler.sample(&row),
+        Some(job) => job
+            .think
+            .forced_token()
+            .unwrap_or_else(|| job.sampler.sample(&row)),
         None => return Ok(()),
     };
     emit_sampled(slot, engine, &[token], n_ctx_seq, None);
@@ -799,10 +840,7 @@ fn verify_and_emit(
         .take_while(|(a, d)| *a == *d)
         .count();
     let keep_pos = n_past_after.saturating_sub((n_verify - n_matched) as u32);
-    let used_ckpt = slot
-        .job
-        .as_ref()
-        .is_some_and(|j| j.spec_ckpt_tgt.is_some());
+    let used_ckpt = slot.job.as_ref().is_some_and(|j| j.spec_ckpt_tgt.is_some());
 
     if n_matched < n_verify {
         if used_ckpt {
@@ -834,10 +872,7 @@ fn verify_and_emit(
     }
 
     engine.spec_accept(seq, n_matched as u16);
-    let replaying = slot
-        .job
-        .as_ref()
-        .is_some_and(|j| j.spec_replaying);
+    let replaying = slot.job.as_ref().is_some_and(|j| j.spec_replaying);
     if let Some(m) = metrics {
         if !replaying {
             m.draft_tokens_total
@@ -927,6 +962,16 @@ fn push_token(slot: &mut Slot, engine: &Engine, token: Token, n_ctx_seq: u32) ->
     job.generated.push(token);
     job.pending = Some(token);
     slot.phase = SlotPhase::Decoding;
+    let was_forcing = job.think.is_forcing();
+    job.think.on_emit(&piece);
+    if !was_forcing && job.think.is_forcing() {
+        tracing::info!(
+            slot = slot.id.0,
+            request_id = job.request_id,
+            think_n = job.think.think_tokens(),
+            "reasoning budget exhausted; forcing </think>"
+        );
+    }
     maybe_log_decode_progress(slot.id.0, job);
 
     if job.n_generated >= job.max_tokens {
@@ -976,7 +1021,7 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<D
         }
         job.spec_replaying = false;
         job.drafts.clear();
-        if !spec_on || job.finish.is_some() {
+        if !spec_on || job.finish.is_some() || job.think.is_forcing() {
             continue;
         }
         let Some(id_last) = job.pending else {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::serve::ListenerExt;
 use clap::Parser;
 use golbang_core::{
     Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
@@ -75,6 +76,11 @@ struct Args {
     /// Default Qwen3.8 jinja `reasoning_effort`: xhigh | medium | low.
     #[arg(long, env = "GOLBANG_REASONING_EFFORT")]
     reasoning_effort: Option<String>,
+
+    /// Force `</think>` after this many think tokens (0 = unlimited).
+    /// Stops Qwen xhigh from spending the whole `max_tokens` on thinking.
+    #[arg(long, env = "GOLBANG_REASONING_BUDGET", default_value_t = 0)]
+    reasoning_budget: u32,
 
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
@@ -287,6 +293,7 @@ async fn main() -> Result<()> {
                 thinking = enable_thinking,
                 reasoning = reasoning_format.as_str(),
                 reasoning_effort = reasoning_effort.as_deref().unwrap_or("template-default"),
+                reasoning_budget = args.reasoning_budget,
                 from_file = args.chat_template_file.is_some(),
                 "jinja chat template loaded"
             ),
@@ -330,6 +337,7 @@ async fn main() -> Result<()> {
             reasoning_format,
             enable_thinking,
             reasoning_effort,
+            reasoning_budget: args.reasoning_budget,
         },
         api_keys,
         vision,
@@ -340,7 +348,12 @@ async fn main() -> Result<()> {
         .context("host:port")?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("bind {addr}"))?;
+        .with_context(|| format!("bind {addr}"))?
+        .tap_io(|stream| {
+            if let Err(err) = stream.set_nodelay(true) {
+                tracing::debug!(error = %err, "TCP_NODELAY failed");
+            }
+        });
     tracing::info!(%addr, n_parallel, queue = args.queue_size, "listening");
 
     axum::serve(listener, router(state))

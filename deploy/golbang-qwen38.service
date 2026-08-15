@@ -22,6 +22,7 @@ ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
   --n-ctx 80000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 --n-rs-seq 3 \
   --n-parallel 1 --queue-size 1 \
   --no-mmap --jinja --reasoning-format deepseek \
+  --reasoning-effort medium --reasoning-budget 2048 \
   --mmproj /home/agurrrrr/models/qwen3.8/mmproj-F16.gguf \
   --spec-type draft-mtp,ngram-mod \
   --spec-draft-n-max 3 \

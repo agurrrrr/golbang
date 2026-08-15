@@ -1,15 +1,16 @@
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::http::{HeaderValue, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::Stream;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use golbang_core::{
     CancellationToken, ChatApplyOpts, GenerateParams, Job, ReasoningParser, SlotEvent,
-    ToolCallParser, apply_chat_template_with, load_media_bytes,
+    ToolCallParser, apply_chat_template_with, load_media_bytes, prompt_opens_think,
 };
 
 use crate::AppState;
@@ -34,7 +35,11 @@ pub fn unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn generate_params(req: &ChatCompletionRequest, state: &AppState) -> GenerateParams {
+pub fn generate_params(
+    req: &ChatCompletionRequest,
+    state: &AppState,
+    prompt: &str,
+) -> GenerateParams {
     let mut stop = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
     if state.chat.use_jinja {
         for extra in [
@@ -48,6 +53,7 @@ pub fn generate_params(req: &ChatCompletionRequest, state: &AppState) -> Generat
             }
         }
     }
+    let extracts = state.chat.reasoning_format.extracts();
     GenerateParams {
         max_tokens: req.max_tokens.unwrap_or(256).max(1),
         temperature: req.temperature.unwrap_or(1.0).max(0.0),
@@ -55,6 +61,20 @@ pub fn generate_params(req: &ChatCompletionRequest, state: &AppState) -> Generat
         top_k: req.top_k.unwrap_or(0),
         seed: req.seed.unwrap_or(0),
         stop,
+        reasoning_budget: if extracts {
+            resolve_reasoning_budget(req.reasoning_budget, state.chat.reasoning_budget)
+        } else {
+            0
+        },
+        start_in_think: extracts && prompt_opens_think(prompt),
+    }
+}
+
+fn resolve_reasoning_budget(req: Option<i32>, server: u32) -> u32 {
+    match req {
+        None => server,
+        Some(n) if n <= 0 => 0,
+        Some(n) => n as u32,
     }
 }
 
@@ -178,15 +198,15 @@ fn finish_reason_for(reason: &str, has_tools: bool) -> String {
 pub fn stream_completion(
     state: AppState,
     req: ChatCompletionRequest,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let id = completion_id();
     let created = unix_ts();
     let model_name = model_name(&req, &state);
-    let params = generate_params(&req, &state);
     let prompt = prompt_from(&req, &state);
+    let params = generate_params(&req, &state, &prompt);
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-    let (sse_tx, sse_rx) = mpsc::channel::<Event>(16);
+    let (sse_tx, sse_rx) = mpsc::channel::<Event>(256);
     let cancel = CancellationToken::new();
     let cancel_on_drop = cancel.clone();
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
@@ -216,157 +236,285 @@ pub fn stream_completion(
         }
 
         let mut n = 0u32;
-        while let Some(ev) = ev_rx.recv().await {
-            let send = match ev {
-                SlotEvent::Token(t) => {
-                    n += 1;
-                    if t.piece.is_empty() {
-                        continue;
-                    }
-                    let split = parser.push(&t.piece);
-                    let content = match split.content {
-                        Some(c) => tools.push(&c),
-                        None => None,
+        let mut pending = PendingDelta::new();
+        loop {
+            tokio::select! {
+                ev = ev_rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    let send = match ev {
+                        SlotEvent::Token(t) => {
+                            n += 1;
+                            if t.piece.is_empty() {
+                                continue;
+                            }
+                            let split = parser.push(&t.piece);
+                            let content = match split.content {
+                                Some(c) => tools.push(&c),
+                                None => None,
+                            };
+                            if split.reasoning.is_none() && content.is_none() {
+                                continue;
+                            }
+                            pending.push(split.reasoning, content);
+                            if pending.due() {
+                                flush_pending(&sse_tx, &id, created, &model_name, &mut pending).await
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        SlotEvent::Finished {
+                            reason, timings, ..
+                        } => {
+                            if flush_pending(&sse_tx, &id, created, &model_name, &mut pending)
+                                .await
+                                .is_err()
+                            {
+                                Err(())
+                            } else {
+                                finish_stream(
+                                    &sse_tx,
+                                    &id,
+                                    created,
+                                    &model_name,
+                                    &mut parser,
+                                    &mut tools,
+                                    reason,
+                                    timings,
+                                    n,
+                                )
+                                .await
+                            }
+                        }
+                        SlotEvent::Failed(e) => {
+                            tracing::error!(error = %e, "stream generation failed");
+                            let payload = serde_json::json!({
+                                "error": { "message": e.to_string(), "type": "server_error" }
+                            });
+                            let _ = sse_tx
+                                .send(Event::default().data(payload.to_string()))
+                                .await;
+                            let _ = sse_tx.send(Event::default().data("[DONE]")).await;
+                            break;
+                        }
+                        SlotEvent::PromptProgress {
+                            n_tokens,
+                            progress,
+                            tps,
+                        } => {
+                            // Comment + empty delta: axum KeepAlive is not enough for
+                            // clients that only reset idle timers on `data:` events.
+                            let comment = format!(
+                                "prompt processing n_tokens={n_tokens} progress={progress:.2} tps={tps:.1}"
+                            );
+                            if sse_tx
+                                .send(Event::default().comment(comment))
+                                .await
+                                .is_err()
+                            {
+                                cancel_on_drop.cancel();
+                                tracing::info!(
+                                    "client gone during prefill; cancel accepted, prefix kv retained"
+                                );
+                                break;
+                            }
+                            send_chunk(
+                                &sse_tx,
+                                &id,
+                                created,
+                                &model_name,
+                                Delta::default(),
+                                None,
+                                None,
+                            )
+                            .await
+                        }
                     };
-                    if split.reasoning.is_none() && content.is_none() {
-                        continue;
+                    if send.is_err() {
+                        cancel_on_drop.cancel();
+                        tracing::info!("client gone; cancel accepted, slot reclaim at next decode");
+                        break;
                     }
-                    send_chunk(
-                        &sse_tx,
-                        &id,
-                        created,
-                        &model_name,
-                        Delta {
-                            role: None,
-                            content,
-                            reasoning_content: split.reasoning,
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )
-                    .await
                 }
-                SlotEvent::Finished {
-                    reason, timings, ..
-                } => {
-                    let split = parser.finish();
-                    if let Some(c) = split.content {
-                        let _ = tools.push(&c);
-                    }
-                    let parsed = tools.finish();
-                    if split.reasoning.is_some() || !parsed.content.is_empty() {
-                        let _ = send_chunk(
-                            &sse_tx,
-                            &id,
-                            created,
-                            &model_name,
-                            Delta {
-                                role: None,
-                                content: nonempty_owned(parsed.content),
-                                reasoning_content: split.reasoning,
-                                ..Default::default()
-                            },
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                    let outgoing = outgoing_tool_calls(parsed.calls);
-                    if !outgoing.is_empty() {
-                        let names: Vec<&str> =
-                            outgoing.iter().map(|t| t.function.name.as_str()).collect();
-                        tracing::info!(?names, n = outgoing.len(), "parsed tool_calls");
-                        let _ = send_chunk(
-                            &sse_tx,
-                            &id,
-                            created,
-                            &model_name,
-                            Delta {
-                                tool_calls: Some(tool_call_deltas(&outgoing)),
-                                ..Default::default()
-                            },
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                    let finish = finish_reason_for(reason.as_str(), !outgoing.is_empty());
-                    let r = send_chunk(
-                        &sse_tx,
-                        &id,
-                        created,
-                        &model_name,
-                        Delta::default(),
-                        Some(finish.clone()),
-                        Some(Timings::from(timings)),
-                    )
-                    .await;
-                    let _ = sse_tx.send(Event::default().data("[DONE]")).await;
-                    tracing::info!(
-                        streamed = n,
-                        finish = finish.as_str(),
-                        prompt_n = timings.prompt_n,
-                        prompt_tps = format!("{:.2}", timings.prompt_per_second()),
-                        predicted_n = timings.predicted_n,
-                        predicted_tps = format!("{:.2}", timings.predicted_per_second()),
-                        "sse finished"
-                    );
-                    r
-                }
-                SlotEvent::Failed(e) => {
-                    tracing::error!(error = %e, "stream generation failed");
-                    let payload = serde_json::json!({
-                        "error": { "message": e.to_string(), "type": "server_error" }
-                    });
-                    let _ = sse_tx
-                        .send(Event::default().data(payload.to_string()))
-                        .await;
-                    let _ = sse_tx.send(Event::default().data("[DONE]")).await;
-                    break;
-                }
-                SlotEvent::PromptProgress {
-                    n_tokens,
-                    progress,
-                    tps,
-                } => {
-                    // Comment + empty delta: axum KeepAlive is not enough for
-                    // clients that only reset idle timers on `data:` events.
-                    let comment = format!(
-                        "prompt processing n_tokens={n_tokens} progress={progress:.2} tps={tps:.1}"
-                    );
-                    if sse_tx
-                        .send(Event::default().comment(comment))
+                _ = tokio::time::sleep(Duration::from_millis(40)), if !pending.is_empty() => {
+                    if flush_pending(&sse_tx, &id, created, &model_name, &mut pending)
                         .await
                         .is_err()
                     {
                         cancel_on_drop.cancel();
-                        tracing::info!(
-                            "client gone during prefill; cancel accepted, prefix kv retained"
-                        );
+                        tracing::info!("client gone; cancel accepted, slot reclaim at next decode");
                         break;
                     }
-                    send_chunk(
-                        &sse_tx,
-                        &id,
-                        created,
-                        &model_name,
-                        Delta::default(),
-                        None,
-                        None,
-                    )
-                    .await
                 }
-            };
-            if send.is_err() {
-                cancel_on_drop.cancel();
-                tracing::info!("client gone; cancel accepted, slot reclaim at next decode");
-                break;
             }
         }
     });
 
-    Ok(Sse::new(ReceiverStream::new(sse_rx).map(Ok)).keep_alive(KeepAlive::default()))
+    let sse = Sse::new(ReceiverStream::new(sse_rx).map(Ok::<Event, Infallible>))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(2)));
+    let mut res = sse.into_response();
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    res.headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    Ok(res)
+}
+
+struct PendingDelta {
+    reasoning: String,
+    content: String,
+    n: u32,
+    since: Instant,
+}
+
+impl PendingDelta {
+    fn new() -> Self {
+        Self {
+            reasoning: String::new(),
+            content: String::new(),
+            n: 0,
+            since: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, reasoning: Option<String>, content: Option<String>) {
+        if let Some(s) = reasoning {
+            self.reasoning.push_str(&s);
+        }
+        if let Some(s) = content {
+            self.content.push_str(&s);
+        }
+        if self.n == 0 {
+            self.since = Instant::now();
+        }
+        self.n += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn due(&self) -> bool {
+        if self.n == 0 {
+            return false;
+        }
+        self.n >= 8
+            || self.reasoning.len() + self.content.len() >= 192
+            || self.since.elapsed() >= Duration::from_millis(40)
+    }
+
+    fn take(&mut self) -> (Option<String>, Option<String>) {
+        self.n = 0;
+        self.since = Instant::now();
+        (
+            nonempty_owned(std::mem::take(&mut self.reasoning)),
+            nonempty_owned(std::mem::take(&mut self.content)),
+        )
+    }
+}
+
+async fn flush_pending(
+    sse_tx: &mpsc::Sender<Event>,
+    id: &str,
+    created: u64,
+    model_name: &str,
+    pending: &mut PendingDelta,
+) -> Result<(), ()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let (reasoning, content) = pending.take();
+    send_chunk(
+        sse_tx,
+        id,
+        created,
+        model_name,
+        Delta {
+            role: None,
+            content,
+            reasoning_content: reasoning,
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+async fn finish_stream(
+    sse_tx: &mpsc::Sender<Event>,
+    id: &str,
+    created: u64,
+    model_name: &str,
+    parser: &mut ReasoningParser,
+    tools: &mut ToolCallParser,
+    reason: golbang_core::FinishReason,
+    timings: golbang_core::SlotTimings,
+    n: u32,
+) -> Result<(), ()> {
+    let split = parser.finish();
+    if let Some(c) = split.content {
+        let _ = tools.push(&c);
+    }
+    let parsed = tools.finish();
+    if split.reasoning.is_some() || !parsed.content.is_empty() {
+        let _ = send_chunk(
+            sse_tx,
+            id,
+            created,
+            model_name,
+            Delta {
+                role: None,
+                content: nonempty_owned(parsed.content),
+                reasoning_content: split.reasoning,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await;
+    }
+    let outgoing = outgoing_tool_calls(parsed.calls);
+    if !outgoing.is_empty() {
+        let names: Vec<&str> = outgoing.iter().map(|t| t.function.name.as_str()).collect();
+        tracing::info!(?names, n = outgoing.len(), "parsed tool_calls");
+        let _ = send_chunk(
+            sse_tx,
+            id,
+            created,
+            model_name,
+            Delta {
+                tool_calls: Some(tool_call_deltas(&outgoing)),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await;
+    }
+    let finish = finish_reason_for(reason.as_str(), !outgoing.is_empty());
+    let r = send_chunk(
+        sse_tx,
+        id,
+        created,
+        model_name,
+        Delta::default(),
+        Some(finish.clone()),
+        Some(Timings::from(timings)),
+    )
+    .await;
+    let _ = sse_tx.send(Event::default().data("[DONE]")).await;
+    tracing::info!(
+        streamed = n,
+        finish = finish.as_str(),
+        prompt_n = timings.prompt_n,
+        prompt_tps = format!("{:.2}", timings.prompt_per_second()),
+        predicted_n = timings.predicted_n,
+        predicted_tps = format!("{:.2}", timings.predicted_per_second()),
+        "sse finished"
+    );
+    r
 }
 
 async fn send_chunk(
@@ -405,8 +553,8 @@ pub async fn complete(
     let id = completion_id();
     let created = unix_ts();
     let model_name = model_name(&req, &state);
-    let params = generate_params(&req, &state);
     let prompt = prompt_from(&req, &state);
+    let params = generate_params(&req, &state, &prompt);
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();

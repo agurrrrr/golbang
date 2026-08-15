@@ -209,16 +209,123 @@ impl ReasoningParser {
 }
 
 fn nonempty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Qwen3.6/3.8 jinja ends the prompt with `<think>\n`. DSV4 uses a bare `<think>`.
-fn prompt_opens_think(prompt: &str) -> bool {
+pub fn prompt_opens_think(prompt: &str) -> bool {
     prompt.trim_end().ends_with(OPEN)
+}
+
+/// Cap tokens spent inside `<think>` and force `</think>` so a long think
+/// cannot eat `max_tokens` (shepherd 383–391: 12k think, no tool call).
+#[derive(Clone, Debug, Default)]
+pub struct ThinkBudget {
+    limit: u32,
+    in_think: bool,
+    n: u32,
+    close: Vec<crate::tokenizer::Token>,
+    force_at: Option<usize>,
+    hold: String,
+}
+
+impl ThinkBudget {
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn new(limit: u32, start_in_think: bool, close: Vec<crate::tokenizer::Token>) -> Self {
+        if limit == 0 || close.is_empty() {
+            return Self::disabled();
+        }
+        Self {
+            limit,
+            in_think: start_in_think,
+            n: 0,
+            close,
+            force_at: None,
+            hold: String::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.limit > 0 && !self.close.is_empty()
+    }
+
+    pub fn is_forcing(&self) -> bool {
+        self.force_at.is_some()
+    }
+
+    pub fn close_len(&self) -> usize {
+        self.close.len()
+    }
+
+    pub fn think_tokens(&self) -> u32 {
+        self.n
+    }
+
+    pub fn forced_token(&self) -> Option<crate::tokenizer::Token> {
+        self.force_at.and_then(|i| self.close.get(i).copied())
+    }
+
+    /// Count a just-emitted token. When the budget is spent, the next
+    /// `forced_token()` is the first close-tag token.
+    pub fn on_emit(&mut self, piece: &str) {
+        if !self.enabled() {
+            return;
+        }
+        if let Some(i) = self.force_at {
+            let next = i + 1;
+            if next >= self.close.len() {
+                self.force_at = None;
+                self.in_think = false;
+                self.hold.clear();
+            } else {
+                self.force_at = Some(next);
+            }
+            return;
+        }
+        if !self.in_think {
+            self.hold.push_str(piece);
+            if let Some(idx) = self.hold.find(OPEN) {
+                self.in_think = true;
+                self.n = 0;
+                self.hold.drain(..idx + OPEN.len());
+                self.maybe_end_or_force();
+            } else {
+                let keep = suffix_that_is_tag_prefix(&self.hold, OPEN);
+                let extra = self.hold.len() - keep;
+                if extra > 0 {
+                    self.hold.drain(..extra);
+                }
+            }
+            return;
+        }
+        self.n = self.n.saturating_add(1);
+        self.hold.push_str(piece);
+        self.maybe_end_or_force();
+    }
+
+    fn maybe_end_or_force(&mut self) {
+        if think_end_at(&self.hold).is_some() {
+            self.in_think = false;
+            self.force_at = None;
+            self.hold.clear();
+            return;
+        }
+        let keep = suffix_that_is_any_tag_prefix(&self.hold, Phase::Think, CLOSE);
+        let extra = self.hold.len() - keep;
+        if extra > 0 {
+            self.hold.drain(..extra);
+        }
+        if self.in_think && self.n >= self.limit {
+            self.force_at = Some(0);
+        }
+    }
+}
+
+fn think_end_at(hold: &str) -> Option<usize> {
+    next_phase_marker(hold, Phase::Think, CLOSE).map(|(i, _, _)| i)
 }
 
 fn next_phase_marker<'a>(
@@ -343,5 +450,68 @@ mod tests {
             ReasoningFormat::Deepseek
         );
         assert!(ReasoningFormat::parse("nope").is_err());
+    }
+
+    #[test]
+    fn budget_forces_close_after_limit() {
+        let mut b = ThinkBudget::new(2, true, vec![7, 8]);
+        assert!(b.forced_token().is_none());
+        b.on_emit("a");
+        assert!(b.forced_token().is_none());
+        b.on_emit("b");
+        assert_eq!(b.forced_token(), Some(7));
+        b.on_emit("</think>");
+        assert_eq!(b.forced_token(), Some(8));
+        b.on_emit("\n\n");
+        assert!(b.forced_token().is_none());
+        assert!(!b.in_think);
+    }
+
+    #[test]
+    fn budget_natural_close_does_not_force() {
+        let mut b = ThinkBudget::new(10, true, vec![7]);
+        b.on_emit("hmm");
+        b.on_emit("</think>");
+        assert!(b.forced_token().is_none());
+        b.on_emit("hi");
+        assert!(b.forced_token().is_none());
+        assert!(!b.in_think);
+    }
+
+    #[test]
+    fn budget_split_close_tag() {
+        let mut b = ThinkBudget::new(10, true, vec![7]);
+        b.on_emit("ab</th");
+        assert!(b.in_think);
+        b.on_emit("ink>cd");
+        assert!(!b.in_think);
+        assert!(b.forced_token().is_none());
+    }
+
+    #[test]
+    fn budget_tool_open_ends_think() {
+        let mut b = ThinkBudget::new(10, true, vec![7]);
+        b.on_emit("hmm<tool_call>");
+        assert!(!b.in_think);
+        assert!(b.forced_token().is_none());
+    }
+
+    #[test]
+    fn budget_disabled_when_limit_zero() {
+        let mut b = ThinkBudget::new(0, true, vec![7]);
+        b.on_emit("a");
+        b.on_emit("b");
+        assert!(b.forced_token().is_none());
+    }
+
+    #[test]
+    fn budget_starts_on_generated_open_tag() {
+        let mut b = ThinkBudget::new(1, false, vec![7]);
+        b.on_emit("pre");
+        assert!(b.forced_token().is_none());
+        b.on_emit("<think>");
+        assert!(b.forced_token().is_none());
+        b.on_emit("x");
+        assert_eq!(b.forced_token(), Some(7));
     }
 }

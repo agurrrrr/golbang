@@ -20,6 +20,11 @@ pub struct ChatCompletionRequest {
     /// Qwen3.8 jinja: `xhigh` | `high` | `medium` | `low`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Max tokens inside `<think>` before `</think>` is forced.
+    /// `None` = server default. `0` / negative = unlimited.
+    /// Alias matches llama-server `reasoning_budget_tokens`.
+    #[serde(default, alias = "reasoning_budget_tokens")]
+    pub reasoning_budget: Option<i32>,
 }
 
 impl ChatCompletionRequest {
@@ -367,6 +372,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             reasoning_effort: None,
+            reasoning_budget: None,
         };
         assert_eq!(
             validate_request(&req).unwrap_err(),
@@ -396,8 +402,23 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             reasoning_effort: None,
+            reasoning_budget: None,
         };
         assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn reasoning_budget_alias_deserializes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(req.reasoning_budget, Some(2048));
+        let req2: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget":0}"#,
+        )
+        .unwrap();
+        assert_eq!(req2.reasoning_budget, Some(0));
     }
 
     #[test]

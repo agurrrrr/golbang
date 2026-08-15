@@ -313,6 +313,7 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 | `--chat-template-file` | 없음 | GGUF 템플릿 재정의 |
 | `--reasoning-format` | `none` | `none` \| `deepseek` \| `deepseek-legacy` \| `auto` |
 | `--reasoning-effort` | 템플릿 기본 | `xhigh` \| `medium` \| `low` |
+| `--reasoning-budget` | `0` | think 토큰 상한. 0=무제한. 넘으면 `</think>` 강제 |
 | `--mmproj` | 없음 | CLIP/projector GGUF |
 | `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod` (콤마) |
 | `--spec-draft-n-max` | `3` | MTP draft 상한 |
@@ -325,7 +326,8 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 
 엔드포인트: `POST /v1/chat/completions`, `GET /metrics`.
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,
-`tools`, `tool_choice`, `reasoning_effort`, `image_url`.
+`tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget` (`reasoning_budget_tokens`),
+`image_url`.
 
 ## 배포
 
