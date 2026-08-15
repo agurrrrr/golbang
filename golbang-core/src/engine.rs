@@ -109,6 +109,33 @@ impl Engine {
         Ok(rows)
     }
 
+    /// Decode, sample each requested logits row in place, then run MTP
+    /// `process()`. Qwen3.8 vocab is 248k; copying those rows to the async
+    /// side was several megabytes per verify step.
+    ///
+    /// `sample_row(logit_i, row)` is called once per `items[i].logits`.
+    pub fn decode_and_sample(
+        &self,
+        items: &[BatchToken],
+        sample_row: &mut dyn FnMut(usize, &[f32]) -> Token,
+    ) -> Result<Vec<Token>> {
+        let mut model = self.lock();
+        model.decode_items(items)?;
+        let mut samples = Vec::new();
+        let mut logit_i = 0usize;
+        for (i, it) in items.iter().enumerate() {
+            if it.logits {
+                let row = model.logits_ith(i as i32)?;
+                samples.push(sample_row(logit_i, row));
+                logit_i += 1;
+            }
+        }
+        if let Err(e) = model.spec_process(items) {
+            tracing::warn!(error = %e, "MTP process() failed; drafts may degrade");
+        }
+        Ok(samples)
+    }
+
     pub fn last_logits(&self) -> Result<Vec<f32>> {
         self.lock().last_logits_vec()
     }
