@@ -856,13 +856,13 @@ impl Model {
                 break;
             }
             let logits = match self.logits_ith_ctx(self.ctx_mtp, -1) {
-                Ok(l) => l.to_vec(),
+                Ok(l) => l,
                 Err(e) => {
                     tracing::warn!(error = %e, "MTP draft logits missing");
                     break;
                 }
             };
-            let (id, p) = topk_mode(&logits, 10);
+            let (id, p) = topk_mode(logits, 10);
             if p < p_min {
                 break;
             }

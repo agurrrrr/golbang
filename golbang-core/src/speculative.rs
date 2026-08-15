@@ -203,36 +203,44 @@ pub fn accept_drafts(samples: &[Token], drafts: &[Token]) -> Vec<Token> {
 }
 
 /// Softmax top-k then pick the mode; returns (token, probability).
+///
+/// Vocab is 248k on Qwen3.8. Collecting every (index, logit) pair and
+/// `select_nth` on that Vec was several milliseconds per MTP draft step.
 pub fn topk_mode(logits: &[f32], top_k: usize) -> (Token, f32) {
     if logits.is_empty() {
         return (0, 0.0);
     }
     let k = top_k.max(1).min(logits.len());
-    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    if k < pairs.len() {
-        pairs.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-        pairs.truncate(k);
+    // `best[0]` is the current min of the k-set (logit, index).
+    let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
+    for (i, &l) in logits.iter().enumerate() {
+        if best.len() < k {
+            best.push((l, i));
+            if best.len() == k {
+                best.select_nth_unstable_by(0, |a, b| a.0.total_cmp(&b.0));
+            }
+            continue;
+        }
+        if l > best[0].0 {
+            best[0] = (l, i);
+            best.select_nth_unstable_by(0, |a, b| a.0.total_cmp(&b.0));
+        }
     }
-    let max_l = pairs.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+    let max_l = best.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
-    for p in &mut pairs {
-        p.1 = (p.1 - max_l).exp();
-        sum += p.1;
+    let mut best_i = 0usize;
+    let mut best_p = 0.0f32;
+    for &(l, i) in &best {
+        let p = (l - max_l).exp();
+        sum += p;
+        if p >= best_p {
+            best_p = p;
+            best_i = i;
+        }
     }
     if !sum.is_finite() || sum <= 0.0 {
-        let id = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i as Token)
-            .unwrap_or(0);
-        return (id, 1.0);
+        return (best_i as Token, 1.0);
     }
-    let (best_i, best_p) = pairs
-        .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .copied()
-        .unwrap_or((0, 0.0));
     (best_i as Token, best_p / sum)
 }
 
@@ -307,5 +315,16 @@ mod tests {
         let (id, p) = topk_mode(&[0.0, 5.0, 1.0], 10);
         assert_eq!(id, 1);
         assert!(p > 0.5, "p={p}");
+    }
+
+    #[test]
+    fn topk_mode_scans_without_materializing_vocab() {
+        let mut logits = vec![0.0f32; 248];
+        logits[17] = 4.0;
+        logits[200] = 9.0;
+        logits[3] = 3.0;
+        let (id, p) = topk_mode(&logits, 2);
+        assert_eq!(id, 200);
+        assert!(p > 0.9, "p={p}");
     }
 }
