@@ -56,6 +56,10 @@ pub struct SpecParams {
     pub n_max: i32,
     /// MTP min draft probability (`--spec-draft-p-min`).
     pub p_min: f32,
+    /// ngram-mod `n_max` (llama-server default 64). Independent of MTP.
+    pub ngram_n_max: i32,
+    /// ngram-mod `n_min` (llama-server default 48). Shorter hits are dropped.
+    pub ngram_n_min: i32,
     pub cache_type_k: u32,
     pub cache_type_v: u32,
 }
@@ -66,6 +70,10 @@ impl Default for SpecParams {
             types: Vec::new(),
             n_max: 3,
             p_min: 0.90,
+            ngram_n_max: 64,
+            // llama default is 48. On a cold table MTP-fail steps then draft
+            // 0 tokens (~10 t/s holes). 1 lets a short ngram fill those.
+            ngram_n_min: 1,
             cache_type_k: golbang_sys::GGML_TYPE_Q8_0 as u32,
             cache_type_v: golbang_sys::GGML_TYPE_Q8_0 as u32,
         }
@@ -84,6 +92,20 @@ impl SpecParams {
     pub fn wants_ngram(&self) -> bool {
         self.types.iter().any(|t| *t == SpecType::NgramMod)
     }
+
+    /// llama `common_speculative_n_max`: max of each enabled impl's n_max.
+    /// Used as the verify budget (`dp.n_max` is remaining ctx/tokens).
+    pub fn verify_n_max(&self) -> i32 {
+        let mut n = 0i32;
+        for t in &self.types {
+            let v = match t {
+                SpecType::DraftMtp => self.n_max,
+                SpecType::NgramMod => self.ngram_n_max,
+            };
+            n = n.max(v);
+        }
+        n.max(0)
+    }
 }
 
 /// Hash table from llama.cpp `common_ngram_mod` (PR 19164).
@@ -93,6 +115,10 @@ pub struct NgramMod {
     entries: Vec<Token>,
     /// Per-seq last hist index from which ngrams were added (`draft_one` `i_last`).
     i_last: Vec<usize>,
+    /// Last draft length returned for this seq (`draft_one` `n_draft_last`).
+    n_draft_last: Vec<usize>,
+    /// Consecutive accept rounds with fraction < 0.25 (`draft_one` `n_low`).
+    n_low: Vec<i32>,
 }
 
 const NGRAM_EMPTY: Token = -1;
@@ -107,18 +133,25 @@ impl NgramMod {
             used: 0,
             entries: vec![NGRAM_EMPTY; size.max(1)],
             i_last: Vec::new(),
+            n_draft_last: Vec::new(),
+            n_low: Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
         self.entries.fill(NGRAM_EMPTY);
         self.used = 0;
+        self.i_last.fill(0);
+        self.n_draft_last.fill(0);
+        self.n_low.fill(0);
     }
 
     fn ensure_seq(&mut self, seq_id: i32) -> usize {
         let i = seq_id.max(0) as usize;
         if i >= self.i_last.len() {
             self.i_last.resize(i + 1, 0);
+            self.n_draft_last.resize(i + 1, 0);
+            self.n_low.resize(i + 1, 0);
         }
         i
     }
@@ -226,6 +259,31 @@ impl NgramMod {
         }
         drafted
     }
+
+    pub fn note_draft(&mut self, seq_id: i32, n_draft: usize) {
+        let sid = self.ensure_seq(seq_id);
+        self.n_draft_last[sid] = n_draft;
+    }
+
+    /// llama `ngram_mod::accept` (`is_other == false`): reset the table after
+    /// five consecutive rounds with accept fraction < 0.25.
+    pub fn accept(&mut self, seq_id: i32, n_accepted: u16) {
+        let sid = self.ensure_seq(seq_id);
+        let n_draft = self.n_draft_last[sid];
+        self.n_draft_last[sid] = 0;
+        if n_draft == 0 {
+            return;
+        }
+        let f_acc = n_accepted as f64 / n_draft as f64;
+        if f_acc < 0.25 {
+            self.n_low[sid] += 1;
+            if self.n_low[sid] >= 5 {
+                self.reset();
+            }
+        } else {
+            self.n_low[sid] = 0;
+        }
+    }
 }
 
 /// Target logits after decoding `[sampled, draft…]`.
@@ -313,6 +371,20 @@ mod tests {
     }
 
     #[test]
+    fn verify_n_max_is_max_of_enabled_impls() {
+        let mut p = SpecParams::default();
+        assert_eq!(p.verify_n_max(), 0);
+        p.types = vec![SpecType::DraftMtp];
+        assert_eq!(p.verify_n_max(), 3);
+        p.types = vec![SpecType::DraftMtp, SpecType::NgramMod];
+        assert_eq!(p.verify_n_max(), 64);
+        p.types = vec![SpecType::NgramMod];
+        assert_eq!(p.verify_n_max(), 64);
+        p.ngram_n_max = 16;
+        assert_eq!(p.verify_n_max(), 16);
+    }
+
+    #[test]
     fn spec_type_rejects_unknown() {
         let err = SpecType::parse_list("draft-eagle3").unwrap_err();
         assert!(err.contains("draft-eagle3"), "{err}");
@@ -376,6 +448,26 @@ mod tests {
             NGRAM_EMPTY,
             "seq 1 grew <32 so must not ingest 108"
         );
+    }
+
+    #[test]
+    fn ngram_low_accept_streak_resets_table() {
+        let mut ng = NgramMod::new(2, 1024);
+        ng.add(&[1, 2, 3]);
+        for _ in 0..4 {
+            ng.note_draft(0, 64);
+            ng.accept(0, 1);
+            assert_eq!(ng.get(&[1, 2]), 3, "need 5 low rounds to reset");
+        }
+        ng.note_draft(0, 64);
+        ng.accept(0, 1);
+        assert_eq!(ng.get(&[1, 2]), NGRAM_EMPTY);
+        ng.add(&[1, 2, 3]);
+        ng.note_draft(0, 64);
+        ng.accept(0, 32);
+        ng.note_draft(0, 64);
+        ng.accept(0, 1);
+        assert_eq!(ng.get(&[1, 2]), 3, "good round must clear the streak");
     }
 
     #[test]

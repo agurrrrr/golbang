@@ -131,6 +131,12 @@ pub(crate) struct ActiveJob {
     pub spec_ckpt_tgt: Option<Vec<u8>>,
     pub spec_ckpt_mtp: Option<Vec<u8>>,
     pub spec_ckpt_n_past: u32,
+    /// llama `spec_is_replay`: last verify restored a checkpoint and left
+    /// `drafts` as the accepted prefix. Next decode re-verifies that prefix
+    /// instead of drafting again (GDN snapshot ≠ 65-token batch numerics).
+    pub spec_is_replay: bool,
+    /// This decode is that replay (do not count drafts twice).
+    pub spec_replaying: bool,
     pub sampler: Sampler,
     pub stop: Vec<String>,
     pub acc: String,
@@ -191,6 +197,8 @@ impl ActiveJob {
             spec_ckpt_tgt: None,
             spec_ckpt_mtp: None,
             spec_ckpt_n_past: 0,
+            spec_is_replay: false,
+            spec_replaying: false,
             sampler: Sampler::new(SamplerParams {
                 temperature: params.temperature,
                 top_p: params.top_p,

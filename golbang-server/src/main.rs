@@ -116,6 +116,15 @@ struct Args {
     #[arg(long, env = "GOLBANG_SPEC_DRAFT_N_MAX", default_value_t = 3)]
     spec_draft_n_max: i32,
 
+    /// ngram-mod max draft tokens (llama-server ngram_mod.n_max).
+    #[arg(long, env = "GOLBANG_SPEC_NGRAM_N_MAX", default_value_t = 64)]
+    spec_ngram_n_max: i32,
+
+    /// ngram-mod min draft tokens. llama-server default is 48; 1 fills
+    /// MTP-fail steps on a cold table (P7).
+    #[arg(long, env = "GOLBANG_SPEC_NGRAM_N_MIN", default_value_t = 1)]
+    spec_ngram_n_min: i32,
+
     /// Min MTP draft probability (llama-server `--spec-draft-p-min`).
     #[arg(long, env = "GOLBANG_SPEC_DRAFT_P_MIN", default_value_t = 0.90)]
     spec_draft_p_min: f32,
@@ -210,6 +219,8 @@ async fn main() -> Result<()> {
         types: spec_types,
         n_max: args.spec_draft_n_max.max(0),
         p_min: args.spec_draft_p_min.clamp(0.0, 1.0),
+        ngram_n_max: args.spec_ngram_n_max.max(0),
+        ngram_n_min: args.spec_ngram_n_min.max(0),
         cache_type_k: parse_ggml_type(&args.spec_draft_type_k).map_err(anyhow::Error::msg)?,
         cache_type_v: parse_ggml_type(&args.spec_draft_type_v).map_err(anyhow::Error::msg)?,
     };
@@ -218,6 +229,9 @@ async fn main() -> Result<()> {
         tracing::info!(
             types = ?spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             n_max = spec.n_max,
+            ngram_n_max = spec.ngram_n_max,
+            ngram_n_min = spec.ngram_n_min,
+            verify_n_max = spec.verify_n_max(),
             p_min = spec.p_min,
             "speculative decoding enabled"
         );

@@ -93,16 +93,19 @@ struct SpecRuntime {
     pending_h: Vec<Vec<f32>>,
     verify_h: Vec<Vec<f32>>,
     verify_h_rows: Vec<i32>,
+    last_draft: Vec<Option<SpecType>>,
 }
 
 impl SpecRuntime {
     fn disabled(n_seq: u32) -> Self {
+        let n = n_seq.max(1) as usize;
         Self {
             params: SpecParams::default(),
             ngram: None,
-            pending_h: vec![Vec::new(); n_seq.max(1) as usize],
-            verify_h: vec![Vec::new(); n_seq.max(1) as usize],
-            verify_h_rows: vec![0; n_seq.max(1) as usize],
+            pending_h: vec![Vec::new(); n],
+            verify_h: vec![Vec::new(); n],
+            verify_h_rows: vec![0; n],
+            last_draft: vec![None; n],
         }
     }
 }
@@ -245,6 +248,7 @@ impl Model {
         spec.pending_h = vec![vec![0.0f32; n_embd as usize]; n_seq_max as usize];
         spec.verify_h = vec![Vec::new(); n_seq_max as usize];
         spec.verify_h_rows = vec![0; n_seq_max as usize];
+        spec.last_draft = vec![None; n_seq_max as usize];
 
         if spec.params.wants_mtp() {
             if n_nextn <= 0 {
@@ -346,7 +350,7 @@ impl Model {
     }
 
     pub fn spec_n_max(&self) -> i32 {
-        self.spec.params.n_max.max(0)
+        self.spec.params.verify_n_max()
     }
 
     pub fn n_rs_seq(&self) -> u32 {
@@ -641,6 +645,9 @@ impl Model {
     pub fn spec_reset_seq(&mut self, seq_id: i32) {
         self.spec_reset_hidden(seq_id);
         self.spec_clear_mtp_kv(seq_id);
+        if let Some(slot) = self.spec.last_draft.get_mut(seq_id.max(0) as usize) {
+            *slot = None;
+        }
     }
 
     fn spec_reset_hidden(&mut self, seq_id: i32) {
@@ -788,6 +795,15 @@ impl Model {
 
     pub fn spec_accept(&mut self, seq_id: i32, n_accepted: u16) {
         let i = seq_id as usize;
+        let last = self.spec.last_draft.get(i).copied().flatten();
+        if last == Some(SpecType::NgramMod) {
+            if let Some(ng) = self.spec.ngram.as_mut() {
+                ng.accept(seq_id, n_accepted);
+            }
+        }
+        if let Some(slot) = self.spec.last_draft.get_mut(i) {
+            *slot = None;
+        }
         let n_rows = self.spec.verify_h_rows.get(i).copied().unwrap_or(0);
         if n_rows <= 0 {
             return;
@@ -812,23 +828,66 @@ impl Model {
         n_past: i32,
         n_max: i32,
     ) -> Vec<Token> {
-        let n_max = n_max.max(0) as usize;
-        if n_max == 0 {
+        let n_budget = n_max.max(0) as usize;
+        if n_budget == 0 {
             return Vec::new();
         }
-
+        // Keep the ngram table current even when MTP wins this step, so a later
+        // MTP miss can still draft a long self-match (llama only ingests inside
+        // ngram `draft_one`, which never runs if MTP filled the slot).
         if let Some(ng) = self.spec.ngram.as_mut() {
-            // llama `draft_one`: add hist[i_last..] before looking up drafts.
-            // Order and thresholds stay golbang's (ngram first, n_min=1, cap n_max).
             ng.ingest_new(seq_id, prompt);
-            let drafted = ng.draft(prompt, id_last, n_max.max(48), 1);
-            let drafted: Vec<Token> = drafted.into_iter().take(n_max).collect();
+        }
+        if let Some(slot) = self.spec.last_draft.get_mut(seq_id.max(0) as usize) {
+            *slot = None;
+        }
+        // llama `common_speculative_draft`: first non-empty impl in --spec-type
+        // order wins. Production is `draft-mtp,ngram-mod` (MTP then ngram).
+        let types = self.spec.params.types.clone();
+        for t in types {
+            let drafted = match t {
+                SpecType::NgramMod => self.draft_ngram(seq_id, prompt, id_last, n_budget),
+                SpecType::DraftMtp => self.draft_mtp(seq_id, id_last, n_past, n_budget),
+            };
             if !drafted.is_empty() {
+                if let Some(slot) = self.spec.last_draft.get_mut(seq_id.max(0) as usize) {
+                    *slot = Some(t);
+                }
                 return drafted;
             }
         }
+        Vec::new()
+    }
 
-        if self.ctx_mtp.is_null() || !self.spec.params.wants_mtp() {
+    fn draft_ngram(
+        &mut self,
+        seq_id: i32,
+        prompt: &[Token],
+        id_last: Token,
+        n_budget: usize,
+    ) -> Vec<Token> {
+        let Some(ng) = self.spec.ngram.as_mut() else {
+            return Vec::new();
+        };
+        let n_max = (self.spec.params.ngram_n_max.max(0) as usize).min(n_budget);
+        let n_min = self.spec.params.ngram_n_min.max(0) as usize;
+        let drafted = ng.draft(prompt, id_last, n_max, n_min);
+        ng.note_draft(seq_id, drafted.len());
+        drafted
+    }
+
+    fn draft_mtp(
+        &mut self,
+        seq_id: i32,
+        id_last: Token,
+        n_past: i32,
+        n_budget: usize,
+    ) -> Vec<Token> {
+        if self.ctx_mtp.is_null() {
+            return Vec::new();
+        }
+        let n_max = (self.spec.params.n_max.max(0) as usize).min(n_budget);
+        if n_max == 0 {
             return Vec::new();
         }
 

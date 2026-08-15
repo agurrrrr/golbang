@@ -628,9 +628,9 @@ fn snapshot_spec_slots(slots: &mut [Slot], engine: &Engine, plan: &crate::batch:
         }
         let seq = slot.id.0 as i32;
         job.spec_ckpt_n_past = job.n_past;
-        // llama-server sets n_rs_seq = spec n_max, then skips the PARTIAL_ONLY
-        // copy when draft.len() <= n_rs_seq (seq_rm can rewind the reject).
-        // A 150 MiB snapshot every step was the remaining P7 gap.
+        // llama-server: n_rs_seq = need_n_rs_seq() == MTP n_max (3), and
+        // skips PARTIAL_ONLY when draft.len() <= n_rs_seq. ngram-mod drafts
+        // of 48–64 therefore snapshot (same as llama).
         if (job.drafts.len() as u32) <= engine.n_rs_seq() {
             job.spec_ckpt_tgt = None;
             job.spec_ckpt_mtp = None;
@@ -645,12 +645,9 @@ fn snapshot_spec_slots(slots: &mut [Slot], engine: &Engine, plan: &crate::batch:
     }
 }
 
-fn replay_spec_prefix(slot: &mut Slot, engine: &Engine, drafts: &[Token], n_matched: usize) {
+fn restore_spec_checkpoint(slot: &mut Slot, engine: &Engine) {
     let seq = slot.id.0 as i32;
     let Some(job) = slot.job.as_ref() else {
-        return;
-    };
-    let Some(pending) = job.pending else {
         return;
     };
     let n0 = job.spec_ckpt_n_past;
@@ -664,6 +661,18 @@ fn replay_spec_prefix(slot: &mut Slot, engine: &Engine, drafts: &[Token], n_matc
             let _ = engine.spec_rm_from(seq, n0 as i32);
         }
     }
+}
+
+fn replay_spec_prefix(slot: &mut Slot, engine: &Engine, drafts: &[Token], n_matched: usize) {
+    let seq = slot.id.0 as i32;
+    let Some(job) = slot.job.as_ref() else {
+        return;
+    };
+    let Some(pending) = job.pending else {
+        return;
+    };
+    let n0 = job.spec_ckpt_n_past;
+    restore_spec_checkpoint(slot, engine);
     let mut items = Vec::with_capacity(1 + n_matched);
     items.push(BatchToken {
         token: pending,
@@ -772,9 +781,14 @@ fn verify_and_emit(
         if job.finish.is_some() {
             return;
         }
+        if job.spec_is_replay {
+            job.spec_is_replay = false;
+            job.spec_replaying = true;
+        }
         let accepted = accept_drafts(samples, drafts);
         if accepted.is_empty() {
             job.drafts.clear();
+            job.spec_replaying = false;
             return;
         }
         (accepted, job.n_past)
@@ -785,8 +799,33 @@ fn verify_and_emit(
         .take_while(|(a, d)| *a == *d)
         .count();
     let keep_pos = n_past_after.saturating_sub((n_verify - n_matched) as u32);
+    let used_ckpt = slot
+        .job
+        .as_ref()
+        .is_some_and(|j| j.spec_ckpt_tgt.is_some());
 
     if n_matched < n_verify {
+        if used_ckpt {
+            // llama: restore, keep accepted as the next draft, re-verify next
+            // iteration. Replaying in this step on a 65-token GDN batch leaves
+            // a state that does not match a short sequential decode.
+            restore_spec_checkpoint(slot, engine);
+            engine.spec_accept(seq, n_matched as u16);
+            if let Some(m) = metrics {
+                m.draft_tokens_total
+                    .fetch_add(n_verify as u64, Ordering::Relaxed);
+            }
+            if let Some(job) = slot.job.as_mut() {
+                job.n_past = job.spec_ckpt_n_past;
+                job.drafts = accepted;
+                job.spec_is_replay = true;
+                job.spec_ckpt_tgt = None;
+                job.spec_ckpt_mtp = None;
+                job.draft_n = job.draft_n.saturating_add(n_verify as u32);
+                job.draft_verif_steps = job.draft_verif_steps.saturating_add(1);
+            }
+            return;
+        }
         let tgt_ok = engine.rm_seq_from(seq, keep_pos as i32);
         let mtp_ok = engine.spec_rm_from(seq, keep_pos as i32);
         if !tgt_ok || !mtp_ok {
@@ -795,9 +834,15 @@ fn verify_and_emit(
     }
 
     engine.spec_accept(seq, n_matched as u16);
+    let replaying = slot
+        .job
+        .as_ref()
+        .is_some_and(|j| j.spec_replaying);
     if let Some(m) = metrics {
-        m.draft_tokens_total
-            .fetch_add(n_verify as u64, Ordering::Relaxed);
+        if !replaying {
+            m.draft_tokens_total
+                .fetch_add(n_verify as u64, Ordering::Relaxed);
+        }
         m.draft_accepted_total
             .fetch_add(n_matched as u64, Ordering::Relaxed);
     }
@@ -806,11 +851,15 @@ fn verify_and_emit(
         n_draft = n_verify,
         n_matched,
         n_emit = accepted.len(),
+        replaying,
         "spec accept"
     );
 
     if let Some(job) = slot.job.as_mut() {
-        job.draft_n = job.draft_n.saturating_add(n_verify as u32);
+        if !job.spec_replaying {
+            job.draft_n = job.draft_n.saturating_add(n_verify as u32);
+        }
+        job.spec_replaying = false;
         job.draft_n_accepted = job.draft_n_accepted.saturating_add(n_matched as u32);
         job.draft_verif_steps = job.draft_verif_steps.saturating_add(1);
         job.n_past = keep_pos;
@@ -920,6 +969,12 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<D
         let Some(job) = slot.job.as_mut() else {
             continue;
         };
+        if job.spec_is_replay && !job.drafts.is_empty() {
+            // Keep the accepted prefix for the next decode. Do not consume
+            // the flag here — verify_and_emit needs it after that decode.
+            continue;
+        }
+        job.spec_replaying = false;
         job.drafts.clear();
         if !spec_on || job.finish.is_some() {
             continue;
@@ -935,8 +990,14 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<D
         if job.generated.len() > 1 {
             hist.extend_from_slice(&job.generated[..job.generated.len() - 1]);
         }
-        let remain = n_ctx_seq.saturating_sub(job.n_past.saturating_add(1)) as i32;
-        let n_max = spec_n_max.min(remain.saturating_sub(1)).max(0);
+        // llama `get_n_draft_max`: remaining ctx and remaining gen tokens,
+        // not MTP n_max. ngram-mod then drafts up to its own n_max (64).
+        let remain_ctx = n_ctx_seq.saturating_sub(job.n_past.saturating_add(1)) as i32;
+        let remain_gen = job.max_tokens.saturating_sub(job.n_generated) as i32;
+        let n_max = spec_n_max
+            .min(remain_ctx.saturating_sub(1))
+            .min(remain_gen.saturating_sub(1))
+            .max(0);
         if n_max <= 0 {
             continue;
         }
