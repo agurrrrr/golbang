@@ -1,0 +1,161 @@
+{
+  "label": "llama-ngram64b-1",
+  "when": "2026-08-15T09:10:41.039813+00:00",
+  "base": "http://127.0.0.1:8083",
+  "gpu_before": {
+    "edge": "39.0",
+    "junction": "40.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "23.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "38.0",
+        "junction": "40.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "41.0",
+        "junction": "45.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 1.0626702120061964,
+      "finish_reason": "length",
+      "prompt_n": 15,
+      "predicted_n": 16,
+      "cache_n": 42,
+      "prompt_ms": 440.854,
+      "predicted_ms": 618.199,
+      "prompt_per_second": 34.02486991158071,
+      "predicted_per_second": 24.26403148500726,
+      "draft_n": 8,
+      "draft_n_accepted": 8,
+      "content_n": 0,
+      "reasoning_n": 64,
+      "content": "",
+      "reasoning": "We need to respond to user: \"Reply with exactly: OK\". Need final",
+      "error": null
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "38.0",
+        "junction": "40.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "43.0",
+        "junction": "47.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 4.2555977429728955,
+      "finish_reason": "length",
+      "prompt_n": 33,
+      "predicted_n": 84,
+      "cache_n": 42,
+      "prompt_ms": 644.289,
+      "predicted_ms": 3605.744,
+      "prompt_per_second": 51.21925098829873,
+      "predicted_per_second": 23.018827737077284,
+      "draft_n": 39,
+      "draft_n_accepted": 39,
+      "content_n": 0,
+      "reasoning_n": 436,
+      "content": "",
+      "reasoning": "We need to answer user: \"In one short paragraph, explain what speculative decoding is and why it can raise tokens per second on a single GPU.\" Need one short paragraph. Need final only. Need be accurate. Speculative decoding: small draft model proposes multiple tokens, large target model verifies in parallel using one forward pass (or batched positions), accepts prefix that matches, rejects/resamples at first mismatch. Raises tokens",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "40.0",
+        "junction": "41.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "48.0",
+        "junction": "52.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 10.470917297061533,
+      "finish_reason": "length",
+      "prompt_n": 42,
+      "predicted_n": 200,
+      "cache_n": 42,
+      "prompt_ms": 586.009,
+      "predicted_ms": 9763.893,
+      "prompt_per_second": 71.67125419575467,
+      "predicted_per_second": 20.381214747027645,
+      "draft_n": 153,
+      "draft_n_accepted": 88,
+      "content_n": 0,
+      "reasoning_n": 941,
+      "content": "",
+      "reasoning": "We need answer user's request: \"Write a detailed technical paragraph (about 180 words) on how flash attention reduces HBM traffic during transformer decode. Do not use a bullet list.\"\n\nNeed produce final only paragraph, about 180 words. Need ensure no bullet list. Need count words approx 180. Let's draft and count.\n\nDraft:\n\"During transformer decode, each new token attends to all previous keys and values, so the attention computation repeatedly reads the growing KV cache from high-bandwidth memory. Flash attention reduces this HBM traffic by keeping the attention computation in fast on-chip SRAM and processing the sequence in tiles. Instead of materializing the full N×N attention matrix in HBM, it loads small blocks of queries, keys, and values, computes partial attention scores, applies online softmax rescaling, and accumulates outputs. For decode, the query tile is tiny, often one token, while key and value tiles are streamed",
+      "error": null
+    },
+    {
+      "id": "long1024",
+      "max_tokens": 1024,
+      "gpu_before": {
+        "edge": "43.0",
+        "junction": "45.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "65.0",
+        "junction": "69.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 52.37761246901937,
+      "finish_reason": "length",
+      "prompt_n": 48,
+      "predicted_n": 1024,
+      "cache_n": 42,
+      "prompt_ms": 741.85,
+      "predicted_ms": 51515.261,
+      "prompt_per_second": 64.70310709712206,
+      "predicted_per_second": 19.858193089616687,
+      "draft_n": 469,
+      "draft_n_accepted": 386,
+      "content_n": 0,
+      "reasoning_n": 4852,
+      "content": "",
+      "reasoning": "We need to respond to user: \"Write a long technical essay (at least 800 words) on speculative decoding, flash attention, and KV-cache traffic on a single GPU. Use only paragraphs, no bullet lists.\"\n\nNeed produce final only paragraphs, no bullets. Need at least 800 words. Need technical essay. Ensure no bullet lists. Could have headings? User says only paragraphs, no bullet lists. Headings maybe not paragraphs? Better avoid headings, just continuous paragraphs. Need count words >800. Let's draft around 1000-1200 words. Need discuss speculative decoding, flash attention, KV-cache traffic on single GPU. Technical. No bullets.\n\nNeed ensure no list-like lines. Each paragraph separated by blank line. That's okay. Need maybe 8-10 paragraphs. Let's craft.\n\nNeed be careful: \"Use only paragraphs\" means no headings, no bullets. Fine.\n\nLet's write about 1100 words. Need maybe count. I'll draft and estimate.\n\nParagraph 1: intro LLM inference on single GPU, autoregressive decoding bottleneck, memory bandwidth, KV cache.\n\nParagraph 2: KV cache basics, attention, QKV, sequence length, batch, memory traffic, HBM vs compute, roofline.\n\nParagraph 3: Flash attention: tiling, online softmax, IO complexity, recomputation, HBM traffic reduction, single GPU implications, block sizes, registers/shared memory, backward maybe but focus decoding.\n\nParagraph 4: Flash attention in prefill vs decode. Prefill compute-bound, decode memory-bound. Flash attention helps prefill and some decode but decode still KV read.\n\nParagraph 5: Speculative decoding: draft model, verify with target, acceptance, tree attention, latency, throughput, single GPU constraints.\n\nParagraph 6: Interaction with KV cache: draft KV, target KV, verification, branching, cache management, memory pressure.\n\nParagraph 7: Flash attention and speculative decoding: tree attention, variable length, masking, block sparsity, efficient verification, avoiding materializing full attention matrix, handling multiple candidate tokens.\n\nParagraph 8: KV-cache traffic details: per token decode reads all previous K/V, batch, quantization, paged attention, offloading? Single GPU no offload maybe. Traffic formulas.\n\nParagraph 9: Optimization strategies: KV compression, quantization, sliding window, MQA/GQA, cache layout, fusion, CUDA graphs, batching, speculative length tradeoffs.\n\nParagraph 10: System-level single GPU: memory capacity, bandwidth, compute, scheduling, latency vs throughput, when speculative decoding helps, when not.\n\nParagraph 11: conclusion.\n\nNeed ensure at least 800 words. Let's write robustly.\n\nPotential word count: 11 paragraphs * 100 = 1100. Good.\n\nNeed no bullet lists. Avoid semicolon? fine.\n\nLet's draft with technical depth.\n\nCheck no numbered lists. No bullets.\n\nNeed maybe mention \"single GPU\" repeatedly.\n\nLet's produce final. Ensure no markdown headings. Just paragraphs.\n\nNeed maybe count approximate. Let's write and count roughly.\n\nPara1:\n\"Large language model inference on a single GPU is increasingly governed less by raw floating point throughput and more by the movement of tensors through memory. In autoregressive decoding, each newly generated token requires the model to attend to all previously generated tokens, and the intermediate key and value tensors for those tokens must be retained across steps. This creates a persistent key value cache, often called the KV cache, whose size grows linearly with sequence length and batch size. On a single accelerator, the cache competes with model weights, activations, and temporary buffers for high bandwidth memory, and the repeated reads of that cache during decoding can dominate wall clock latency. Understanding speculative decoding, flash attention, and KV cache traffic is therefore essential for designing efficient single GPU inference systems.\" Count ~120.\n\nPara2:\n\"The KV cache is the central data structure in transformer inference. For each layer, the attention mechanism computes queries from the current token and compares them against keys and values produced by earlier tokens. In a naive implementation, the full attention matrix is materialized, which is quadratic in sequence length and quickly becomes infeasible. More importantly for decoding, even when the attention matrix is not stored, the keys and values for the entire context must be read from memory to compute the attention scores for the new query. If a model has L layers, hidden dimension d, and context length n, the per token decode step must move on the order of 2 L n d elements of KV data, plus weights and activations. Modern GPUs have high arithmetic throughput but comparatively lower memory bandwidth, so this read traffic places decoding in a memory bound regime. The practical consequence is that increasing FLOPS alone does not proportionally reduce latency; reducing bytes moved is often more valuable.\"",
+      "error": null
+    }
+  ],
+  "metrics_before": {},
+  "gpu_after": {
+    "edge": "63.0",
+    "junction": "67.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "27.0"
+  },
+  "metrics_after": {}
+}

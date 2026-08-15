@@ -1,0 +1,103 @@
+{
+  "label": "golbang-ngram64b-2",
+  "when": "2026-08-15T09:07:18.839547+00:00",
+  "base": "http://127.0.0.1:8083",
+  "gpu_before": {
+    "edge": "40.0",
+    "junction": "42.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "24.0"
+  },
+  "cases": [
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "40.0",
+        "junction": "42.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "gpu_after": {
+        "edge": "43.0",
+        "junction": "48.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 69,
+        "draft_accepted_total": 69
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 2.5227630690205842,
+      "finish_reason": "length",
+      "prompt_n": 75,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 665.2670459999999,
+      "predicted_ms": 1848.0243079999998,
+      "prompt_per_second": 112.73668288688992,
+      "predicted_per_second": 45.45394756788015,
+      "draft_n": 69,
+      "draft_n_accepted": 69,
+      "content_n": 0,
+      "reasoning_n": 436,
+      "content": "",
+      "reasoning": "We need to answer user: \"In one short paragraph, explain what speculative decoding is and why it can raise tokens per second on a single GPU.\" Need one short paragraph. Need final only. Need be accurate. Speculative decoding: small draft model proposes multiple tokens, large target model verifies in parallel using one forward pass (or batched positions), accepts prefix that matches, rejects/resamples at first mismatch. Raises tokens",
+      "error": null
+    },
+    {
+      "id": "long1024",
+      "max_tokens": 1024,
+      "gpu_before": {
+        "edge": "40.0",
+        "junction": "42.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "gpu_after": {
+        "edge": "66.0",
+        "junction": "71.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 541,
+        "draft_accepted_total": 319
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 58.36631576507352,
+      "finish_reason": "length",
+      "prompt_n": 90,
+      "predicted_n": 1024,
+      "cache_n": 0,
+      "prompt_ms": 954.4712509999999,
+      "predicted_ms": 57404.444599999995,
+      "prompt_per_second": 94.29304434859297,
+      "predicted_per_second": 17.838339995018437,
+      "draft_n": 541,
+      "draft_n_accepted": 319,
+      "content_n": 0,
+      "reasoning_n": 4555,
+      "content": "",
+      "reasoning": "We need to respond to user: \"Write a long technical essay (at least 800 words) on speculative decoding, flash attention, and KV-cache traffic on a single GPU. Use only paragraphs, no bullet lists.\"\n\nNeed produce final only paragraphs, no bullets. At least 800 words. Need ensure no bullet lists. Could have headings? User says only paragraphs, no bullet lists. Headings maybe not paragraphs? Better avoid headings, just continuous paragraphs. Need technical essay. Need count words >800. Let's draft around 1000-1200 words. Need discuss speculative decoding, flash attention, KV-cache traffic on single GPU. Need technical depth.\n\nNeed ensure no list markers. Paragraphs separated by blank lines. No bullets. Could include equations? Fine. Need maybe no numbered list. Let's craft.\n\nNeed think about content:\n- Intro: LLM inference on single GPU, autoregressive decoding bottleneck memory bandwidth, KV cache, attention.\n- Speculative decoding: draft model, target verification, acceptance/rejection, distribution matching, tree attention, latency reduction, throughput, single GPU constraints, draft/target co-location, memory, batch size, speculative length, acceptance rate, cost model.\n- Flash attention: IO-aware exact attention, tiling, online softmax, HBM vs SRAM, O(N) memory, reduced memory traffic, kernel fusion, backward, implications for decoding and prefill, block sizes, causal masking, paged KV? On single GPU, flash attention reduces KV reads/writes, but KV cache still large.\n- KV-cache traffic: autoregressive step reads entire KV cache for each layer, writes new K/V, memory-bound. Quantization, compression, paged attention, offloading? Single GPU no offload maybe. Traffic analysis: per token per layer: read K,V of length t, write 2d, compute. For batch B, sequence length L, hidden d, heads, etc. Flash attention reduces intermediate attention matrix traffic but not necessarily KV cache reads? It can read KV in tiles, still must read all KV once per query per layer, but avoids materializing S matrix. For decoding query length 1, flash attention less benefit? Actually for decode, query length small, attention is memory-bound reading KV; flash attention can still reduce memory traffic by fusing softmax and avoiding S, but main traffic is KV reads. For prefill, flash attention huge.\n- Interaction: speculative decoding changes traffic: verification of multiple candidate tokens in one step: query length gamma+1, can use batched/tree attention, reads KV cache multiple times? If tree, multiple branches share prefix, can reuse KV reads? Need discuss. Speculative decoding increases compute per accepted token but reduces number of target forward passes. KV traffic per target pass: for verifying m tokens, read KV cache m times? If using flash attention with query block m, each KV tile read once per query block? For causal, each query token attends to previous KV; if m small, can read KV once and compute all m queries? In flash attention, query block of m, KV tiles read once per query block, so traffic roughly KV size per layer per verification step, not m times, if implemented as batched query. But if separate queries, m times. Tree attention can group. Need nuance.\n- Single GPU: memory capacity limits model + KV cache + draft. Speculative decoding may require two models, memory pressure. Flash attention enables longer context by reducing activation memory, but KV cache dominates. KV cache traffic determines latency; HBM bandwidth. Need maybe formulas: KV cache size = 2 * L * B * n_layers * n_heads * d_head * bytes. For decode step, read traffic ~ 2 * L * B * n_layers * n_heads * d_head * bytes (plus weights). If model weights also read each step, for small batch weights dominate; for long context KV dominates. Speculative decoding: target verification with gamma tokens: if query block, KV read once per layer per batch, but compute more; if not, gamma times. Acceptance rate alpha, expected accepted tokens per step = (1-alpha^{gamma+1})/(1-alpha) maybe. Speedup approx expected accepted / (1 + gamma*cost_draft/cost_target?) Need mention.\n- Flash attention details: standard attention computes S=QK^T, P=softmax(S), O=PV. Naive materializes S O(N^2) in HBM. Flash attention partitions Q,K,V into blocks that fit SRAM, computes partial softmax with row max and sum, rescales, writes output. Reduces HBM reads/writes from O(N^2) to O(N^2/d?) Actually O(N^2) compute but O(N) memory traffic? For sequence length N, standard attention HBM traffic O(N^2) for S and P; flash O(N^2/d) maybe? Need be accurate",
+      "error": null
+    }
+  ],
+  "metrics_before": {
+    "draft_tokens_total": 497,
+    "draft_accepted_total": 476
+  },
+  "gpu_after": {
+    "edge": "64.0",
+    "junction": "67.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "27.0"
+  },
+  "metrics_after": {
+    "draft_tokens_total": 1107,
+    "draft_accepted_total": 864
+  }
+}
