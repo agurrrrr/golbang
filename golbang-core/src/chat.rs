@@ -171,13 +171,28 @@ fn message_to_jinja(m: &ChatMessage) -> serde_json::Value {
                     "type": "function",
                     "function": {
                         "name": tc.name,
-                        "arguments": tc.arguments,
+                        "arguments": arguments_for_jinja(&tc.arguments),
                     }
                 })
             })
             .collect::<Vec<_>>());
     }
     obj
+}
+
+/// OpenAI and `ToolCall` keep `arguments` as a JSON string. Qwen3.8 jinja
+/// (`raise_exception` at chat:150) requires a mapping; DSV4 accepts either
+/// and runs `| from_json` on strings. Parse before render so a tool-call
+/// follow-up does not fall back to ChatML.
+fn arguments_for_jinja(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::json!({});
+    }
+    match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => serde_json::Value::String(raw.to_string()),
+    }
 }
 
 fn try_chatml(messages: &[ChatMessage]) -> std::result::Result<String, &'static str> {
@@ -491,6 +506,136 @@ mod tests {
         assert!(
             applied.prompt.ends_with("<|im_start|>assistant\n<think>\n"),
             "bad gen prefix:\n{}",
+            applied.prompt
+        );
+    }
+
+    fn assistant_tool_call(name: &str, arguments: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qwen38_jinja_parses_openai_string_tool_arguments() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[
+                msg("user", "351 작업 상세 조회해"),
+                assistant_tool_call("get_task_detail", r#"{"task_id":351}"#),
+                ChatMessage {
+                    role: "tool".into(),
+                    content: "ok".into(),
+                    tool_call_id: Some("call_1".into()),
+                    ..Default::default()
+                },
+            ],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            applied.used_jinja,
+            "string arguments must not fall back to ChatML:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<function=get_task_detail>"),
+            "missing tool name:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<parameter=task_id>"),
+            "arguments must be expanded as a mapping:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied
+                .prompt
+                .contains("<tool_response>\nok\n</tool_response>"),
+            "missing tool response:\n{}",
+            applied.prompt
+        );
+        assert!(
+            !applied
+                .prompt
+                .contains("get_task_detail were passed as a JSON string"),
+            "template still saw a string:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn qwen38_jinja_empty_tool_arguments_are_object() {
+        let tmpl = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[
+                msg("user", "skill 로드해"),
+                assistant_tool_call("skill_load", ""),
+            ],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                enable_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            applied.used_jinja,
+            "empty arguments must not raise:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<function=skill_load>"),
+            "missing empty-arg tool call:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn dsv4_jinja_tool_call_history_accepts_string_arguments() {
+        let tmpl = include_str!("../tests/fixtures/dsv4_chat_template.jinja");
+        let applied = apply_chat_template_with(
+            &[
+                msg("user", "이전 작업 조회해봐"),
+                assistant_tool_call("get_history", r#"{"project_name":"golbang"}"#),
+                ChatMessage {
+                    role: "tool".into(),
+                    content: "[]".into(),
+                    tool_call_id: Some("call_1".into()),
+                    ..Default::default()
+                },
+            ],
+            &ChatApplyOpts {
+                jinja: true,
+                template: Some(tmpl.to_string()),
+                bos_token: "<｜begin▁of▁sentence｜>".into(),
+                enable_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert!(applied.used_jinja, "dsv4 jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied
+                .prompt
+                .contains("<｜DSML｜invoke name=\"get_history\">"),
+            "missing DSML invoke:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied
+                .prompt
+                .contains("<｜DSML｜parameter name=\"project_name\" string=\"true\">golbang"),
+            "arguments must survive as DSML parameters:\n{}",
             applied.prompt
         );
     }
