@@ -1,0 +1,141 @@
+{
+  "label": "golbang-post3",
+  "when": "2026-08-15T03:13:07.441888+00:00",
+  "base": "http://127.0.0.1:8083",
+  "gpu_before": {
+    "edge": "35.0",
+    "junction": "37.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "23.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "35.0",
+        "junction": "37.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "37.0",
+        "junction": "42.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 10,
+        "draft_accepted_total": 10
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 1.5892766170436516,
+      "finish_reason": "length",
+      "prompt_n": 57,
+      "predicted_n": 16,
+      "cache_n": 0,
+      "prompt_ms": 971.993486,
+      "predicted_ms": 613.97165,
+      "prompt_per_second": 58.6423683090403,
+      "predicted_per_second": 26.059835173171273,
+      "draft_n": 10,
+      "draft_n_accepted": 10,
+      "content_n": 0,
+      "reasoning_n": 64,
+      "content": "",
+      "reasoning": "We need to respond to user: \"Reply with exactly: OK\". Need final",
+      "error": null
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "35.0",
+        "junction": "37.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "gpu_after": {
+        "edge": "41.0",
+        "junction": "45.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 38,
+        "draft_accepted_total": 38
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 4.530730678001419,
+      "finish_reason": "length",
+      "prompt_n": 75,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 647.438145,
+      "predicted_ms": 3875.872684,
+      "prompt_per_second": 115.84118201747289,
+      "predicted_per_second": 21.672538509007435,
+      "draft_n": 38,
+      "draft_n_accepted": 38,
+      "content_n": 0,
+      "reasoning_n": 436,
+      "content": "",
+      "reasoning": "We need to answer user: \"In one short paragraph, explain what speculative decoding is and why it can raise tokens per second on a single GPU.\" Need one short paragraph. Need final only. Need be accurate. Speculative decoding: small draft model proposes multiple tokens, large target model verifies in parallel using one forward pass (or batched positions), accepts prefix that matches, rejects/resamples at first mismatch. Raises tokens",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "38.0",
+        "junction": "39.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "46.0",
+        "junction": "50.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "24.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 92,
+        "draft_accepted_total": 85
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 10.91219160798937,
+      "finish_reason": "length",
+      "prompt_n": 84,
+      "predicted_n": 200,
+      "cache_n": 0,
+      "prompt_ms": 938.06684,
+      "predicted_ms": 9967.635782000001,
+      "prompt_per_second": 89.54585794760638,
+      "predicted_per_second": 20.064938604715962,
+      "draft_n": 92,
+      "draft_n_accepted": 85,
+      "content_n": 0,
+      "reasoning_n": 1007,
+      "content": "",
+      "reasoning": "We need answer user's request: \"Write a detailed technical paragraph (about 180 words) on how flash attention reduces HBM traffic during transformer decode. Do not use a bullet list.\"\n\nNeed produce final only paragraph, about 180 words. Need ensure no bullet list. Need count words approx 180. Let's draft and count.\n\nDraft:\n\"During transformer decode, each new token attends to all previous keys and values, so the attention computation repeatedly reads the growing KV cache from high-bandwidth memory. Conventional implementations materialize the full attention matrix in HBM: they load keys and values, compute scores, apply softmax, and write intermediate results back before multiplying by values. This creates large memory traffic that often dominates latency. Flash attention reduces this traffic by tiling the computation in registers and shared memory. It partitions queries, keys, and values into small blocks that fit on-chip, computes partial attention scores, performs online softmax rescaling,",
+      "error": null
+    }
+  ],
+  "metrics_before": {
+    "draft_tokens_total": 0,
+    "draft_accepted_total": 0
+  },
+  "gpu_after": {
+    "edge": "44.0",
+    "junction": "47.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "24.0"
+  },
+  "metrics_after": {
+    "draft_tokens_total": 140,
+    "draft_accepted_total": 133
+  }
+}
