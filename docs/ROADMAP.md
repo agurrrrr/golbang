@@ -71,6 +71,16 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 - [x] 지목 안 됨 — 중단 사유만 (decode/suffix 1위는 CPU MoE `n_cpu_moe=32`. HIP 패치 0)
 - [x] **완료 기준:** 순위표 + 중단 사유. 커널 diff 0. 이슈 #29
 
+## P7 — Qwen3.8-27B decode ≥ llama-server (local-llm #364)
+
+**목표:** 같은 MI50 · 같은 GGUF · 같은 spec 플래그 · SHA `3ac5658c7`에서
+`golbang-qwen38` decode가 생산 llama-server(#364: 실사용 17–23 t/s, 짧은 25 t/s)를
+맞추거나 넘긴다. DSV4 ~8 t/s 동률 A/B와 다른 문제.
+
+- [ ] 고치기 전 통제 A/B (`docs/bench/p7.md`)
+- [ ] 병목 분류: spec 미발화 / 검증 비용 / 호스트 오버헤드. 클럭·커널 추측 금지
+- [ ] **완료 기준:** 16 / ~84 / 100–230 / 장문 밴드에서 golbang ≥ llama. 16토큰만으로 완료 금지. 이슈 #31
+
 ## P4 — (장기·선택) 순수 Rust 커널
 
 **목표:** hot-path 커널을 Rust+HIP로 점진 재작성해 FFI 의존을 줄인다.
@@ -94,4 +104,5 @@ join은 **이번 `llama_decode` 반환 직후** 빈 슬롯에 넣는 것이다.
 | P3 | 성능 최적화 | 공정 조건 벤치 |
 | P5 | 다턴 prefix KV 생존 | 2턴째 `cache_n>0`, TTFT=suffix |
 | P6 | rocprof + HIP C++ 1커널 | 순위표, 지목 시에만 패치 |
+| P7 | Qwen3.8 decode ≥ llama-server #364 | 밴드별 A/B, 16토큰만으로 완료 금지 |
 | P4 | Rust 커널 일부 (선택) | P6 이후 gate, 회귀 없음 |

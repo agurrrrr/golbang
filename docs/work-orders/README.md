@@ -49,6 +49,7 @@ llama-server도 이미 continuous batching(슬롯 + 통합 batch + `llama_decode
 | **P3** | [P3-performance.md](P3-performance.md) | prefix cache, chunked prefill, 메트릭 | 동일 GGUF/`-c`/`-np`/`-ctk`/`-ctv`/클럭 벤치 | #26 |
 | **P5** | [P5-multiturn-prefix-cache.md](P5-multiturn-prefix-cache.md) | 다턴에서 prefix KV 생존 (커널 0줄) | 2턴째 `cache_n>0`, TTFT=suffix | #28 |
 | **P6** | [P6-rocprof-hip-kernels.md](P6-rocprof-hip-kernels.md) | rocprof 지목 커널만 HIP C++ | 순위표 + (조건부) 패치 1개 | #29 |
+| **P7** | [P7-qwen38-decode-parity.md](P7-qwen38-decode-parity.md) | Qwen3.8 decode ≥ llama-server #364 | 밴드별 A/B, 16토큰만으로 완료 금지 | #31 |
 | **P4** | [P4-rust-kernels.md](P4-rust-kernels.md) | (장기·선택) hot-path 커널 Rust+HIP 점진 재작성 | 특정 커널 Rust 치환 + 성능 회귀 없음 | #27 |
 
 ## 진행 규칙
