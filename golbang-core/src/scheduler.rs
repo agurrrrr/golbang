@@ -779,6 +779,9 @@ fn verify_and_emit(
     );
 
     if let Some(job) = slot.job.as_mut() {
+        job.draft_n = job.draft_n.saturating_add(n_verify as u32);
+        job.draft_n_accepted = job.draft_n_accepted.saturating_add(n_matched as u32);
+        job.draft_verif_steps = job.draft_verif_steps.saturating_add(1);
         job.n_past = keep_pos;
         job.drafts.clear();
         job.spec_ckpt_tgt = None;
@@ -968,6 +971,7 @@ fn finish_slot(
         let timings = job.timings(Instant::now());
         record_request_totals(metrics, &timings);
         log_slot_timings(id.0, job.request_id, reason.as_str(), &timings);
+        log_draft_acceptance(&timings);
         let ev = match reason {
             FinishReason::Cancelled => SlotEvent::Failed(Error::Cancelled),
             FinishReason::Timeout => SlotEvent::Failed(Error::Timeout),
@@ -1028,6 +1032,23 @@ fn log_slot_timings(slot: u32, request_id: u64, reason: &str, t: &SlotTimings) {
         "      total time = {:10.2} ms / {:5} tokens",
         t.total_ms(),
         t.total_n(),
+    );
+}
+
+fn log_draft_acceptance(t: &SlotTimings) {
+    if t.draft_n == 0 {
+        return;
+    }
+    let ratio = f64::from(t.draft_n_accepted) / f64::from(t.draft_n);
+    let mean = if t.draft_verif_steps > 0 {
+        1.0 + f64::from(t.draft_n_accepted) / f64::from(t.draft_verif_steps)
+    } else {
+        1.0
+    };
+    tracing::info!(
+        "draft acceptance = {ratio:0.5} ({:5} accepted / {:5} generated), mean len = {mean:5.2}",
+        t.draft_n_accepted,
+        t.draft_n,
     );
 }
 

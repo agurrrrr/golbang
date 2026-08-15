@@ -51,11 +51,12 @@ impl BatchBuilder {
         let mut plan = BatchPlan::default();
         let cap = self.n_batch;
 
-        // Decode pass — bounded by budget.decode_max so a prefill burst cannot
-        // push decode out of the iteration.
-        let mut decode_taken = 0usize;
+        // Decode pass — `decode_max` is a slot cap (P3 fairness), not a token
+        // cap. Counting drafts as tokens left n_parallel=1 units at ~10 t/s
+        // with `/metrics` draft=0 (P7).
+        let mut decode_slots = 0usize;
         for &id in order {
-            if plan.tokens.len() >= cap || decode_taken >= budget.decode_max {
+            if plan.tokens.len() >= cap || decode_slots >= budget.decode_max {
                 break;
             }
             let Some(slot) = slots.iter().find(|s| s.id == id) else {
@@ -77,9 +78,9 @@ impl BatchBuilder {
                 logits: true,
             });
             plan.logit_slots.push(id);
-            decode_taken += 1;
+            decode_slots += 1;
             for (k, &draft) in job.drafts.iter().enumerate() {
-                if plan.tokens.len() >= cap || decode_taken >= budget.decode_max {
+                if plan.tokens.len() >= cap {
                     break;
                 }
                 plan.tokens.push(BatchToken {
@@ -89,7 +90,6 @@ impl BatchBuilder {
                     logits: true,
                 });
                 plan.logit_slots.push(id);
-                decode_taken += 1;
             }
         }
 
@@ -265,5 +265,26 @@ mod tests {
         assert_eq!(pos, vec![10, 11, 12]);
         assert_eq!(plan.logit_slots, vec![SlotId(0), SlotId(0), SlotId(0)]);
         assert!(plan.tokens.iter().all(|t| t.logits));
+    }
+
+    /// Production Qwen uses n_parallel=1 → decode_max=1. Drafts must still
+    /// ride with that one slot or speculative verify never runs.
+    #[test]
+    fn decode_max_one_slot_keeps_all_drafts() {
+        let mut slot = Slot::new(SlotId(0));
+        slot.phase = SlotPhase::Decoding;
+        let mut job = crate::slot::ActiveJob::for_test(vec![]);
+        job.n_past = 4;
+        job.pending = Some(1);
+        job.drafts = vec![2, 3, 4];
+        slot.job = Some(job);
+        let budget = IterationBudget {
+            prefill_max: 32,
+            decode_max: 1,
+        };
+        let plan = BatchBuilder::new(16).plan(&[slot], &[SlotId(0)], budget);
+        let toks: Vec<i32> = plan.tokens.iter().map(|t| t.token).collect();
+        assert_eq!(toks, vec![1, 2, 3, 4]);
+        assert_eq!(plan.logit_slots.len(), 4);
     }
 }

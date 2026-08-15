@@ -42,6 +42,11 @@ pub struct SlotTimings {
     /// Generated tokens (sampled).
     pub predicted_n: u32,
     pub predicted_ms: f64,
+    /// Speculative drafts proposed / accepted this request (not the bonus).
+    pub draft_n: u32,
+    pub draft_n_accepted: u32,
+    /// Verify batches that consumed at least one draft (for mean accept len).
+    pub draft_verif_steps: u32,
 }
 
 impl SlotTimings {
@@ -114,6 +119,9 @@ pub(crate) struct ActiveJob {
     pub images: Vec<Vec<u8>>,
     /// `spec_begin` already ran for this job.
     pub spec_begun: bool,
+    pub draft_n: u32,
+    pub draft_n_accepted: u32,
+    pub draft_verif_steps: u32,
     /// Target/MTP snapshots taken before a speculative verify decode.
     pub spec_ckpt_tgt: Option<Vec<u8>>,
     pub spec_ckpt_mtp: Option<Vec<u8>>,
@@ -168,6 +176,9 @@ impl ActiveJob {
             generated: Vec::new(),
             images,
             spec_begun: false,
+            draft_n: 0,
+            draft_n_accepted: 0,
+            draft_verif_steps: 0,
             spec_ckpt_tgt: None,
             spec_ckpt_mtp: None,
             spec_ckpt_n_past: 0,
@@ -212,6 +223,9 @@ impl ActiveJob {
             prompt_ms,
             predicted_n: self.n_generated,
             predicted_ms,
+            draft_n: self.draft_n,
+            draft_n_accepted: self.draft_n_accepted,
+            draft_verif_steps: self.draft_verif_steps,
         }
     }
 
@@ -390,6 +404,7 @@ mod tests {
             prompt_ms: 2000.0,
             predicted_n: 50,
             predicted_ms: 5000.0,
+            ..SlotTimings::default()
         };
         assert!((t.prompt_per_token_ms() - 20.0).abs() < 1e-9);
         assert!((t.prompt_per_second() - 50.0).abs() < 1e-9);

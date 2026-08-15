@@ -19,10 +19,12 @@ pub struct WaitingJobView {
 
 /// Per-iteration token budget for the unified batch (P3 §4.2 chunked prefill).
 ///
-/// `decode_max` bounds how many decode tokens are admitted per iteration so a
-/// burst of prefill cannot starve already-running generation. `prefill_max`
-/// bounds how many prefill tokens one slot may consume per iteration, so a
-/// very long prompt is split across several iterations (chunked prefill).
+/// `decode_max` bounds how many **decoding slots** may run this iteration so a
+/// burst of prefill cannot starve already-running generation. Each admitted
+/// slot includes its pending token plus speculative drafts (those extra tokens
+/// must not count against `decode_max`, or `n_parallel=1` never verifies).
+/// `prefill_max` bounds how many prefill tokens one slot may consume per
+/// iteration, so a very long prompt is split across several iterations.
 ///
 /// [`Default`] is the P3 unit-test placeholder (32 / 16). Production must call
 /// [`IterationBudget::for_context`] so the chunk size matches llama.cpp

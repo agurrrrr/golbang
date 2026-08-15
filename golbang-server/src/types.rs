@@ -206,6 +206,14 @@ pub struct Timings {
     pub predicted_ms: f64,
     pub predicted_per_token_ms: f64,
     pub predicted_per_second: f64,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub draft_n: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub draft_n_accepted: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl From<golbang_core::SlotTimings> for Timings {
@@ -220,6 +228,8 @@ impl From<golbang_core::SlotTimings> for Timings {
             predicted_ms: t.predicted_ms,
             predicted_per_token_ms: t.predicted_per_token_ms(),
             predicted_per_second: t.predicted_per_second(),
+            draft_n: t.draft_n,
+            draft_n_accepted: t.draft_n_accepted,
         }
     }
 }
@@ -454,6 +464,8 @@ mod tests {
             predicted_ms: 2000.0,
             predicted_per_token_ms: 125.0,
             predicted_per_second: 8.0,
+            draft_n: 0,
+            draft_n_accepted: 0,
         };
         let v = serde_json::to_value(t).unwrap();
         for key in [
