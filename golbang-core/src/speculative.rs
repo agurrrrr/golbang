@@ -3,6 +3,11 @@
 //! Verification is: decode `[sampled, draft…]` on the target, then sample each
 //! row until a mismatch. The last sampled token (mismatch or bonus) is not yet
 //! in the KV and becomes the next pending token.
+//!
+//! `spec_draft` may write MTP KV at `n_past…` to score candidates. Those cells
+//! must be removed before the next `spec_process` — Qwen35 is M-RoPE and
+//! rejects `Y <= X`. llama-server does `seq_rm(ctx_dft, pos_max+1, -1)`
+//! immediately after `common_speculative_draft`.
 
 use crate::tokenizer::Token;
 

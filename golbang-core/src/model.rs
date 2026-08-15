@@ -8,7 +8,7 @@ use golbang_sys::*;
 
 use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
-use crate::speculative::{NgramMod, SpecParams, SpecType, topk_mode};
+use crate::speculative::{topk_mode, NgramMod, SpecParams, SpecType};
 use crate::tokenizer::{Token, Tokenizer};
 use crate::vision::Vision;
 
@@ -493,7 +493,11 @@ impl Model {
                 return 0;
             }
             let max = llama_memory_seq_pos_max(mem, seq_id);
-            if max < 0 { 0 } else { (max + 1) as u32 }
+            if max < 0 {
+                0
+            } else {
+                (max + 1) as u32
+            }
         }
     }
 
@@ -602,23 +606,17 @@ impl Model {
         Generate::start(self, prompt, params)
     }
 
-    pub fn spec_begin(&mut self, seq_id: i32, prompt: &[Token]) {
+    pub fn spec_begin(&mut self, _seq_id: i32, prompt: &[Token]) {
+        // llama.cpp `common_speculative_begin` only seeds ngram. Do not wipe
+        // `pending_h` — `spec_process` already filled it during prefill.
         if let Some(ng) = self.spec.ngram.as_mut() {
             ng.ingest(prompt);
         }
-        self.spec_reset_hidden(seq_id);
     }
 
     pub fn spec_reset_seq(&mut self, seq_id: i32) {
         self.spec_reset_hidden(seq_id);
-        if !self.ctx_mtp.is_null() {
-            unsafe {
-                let mem = llama_get_memory(self.ctx_mtp);
-                if !mem.is_null() {
-                    llama_memory_seq_rm(mem, seq_id, -1, -1);
-                }
-            }
-        }
+        self.spec_clear_mtp_kv(seq_id);
     }
 
     fn spec_reset_hidden(&mut self, seq_id: i32) {
@@ -634,6 +632,71 @@ impl Model {
         }
     }
 
+    fn spec_clear_mtp_kv(&mut self, seq_id: i32) {
+        if self.ctx_mtp.is_null() {
+            return;
+        }
+        unsafe {
+            let mem = llama_get_memory(self.ctx_mtp);
+            if !mem.is_null() {
+                llama_memory_seq_rm(mem, seq_id, -1, -1);
+            }
+        }
+    }
+
+    fn mtp_pos_max(&self, seq_id: i32) -> i32 {
+        if self.ctx_mtp.is_null() {
+            return -1;
+        }
+        unsafe {
+            let mem = llama_get_memory(self.ctx_mtp);
+            if mem.is_null() {
+                return -1;
+            }
+            llama_memory_seq_pos_max(mem, seq_id)
+        }
+    }
+
+    /// Drop MTP cells at `p0..` so the next process/draft can write those
+    /// positions. Qwen35 is M-RoPE: a leftover draft cell makes `X >= Y`
+    /// and `llama_decode` returns -1.
+    ///
+    /// llama-server does the same right after `common_speculative_draft`:
+    /// `llama_memory_seq_rm(ctx_dft, seq, ckpt.pos_max + 1, -1)`.
+    fn spec_rewind_mtp_kv(&mut self, seq_id: i32, p0: i32) {
+        let max = self.mtp_pos_max(seq_id);
+        if max < p0 {
+            return;
+        }
+        if self.spec_rm_from(seq_id, p0) && self.mtp_pos_max(seq_id) < p0 {
+            return;
+        }
+        tracing::warn!(
+            seq_id,
+            p0,
+            max,
+            "MTP draft KV rewind failed; clearing MTP seq"
+        );
+        self.spec_clear_mtp_kv(seq_id);
+    }
+
+    fn spec_prepare_process(&mut self, items: &[crate::batch::BatchToken]) {
+        let n_seq = self.spec.pending_h.len();
+        let mut first: Vec<Option<i32>> = vec![None; n_seq];
+        for it in items {
+            let sid = it.seq_id as usize;
+            if sid >= n_seq {
+                continue;
+            }
+            first[sid] = Some(first[sid].map_or(it.pos, |p| p.min(it.pos)));
+        }
+        for (sid, pos) in first.into_iter().enumerate() {
+            if let Some(p0) = pos {
+                self.spec_rewind_mtp_kv(sid as i32, p0);
+            }
+        }
+    }
+
     /// After a target decode of `items`, catch MTP up (qwen35 single-head path).
     pub fn spec_process(&mut self, items: &[crate::batch::BatchToken]) -> Result<()> {
         if self.ctx_mtp.is_null() || items.is_empty() {
@@ -642,6 +705,7 @@ impl Model {
         if items.iter().any(|it| it.token < 0) {
             return Ok(());
         }
+        self.spec_prepare_process(items);
         let n_embd = self.n_embd as usize;
         let n = items.len();
         let mut h_tgt = vec![0.0f32; n * n_embd];
@@ -788,6 +852,9 @@ impl Model {
             tok = id;
             pos += 1;
         }
+        // Draft cells are only used to pick token ids. The verify `process()`
+        // must rewrite those positions; leftover cells fail M-RoPE (X < Y).
+        self.spec_rewind_mtp_kv(seq_id, n_past);
         drafted
     }
 
