@@ -39,6 +39,8 @@ pub struct LoadParams {
     pub n_threads: i32,
     /// Recurrent-state snapshots per seq (`llama_context_params.n_rs_seq`).
     /// DSV4 cannot `seq_rm` a suffix without at least 1. 0 = library default.
+    /// MTP raises this to `--spec-draft-n-max` (llama `need_n_rs_seq`) so a
+    /// rejected draft can be `seq_rm`'d instead of copying ~150 MiB of state.
     pub n_rs_seq: u32,
     /// `true` → `LLAMA_LOAD_MODE_MMAP` (llama default). `false` is `--no-mmap`.
     pub use_mmap: bool,
@@ -79,6 +81,7 @@ pub struct Model {
     vocab: *const llama_vocab,
     n_vocab: i32,
     n_embd: i32,
+    n_rs_seq: u32,
     path: PathBuf,
     vision: Option<Vision>,
     spec: SpecRuntime,
@@ -136,6 +139,22 @@ impl Model {
             params.n_ubatch.max(1).min(n_batch)
         };
         let load_mtp = params.load_mtp || params.spec.wants_mtp();
+        // llama-server: cparams.n_rs_seq = speculative.need_n_rs_seq() == n_max
+        // when draft-mtp is on. n_rs_seq=1 cannot rewind a 3-token reject, so
+        // the scheduler copied ~150 MiB PARTIAL_ONLY state every verify step.
+        let n_rs_seq = if params.spec.wants_mtp() {
+            params.n_rs_seq.max(params.spec.n_max.max(0) as u32)
+        } else {
+            params.n_rs_seq
+        };
+        if n_rs_seq != params.n_rs_seq {
+            tracing::info!(
+                from = params.n_rs_seq,
+                to = n_rs_seq,
+                n_max = params.spec.n_max,
+                "n_rs_seq raised to spec n_max (llama need_n_rs_seq)"
+            );
+        }
         tracing::info!(
             path = %path.display(),
             n_ctx_seq,
@@ -146,7 +165,7 @@ impl Model {
             n_gpu_layers = params.n_gpu_layers,
             n_cpu_moe = params.n_cpu_moe,
             flash_attn = params.flash_attn,
-            n_rs_seq = params.n_rs_seq,
+            n_rs_seq,
             use_mmap = params.use_mmap,
             load_mtp,
             spec = ?params.spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
@@ -197,8 +216,8 @@ impl Model {
         cparams.n_ubatch = n_ubatch;
         cparams.n_seq_max = n_seq_max;
         cparams.flash_attn_type = params.flash_attn;
-        if params.n_rs_seq > 0 {
-            cparams.n_rs_seq = params.n_rs_seq;
+        if n_rs_seq > 0 {
+            cparams.n_rs_seq = n_rs_seq;
         }
         if params.n_threads > 0 {
             cparams.n_threads = params.n_threads;
@@ -307,6 +326,7 @@ impl Model {
             vocab,
             n_vocab,
             n_embd,
+            n_rs_seq,
             path: path.to_path_buf(),
             vision,
             spec,
@@ -327,6 +347,10 @@ impl Model {
 
     pub fn spec_n_max(&self) -> i32 {
         self.spec.params.n_max.max(0)
+    }
+
+    pub fn n_rs_seq(&self) -> u32 {
+        self.n_rs_seq
     }
 
     pub fn vision_enabled(&self) -> bool {

@@ -122,6 +122,11 @@ pub(crate) struct ActiveJob {
     pub draft_n: u32,
     pub draft_n_accepted: u32,
     pub draft_verif_steps: u32,
+    /// Host-side speculative overhead this request (microseconds).
+    pub spec_us_snapshot: u64,
+    pub spec_us_draft: u64,
+    pub spec_ckpt_tgt_bytes: usize,
+    pub spec_ckpt_mtp_bytes: usize,
     /// Target/MTP snapshots taken before a speculative verify decode.
     pub spec_ckpt_tgt: Option<Vec<u8>>,
     pub spec_ckpt_mtp: Option<Vec<u8>>,
@@ -179,6 +184,10 @@ impl ActiveJob {
             draft_n: 0,
             draft_n_accepted: 0,
             draft_verif_steps: 0,
+            spec_us_snapshot: 0,
+            spec_us_draft: 0,
+            spec_ckpt_tgt_bytes: 0,
+            spec_ckpt_mtp_bytes: 0,
             spec_ckpt_tgt: None,
             spec_ckpt_mtp: None,
             spec_ckpt_n_past: 0,

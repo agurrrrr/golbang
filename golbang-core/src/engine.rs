@@ -51,6 +51,10 @@ impl Engine {
         self.lock().spec_n_max()
     }
 
+    pub fn n_rs_seq(&self) -> u32 {
+        self.lock().n_rs_seq()
+    }
+
     pub fn vision_enabled(&self) -> bool {
         self.lock().vision_enabled()
     }

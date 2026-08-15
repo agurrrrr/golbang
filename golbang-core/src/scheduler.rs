@@ -603,8 +603,20 @@ fn snapshot_spec_slots(slots: &mut [Slot], engine: &Engine, plan: &crate::batch:
         }
         let seq = slot.id.0 as i32;
         job.spec_ckpt_n_past = job.n_past;
+        // llama-server sets n_rs_seq = spec n_max, then skips the PARTIAL_ONLY
+        // copy when draft.len() <= n_rs_seq (seq_rm can rewind the reject).
+        // A 150 MiB snapshot every step was the remaining P7 gap.
+        if (job.drafts.len() as u32) <= engine.n_rs_seq() {
+            job.spec_ckpt_tgt = None;
+            job.spec_ckpt_mtp = None;
+            continue;
+        }
+        let t0 = Instant::now();
         job.spec_ckpt_tgt = engine.seq_state_get(seq);
-        job.spec_ckpt_mtp = engine.spec_state_get(seq);
+        job.spec_ckpt_mtp = None;
+        job.spec_us_snapshot += t0.elapsed().as_micros() as u64;
+        job.spec_ckpt_tgt_bytes = job.spec_ckpt_tgt.as_ref().map(|b| b.len()).unwrap_or(0);
+        job.spec_ckpt_mtp_bytes = 0;
     }
 }
 
@@ -897,7 +909,9 @@ fn maybe_fill_drafts(slot: &mut Slot, engine: &Engine, n_ctx_seq: u32) {
     if n_max <= 0 {
         return;
     }
+    let t0 = Instant::now();
     job.drafts = engine.spec_draft(seq, &hist, id_last, job.n_past as i32, n_max);
+    job.spec_us_draft += t0.elapsed().as_micros() as u64;
 }
 
 fn evict_cancelled(slots: &mut [Slot], engine: &Engine, iter: u64, metrics: &SchedulerMetrics) {
@@ -972,6 +986,17 @@ fn finish_slot(
         record_request_totals(metrics, &timings);
         log_slot_timings(id.0, job.request_id, reason.as_str(), &timings);
         log_draft_acceptance(&timings);
+        if job.spec_us_snapshot > 0 || job.spec_us_draft > 0 {
+            tracing::info!(
+                slot = id.0,
+                request_id = job.request_id,
+                snapshot_ms = job.spec_us_snapshot as f64 / 1e3,
+                draft_ms = job.spec_us_draft as f64 / 1e3,
+                ckpt_tgt_kib = job.spec_ckpt_tgt_bytes / 1024,
+                ckpt_mtp_kib = job.spec_ckpt_mtp_bytes / 1024,
+                "spec host overhead"
+            );
+        }
         let ev = match reason {
             FinishReason::Cancelled => SlotEvent::Failed(Error::Cancelled),
             FinishReason::Timeout => SlotEvent::Failed(Error::Timeout),
