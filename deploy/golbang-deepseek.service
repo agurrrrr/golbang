@@ -11,7 +11,7 @@ WorkingDirectory=/home/agurrrrr/code/golbang
 Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
 Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
-Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp/build/bin
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-upgrade/build/bin
 Environment=RUST_LOG=info
 # n-ubatch=1024: llama-server uses -b/-ub 5800, but this llama.cpp SHA needs ~5 GiB
 # compute at ubatch=5800 and OOMs next to 60k KV on 32 GiB. n-batch stays 5800.

@@ -1,7 +1,7 @@
 //! Prefix cache: reuse KV of a common prompt prefix across slots.
 //!
 //! P3 §4.0 spike confirmed `llama_memory_seq_cp` / `llama_memory_seq_keep` /
-//! `llama_memory_seq_rm` are bound (llama.cpp SHA `5b474eb69`). We use the
+//! `llama_memory_seq_rm` are bound (llama.cpp SHA `3ac5658c7`). We use the
 //! **slot-local reuse** path: each slot keeps the KV of its own prefix so a
 //! re-bound job that shares the same prefix does not re-prefill it.
 //!

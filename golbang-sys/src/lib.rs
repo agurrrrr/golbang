@@ -1,8 +1,8 @@
 //! Low-level FFI for the SHA-pinned `llama.h` (P0).
 //!
 //! Safe wrappers live in `golbang-core` (P1). This crate only exposes the C ABI
-//! generated from `/home/agurrrrr/code/local-llm/llama.cpp` @
-//! `5b474eb69dac2d7c26ba8855310d3b60e02a5c4f`.
+//! generated from `/home/agurrrrr/code/local-llm/llama.cpp-upgrade` @
+//! `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 //!
 //! Current names: [`llama_model_load_from_file`], [`llama_init_from_model`],
 //! [`llama_model_free`]. The older `llama_load_model_from_file` /
@@ -51,6 +51,6 @@ mod api_names {
         let _get_h = golbang_llama_get_embeddings_nextn;
         let _mtmd = mtmd_init_from_file;
         let _bmp = mtmd_helper_bitmap_init_from_buf;
-        assert_eq!(LLAMA_CPP_SHA, "5b474eb69dac2d7c26ba8855310d3b60e02a5c4f");
+        assert_eq!(LLAMA_CPP_SHA, "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee");
     }
 }

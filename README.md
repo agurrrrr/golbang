@@ -55,12 +55,12 @@ golbang이 차별화되는 지점은:
 
 ## 빌드
 
-P0(`golbang-sys`)는 llama.cpp **SHA `5b474eb69`** 의 `llama.h`를 bindgen하고, 같은 SHA로 빌드된 gfx906 `.so`를 링크한다.
+P0(`golbang-sys`)는 llama.cpp **SHA `3ac5658c7`** (`llama.cpp-upgrade`, `llama.h` 1629줄) 를 bindgen하고, 같은 SHA로 빌드된 gfx906 `.so`를 링크한다.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-# 기본값. 다른 트리를 가리키지 말 것 (llama.cpp.new / furnace / prefetch 는 HEAD가 다름).
-export GOLBANG_LLAMA_DIR=/home/agurrrrr/code/local-llm/llama.cpp
+# 기본값. 생산 핀 트리(llama.cpp) / .new / furnace / prefetch 는 HEAD가 다름.
+export GOLBANG_LLAMA_DIR=/home/agurrrrr/code/local-llm/llama.cpp-upgrade
 # 소형 GGUF. 추론 테스트에 필요.
 export GOLBANG_TEST_MODEL=/home/agurrrrr/code/local-llm/models/Qwen3-0.6B-Q4_K_M.gguf
 

@@ -1,17 +1,19 @@
-//! P0 link path (A): bindgen the SHA-pinned `llama.h`, link the existing gfx906 `.so`.
+//! SHA-pinned `llama.h` bindgen + matching gfx906 `.so`.
 //!
-//! Do not point bindgen at a live header from a different tree (llama.cpp.new / furnace / prefetch).
-//! SHA or `.so` drift is a hard error — switch to (B) cmake rebuild in P3.
+//! Pin is the `llama.cpp-upgrade` worktree (`origin/master` + DPP / MMQ I=64 /
+//! GCN repack). Do not point bindgen at a live header from a sibling tree
+//! (`llama.cpp` production, `.new`, `-furnace`, `-prefetch`).
+//! SHA or `.so` drift is a hard error — rebuild that tree, then bump this pin.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// docs/work-orders/P0-ffi-binding.md §4.0
-const EXPECTED_SHA: &str = "5b474eb69dac2d7c26ba8855310d3b60e02a5c4f";
-const DEFAULT_LLAMA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp";
-const EXPECTED_LLAMA_H_LINES: usize = 1611;
+/// wiki `llama-cpp-upgrade-notes` — 2026-08-15 rebuild
+const EXPECTED_SHA: &str = "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee";
+const DEFAULT_LLAMA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-upgrade";
+const EXPECTED_LLAMA_H_LINES: usize = 1629;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
     ("include/llama.h", "llama.h"),
@@ -45,10 +47,9 @@ fn main() {
     if head != EXPECTED_SHA {
         panic!(
             "llama.cpp HEAD is {head}, expected {EXPECTED_SHA}. \
-             P0 is pinned to that SHA + its .so (link path A). \
-             SHA/.so drift: abandon (A) and switch to (B) cmake rebuild in P3. \
-             Do not mix a live header with the old .so. \
-             Sibling trees (llama.cpp.new / -furnace / -prefetch) are different HEADs."
+             Pin is that SHA + its gfx906 .so under llama.cpp-upgrade. \
+             Do not mix a live header with a different .so. \
+             Sibling trees (llama.cpp / .new / -furnace / -prefetch) are different HEADs."
         );
     }
 
@@ -70,7 +71,7 @@ fn main() {
     }
 
     println!(
-        "cargo:warning=P0 link (A): llama.cpp {EXPECTED_SHA}, hip={}, llama={}",
+        "cargo:warning=P0 link: llama.cpp {EXPECTED_SHA}, hip={}, llama={}",
         hip_so.display(),
         llama_so.display()
     );

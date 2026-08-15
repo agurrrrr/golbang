@@ -15,7 +15,7 @@
 **목표:** gfx906에서 Rust가 `llama.h`를 통해 모델을 로드하고 토큰 1개를 디코딩한다.
 **목적:** 연결 검증. 속도 하한 없음.
 
-- [x] 링크 대상 SHA 고정: `5b474eb69` / `llama.h` 1611줄 / 빌드 2026-08-06 19:01
+- [x] 링크 대상 SHA 고정: `3ac5658c7` / `llama.h` 1629줄 / `llama.cpp-upgrade` (2026-08-15, origin/master `9d57ce456` + DPP + MMQ I=64 + GCN repack). 이전 핀은 `5b474eb69` / 1611줄 / 2026-08-06 19:01.
 - [x] `golbang-sys/build.rs`: 그 SHA의 `llama.h`를 bindgen
 - [x] (A) 기존 `.so` 링크 (`libllama`, `libggml-hip`, ROCm 런타임)
 - [x] 현행 API: `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`
