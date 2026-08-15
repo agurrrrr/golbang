@@ -1,0 +1,126 @@
+{
+  "label": "llama-post6",
+  "when": "2026-08-15T04:34:15.375402+00:00",
+  "base": "http://127.0.0.1:8083",
+  "gpu_before": {
+    "edge": "45.0",
+    "junction": "49.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "39.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "45.0",
+        "junction": "49.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "39.0"
+      },
+      "gpu_after": {
+        "edge": "45.0",
+        "junction": "49.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "39.0"
+      },
+      "metrics_delta": {},
+      "ok": false,
+      "http": 503,
+      "wall_s": 0.0005963690346106887,
+      "finish_reason": null,
+      "prompt_n": null,
+      "predicted_n": null,
+      "cache_n": null,
+      "prompt_ms": null,
+      "predicted_ms": null,
+      "prompt_per_second": null,
+      "predicted_per_second": null,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": null,
+      "reasoning_n": null,
+      "content": null,
+      "reasoning": null,
+      "error": "{\"error\":{\"message\":\"Loading model\",\"type\":\"unavailable_error\",\"code\":503}}"
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "44.0",
+        "junction": "45.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "48.0",
+        "junction": "53.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 5.116756700095721,
+      "finish_reason": "length",
+      "prompt_n": 75,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 1425.037,
+      "predicted_ms": 3685.821,
+      "prompt_per_second": 52.630212408519924,
+      "predicted_per_second": 22.518727849236303,
+      "draft_n": 39,
+      "draft_n_accepted": 39,
+      "content_n": 0,
+      "reasoning_n": 436,
+      "content": "",
+      "reasoning": "We need to answer user: \"In one short paragraph, explain what speculative decoding is and why it can raise tokens per second on a single GPU.\" Need one short paragraph. Need final only. Need be accurate. Speculative decoding: small draft model proposes multiple tokens, large target model verifies in parallel using one forward pass (or batched positions), accepts prefix that matches, rejects/resamples at first mismatch. Raises tokens",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "44.0",
+        "junction": "46.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "gpu_after": {
+        "edge": "52.0",
+        "junction": "56.0",
+        "sclk": "sclk clock level: 0: (925Mhz)",
+        "power_w": "23.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 10.461469596019015,
+      "finish_reason": "length",
+      "prompt_n": 42,
+      "predicted_n": 200,
+      "cache_n": 42,
+      "prompt_ms": 586.113,
+      "predicted_ms": 9775.839,
+      "prompt_per_second": 71.65853683504716,
+      "predicted_per_second": 20.356309059508856,
+      "draft_n": 153,
+      "draft_n_accepted": 88,
+      "content_n": 0,
+      "reasoning_n": 941,
+      "content": "",
+      "reasoning": "We need answer user's request: \"Write a detailed technical paragraph (about 180 words) on how flash attention reduces HBM traffic during transformer decode. Do not use a bullet list.\"\n\nNeed produce final only paragraph, about 180 words. Need ensure no bullet list. Need count words approx 180. Let's draft and count.\n\nDraft:\n\"During transformer decode, each new token attends to all previous keys and values, so the attention computation repeatedly reads the growing KV cache from high-bandwidth memory. Flash attention reduces this HBM traffic by keeping the attention computation in fast on-chip SRAM and processing the sequence in tiles. Instead of materializing the full N×N attention matrix in HBM, it loads small blocks of queries, keys, and values, computes partial attention scores, applies online softmax rescaling, and accumulates outputs. For decode, the query tile is tiny, often one token, while key and value tiles are streamed",
+      "error": null
+    }
+  ],
+  "metrics_before": {},
+  "gpu_after": {
+    "edge": "51.0",
+    "junction": "53.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "23.0"
+  },
+  "metrics_after": {}
+}

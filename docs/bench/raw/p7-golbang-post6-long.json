@@ -1,0 +1,26 @@
+{
+  "id": "long1024",
+  "ok": true,
+  "wall_s": 54.028438700013794,
+  "gpu_before": {
+    "junction": "41.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "23.0"
+  },
+  "gpu_after": {
+    "junction": "69.0",
+    "sclk": "sclk clock level: 0: (925Mhz)",
+    "power_w": "26.0"
+  },
+  "metrics_delta": {
+    "draft_tokens_total": 358,
+    "draft_accepted_total": 349
+  },
+  "prompt_n": 88,
+  "predicted_n": 1024,
+  "predicted_per_second": 19.29595118107045,
+  "predicted_ms": 53068.127629,
+  "draft_n": 358,
+  "draft_n_accepted": 349,
+  "cache_n": 0
+}
