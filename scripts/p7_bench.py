@@ -40,6 +40,15 @@ PROMPTS = [
             "Do not use a bullet list."
         ),
     },
+    {
+        "id": "long1024",
+        "max_tokens": 1024,
+        "content": (
+            "Write a long technical essay (at least 800 words) on speculative "
+            "decoding, flash attention, and KV-cache traffic on a single GPU. "
+            "Use only paragraphs, no bullet lists."
+        ),
+    },
 ]
 
 
@@ -156,7 +165,16 @@ def main() -> None:
     ap.add_argument("--label", required=True, help="e.g. llama-pre, golbang-pre")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--sleep", type=float, default=8.0, help="cool-down between cases")
+    ap.add_argument(
+        "--only",
+        default="",
+        help="comma-separated case ids (default: all). e.g. para84,long1024",
+    )
     args = ap.parse_args()
+    wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+    cases = [c for c in PROMPTS if not wanted or c["id"] in wanted]
+    if not cases:
+        raise SystemExit(f"no cases match --only {args.only!r}")
 
     report = {
         "label": args.label,
@@ -168,7 +186,7 @@ def main() -> None:
     drafts0 = parse_golbang_drafts(metrics_text(args.base))
     report["metrics_before"] = drafts0
 
-    for i, case in enumerate(PROMPTS):
+    for i, case in enumerate(cases):
         if i:
             time.sleep(args.sleep)
         gpu0 = rocm_snapshot()
