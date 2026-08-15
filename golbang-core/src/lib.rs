@@ -27,7 +27,7 @@ pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
 pub use model::{LoadParams, Model};
 pub use policy::{FifoPolicy, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
-pub use prefix_cache::{PrefixStore, SlotPrefixCache, common_prefix_len};
+pub use prefix_cache::{PrefixStore, SlotPrefixCache, VisionChunk, VisionSeq, common_prefix_len};
 pub use reasoning::{
     ReasoningDelta, ReasoningFormat, ReasoningParser, ThinkBudget, prompt_opens_think,
 };

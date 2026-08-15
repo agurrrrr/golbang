@@ -7,6 +7,7 @@ use crate::batch::BatchToken;
 use crate::error::Result;
 use crate::model::Model;
 use crate::tokenizer::Token;
+use crate::vision::TokenizedVision;
 
 pub struct Engine {
     model: Mutex<Model>,
@@ -183,5 +184,20 @@ impl Engine {
 
     pub fn vision_eval(&self, seq_id: i32, prompt: &str, images: &[Vec<u8>]) -> Result<u32> {
         self.lock().vision_eval(seq_id, prompt, images)
+    }
+
+    pub fn vision_tokenize(&self, prompt: &str, images: &[Vec<u8>]) -> Result<TokenizedVision> {
+        self.lock().vision_tokenize(prompt, images)
+    }
+
+    pub fn vision_eval_from(
+        &self,
+        seq_id: i32,
+        tok: &TokenizedVision,
+        skip_tokens: usize,
+        n_past: u32,
+    ) -> Result<u32> {
+        self.lock()
+            .vision_eval_from(seq_id, tok, skip_tokens, n_past)
     }
 }

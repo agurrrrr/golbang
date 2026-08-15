@@ -1,19 +1,37 @@
 //! `--mmproj` / libmtmd wrapper. Images are raw file bytes (jpeg/png/…);
 //! `mtmd_helper_bitmap_init_from_buf` decodes them.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
 
 use golbang_sys::*;
 
 use crate::error::{Error, Result};
+use crate::prefix_cache::{VisionChunk, VisionSeq};
+use crate::tokenizer::Token;
 
 /// Same default as `mtmd_default_marker()`. Insert this where an image was.
 pub const MEDIA_MARKER: &str = "<__media__>";
 
 pub struct Vision {
     ctx: *mut mtmd_context,
+}
+
+/// Owned `mtmd_tokenize` output. Chunks stay alive until eval (or drop).
+pub struct TokenizedVision {
+    pub seq: VisionSeq,
+    chunks: *mut mtmd_input_chunks,
+}
+
+impl Drop for TokenizedVision {
+    fn drop(&mut self) {
+        if !self.chunks.is_null() {
+            unsafe { mtmd_input_chunks_free(self.chunks) };
+            self.chunks = ptr::null_mut();
+        }
+    }
 }
 
 unsafe impl Send for Vision {}
@@ -70,6 +88,12 @@ impl Vision {
         seq_id: i32,
         n_batch: i32,
     ) -> Result<u32> {
+        let tok = self.tokenize(prompt, images)?;
+        self.eval_from(lctx, &tok, seq_id, n_batch, 0, 0)
+    }
+
+    /// Tokenize only. CLIP encode happens later in [`Self::eval_from`].
+    pub fn tokenize(&mut self, prompt: &str, images: &[Vec<u8>]) -> Result<TokenizedVision> {
         if images.is_empty() {
             return Err(Error::Vision("eval_prompt called with no images".into()));
         }
@@ -133,34 +157,69 @@ impl Vision {
             )));
         }
 
-        let n_tok = unsafe { mtmd_helper_get_n_tokens(chunks) };
-        let mut n_past: llama_pos = 0;
-        let rc = unsafe {
-            mtmd_helper_eval_chunks(
-                self.ctx,
-                lctx,
-                chunks,
-                0,
-                seq_id,
-                n_batch.max(1),
-                true,
-                &mut n_past,
-            )
-        };
-        unsafe { mtmd_input_chunks_free(chunks) };
-        if rc != 0 {
-            return Err(Error::Vision(format!(
-                "mtmd_helper_eval_chunks returned {rc}"
-            )));
+        let seq = flatten_chunks(chunks)?;
+        Ok(TokenizedVision { seq, chunks })
+    }
+
+    /// Eval chunks starting at `skip_tokens` / `n_past`. Cached prefix
+    /// (including same-hash images) is not CLIP-encoded again.
+    pub fn eval_from(
+        &mut self,
+        lctx: *mut llama_context,
+        tok: &TokenizedVision,
+        seq_id: i32,
+        n_batch: i32,
+        skip_tokens: usize,
+        n_past: u32,
+    ) -> Result<u32> {
+        let n_batch = n_batch.max(1);
+        let n_chunks = unsafe { mtmd_input_chunks_size(tok.chunks) };
+        let mut tok_i = 0usize;
+        let mut pos: llama_pos = n_past as llama_pos;
+        let mut eval_chunks = 0u32;
+
+        for ci in 0..n_chunks {
+            let chunk = unsafe { mtmd_input_chunks_get(tok.chunks, ci) };
+            if chunk.is_null() {
+                return Err(Error::Null("mtmd_input_chunks_get"));
+            }
+            let n_tok = unsafe { mtmd_input_chunk_get_n_tokens(chunk) };
+            let logits_last = ci + 1 == n_chunks;
+            if tok_i.saturating_add(n_tok) <= skip_tokens {
+                tok_i += n_tok;
+                continue;
+            }
+            if tok_i < skip_tokens {
+                let skip = skip_tokens - tok_i;
+                eval_partial_chunk(lctx, chunk, seq_id, n_batch, skip, logits_last, &mut pos)?;
+            } else {
+                eval_full_chunk(
+                    self.ctx,
+                    lctx,
+                    chunk,
+                    seq_id,
+                    n_batch,
+                    logits_last,
+                    &mut pos,
+                )?;
+            }
+            eval_chunks += 1;
+            tok_i += n_tok;
         }
+
+        let n_past_out = pos.max(0) as u32;
         tracing::info!(
             seq = seq_id,
-            n_tokens = n_tok,
-            n_past,
-            n_images = images.len(),
+            n_tokens = tok.seq.n_tokens(),
+            n_pos = tok.seq.n_pos(),
+            skip_tokens,
+            reuse_pos = n_past,
+            n_past = n_past_out,
+            n_images = tok.seq.images.len(),
+            eval_chunks,
             "vision prompt evaluated"
         );
-        Ok(n_past.max(0) as u32)
+        Ok(n_past_out)
     }
 
     fn free_bitmaps(&self, bitmaps: &[*mut mtmd_bitmap]) {
@@ -170,6 +229,176 @@ impl Vision {
             }
         }
     }
+}
+
+fn flatten_chunks(chunks: *mut mtmd_input_chunks) -> Result<VisionSeq> {
+    let n = unsafe { mtmd_input_chunks_size(chunks) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let chunk = unsafe { mtmd_input_chunks_get(chunks, i) };
+        if chunk.is_null() {
+            return Err(Error::Null("mtmd_input_chunks_get"));
+        }
+        let typ = unsafe { mtmd_input_chunk_get_type(chunk) };
+        if typ == MTMD_INPUT_CHUNK_TYPE_TEXT {
+            let mut n_tok = 0usize;
+            let ptr = unsafe { mtmd_input_chunk_get_tokens_text(chunk, &mut n_tok) };
+            if n_tok > 0 && ptr.is_null() {
+                return Err(Error::Null("mtmd_input_chunk_get_tokens_text"));
+            }
+            let toks = if n_tok == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(ptr, n_tok) }.to_vec()
+            };
+            out.push(VisionChunk::Text(toks));
+        } else {
+            let n_tokens = unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as u32;
+            let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) }.max(0) as u32;
+            out.push(VisionChunk::Media {
+                id: cstr_id(unsafe { mtmd_input_chunk_get_id(chunk) }),
+                n_tokens,
+                n_pos,
+            });
+        }
+    }
+    Ok(VisionSeq::from_chunks(out))
+}
+
+fn cstr_id(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+fn eval_full_chunk(
+    ctx: *mut mtmd_context,
+    lctx: *mut llama_context,
+    chunk: *const mtmd_input_chunk,
+    seq_id: i32,
+    n_batch: i32,
+    logits_last: bool,
+    n_past: &mut llama_pos,
+) -> Result<()> {
+    let typ = unsafe { mtmd_input_chunk_get_type(chunk) };
+    if typ == MTMD_INPUT_CHUNK_TYPE_TEXT {
+        let mut n_tok = 0usize;
+        let ptr = unsafe { mtmd_input_chunk_get_tokens_text(chunk, &mut n_tok) };
+        let toks = if n_tok == 0 {
+            &[][..]
+        } else {
+            if ptr.is_null() {
+                return Err(Error::Null("mtmd_input_chunk_get_tokens_text"));
+            }
+            unsafe { std::slice::from_raw_parts(ptr, n_tok) }
+        };
+        eval_text_tokens(lctx, toks, seq_id, n_batch, n_past, logits_last)
+    } else {
+        let rc = unsafe {
+            mtmd_helper_eval_chunk_single(
+                ctx,
+                lctx,
+                chunk,
+                *n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                n_past,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Vision(format!(
+                "mtmd_helper_eval_chunk_single returned {rc}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn eval_partial_chunk(
+    lctx: *mut llama_context,
+    chunk: *const mtmd_input_chunk,
+    seq_id: i32,
+    n_batch: i32,
+    skip: usize,
+    logits_last: bool,
+    n_past: &mut llama_pos,
+) -> Result<()> {
+    let typ = unsafe { mtmd_input_chunk_get_type(chunk) };
+    if typ != MTMD_INPUT_CHUNK_TYPE_TEXT {
+        return Err(Error::Vision(
+            "vision prefix reuse landed mid-image; refusing to split media chunk".into(),
+        ));
+    }
+    let mut n_tok = 0usize;
+    let ptr = unsafe { mtmd_input_chunk_get_tokens_text(chunk, &mut n_tok) };
+    if skip > n_tok {
+        return Err(Error::Vision(format!(
+            "vision text skip {skip} > chunk {n_tok}"
+        )));
+    }
+    let toks = if n_tok == 0 {
+        &[][..]
+    } else {
+        if ptr.is_null() {
+            return Err(Error::Null("mtmd_input_chunk_get_tokens_text"));
+        }
+        unsafe { std::slice::from_raw_parts(ptr, n_tok) }
+    };
+    eval_text_tokens(lctx, &toks[skip..], seq_id, n_batch, n_past, logits_last)
+}
+
+fn eval_text_tokens(
+    lctx: *mut llama_context,
+    tokens: &[Token],
+    seq_id: i32,
+    n_batch: i32,
+    n_past: &mut llama_pos,
+    logits_last: bool,
+) -> Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let n_batch = n_batch.max(1) as usize;
+    let mut batch = unsafe { llama_batch_init(n_batch as i32, 0, 1) };
+    if batch.token.is_null() || batch.pos.is_null() || batch.seq_id.is_null() {
+        unsafe { llama_batch_free(batch) };
+        return Err(Error::Null("llama_batch_init vision text"));
+    }
+    let mut i = 0;
+    while i < tokens.len() {
+        let take = (tokens.len() - i).min(n_batch);
+        for j in 0..take {
+            unsafe {
+                *batch.token.add(j) = tokens[i + j];
+                *batch.pos.add(j) = *n_past;
+                *batch.n_seq_id.add(j) = 1;
+                let seqs = *batch.seq_id.add(j);
+                if seqs.is_null() {
+                    llama_batch_free(batch);
+                    return Err(Error::Null("llama_batch.seq_id vision text"));
+                }
+                *seqs.add(0) = seq_id;
+                *batch.logits.add(j) = 0;
+            }
+            *n_past += 1;
+        }
+        batch.n_tokens = take as i32;
+        i += take;
+        if logits_last && i == tokens.len() {
+            unsafe {
+                *batch.logits.add(take - 1) = 1;
+            }
+        }
+        let rc = unsafe { llama_decode(lctx, batch) };
+        if rc != 0 {
+            unsafe { llama_batch_free(batch) };
+            return Err(Error::Vision(format!("vision text decode {rc}")));
+        }
+    }
+    unsafe { llama_batch_free(batch) };
+    Ok(())
 }
 
 impl Drop for Vision {

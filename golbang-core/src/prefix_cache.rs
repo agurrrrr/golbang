@@ -10,6 +10,10 @@
 //! previous assistant turn, or a mid-prefill prefix after a client drop.
 //! A global cross-slot store is still NOT implemented — `PrefixStore` stays
 //! inactive; no `llama_memory_seq_cp` between slots.
+//!
+//! Vision (Qwen3.8 `--mmproj`): `VisionSeq` is llama-server `server_tokens`
+//! for one slot. Image cells compare FNV chunk ids, not vocab tokens. M-RoPE
+//! uses `n_pos != n_tokens`; `pos_next` is what `seq_rm` / `n_past` need.
 
 use std::collections::HashMap;
 
@@ -25,6 +29,181 @@ pub fn common_prefix_len(a: &[Token], b: &[Token]) -> usize {
     i
 }
 
+/// One mtmd chunk after `mtmd_tokenize`. Image/audio ids are FNV hashes
+/// from `mtmd_helper_bitmap_init_from_buf`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisionChunk {
+    Text(Vec<Token>),
+    Media {
+        id: String,
+        n_tokens: u32,
+        n_pos: u32,
+    },
+}
+
+/// One image/audio span in a flattened vision prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisionImageSpan {
+    pub start: usize,
+    pub id: String,
+    pub n_tokens: u32,
+    pub n_pos: u32,
+}
+
+/// Flattened text tokens + media spans. Image cells use token id 0; LCP
+/// compares span ids, not those placeholders. Qwen3.8 M-RoPE: `n_pos`
+/// for an image is `max(nx, ny)`, smaller than `n_tokens`.
+#[derive(Clone, Debug, Default)]
+pub struct VisionSeq {
+    pub tokens: Vec<Token>,
+    pub images: Vec<VisionImageSpan>,
+}
+
+impl VisionSeq {
+    pub fn from_chunks(chunks: impl IntoIterator<Item = VisionChunk>) -> Self {
+        let mut seq = Self::default();
+        for chunk in chunks {
+            match chunk {
+                VisionChunk::Text(toks) => seq.tokens.extend(toks),
+                VisionChunk::Media {
+                    id,
+                    n_tokens,
+                    n_pos,
+                } => {
+                    let start = seq.tokens.len();
+                    seq.tokens
+                        .extend(std::iter::repeat(0).take(n_tokens as usize));
+                    seq.images.push(VisionImageSpan {
+                        start,
+                        id,
+                        n_tokens,
+                        n_pos,
+                    });
+                }
+            }
+        }
+        seq
+    }
+
+    pub fn n_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn n_pos(&self) -> u32 {
+        self.pos_next(self.tokens.len())
+    }
+
+    pub fn image_at(&self, idx: usize) -> Option<&VisionImageSpan> {
+        self.images.iter().find(|im| im.start == idx)
+    }
+
+    pub fn image_covering(&self, idx: usize) -> Option<&VisionImageSpan> {
+        self.images
+            .iter()
+            .find(|im| idx >= im.start && idx < im.start.saturating_add(im.n_tokens as usize))
+    }
+
+    /// Position after the first `n_tokens` cells (M-RoPE-aware).
+    pub fn pos_next(&self, n_tokens: usize) -> u32 {
+        let n = n_tokens.min(self.tokens.len());
+        let mut idx = 0;
+        let mut pos = 0u32;
+        while idx < n {
+            if let Some(img) = self.image_at(idx) {
+                pos = pos.saturating_add(img.n_pos);
+                idx = idx.saturating_add(img.n_tokens as usize);
+            } else {
+                pos = pos.saturating_add(1);
+                idx += 1;
+            }
+        }
+        pos
+    }
+
+    /// Token index whose position is `max_pos` (llama-server `size_up_to_pos`).
+    pub fn size_up_to_pos(&self, max_pos: u32) -> usize {
+        let mut idx = 0;
+        let mut pos = 0u32;
+        while idx < self.tokens.len() && pos < max_pos {
+            if let Some(img) = self.image_at(idx) {
+                pos = pos.saturating_add(img.n_pos);
+                idx = idx.saturating_add(img.n_tokens as usize);
+            } else {
+                pos = pos.saturating_add(1);
+                idx += 1;
+            }
+        }
+        idx
+    }
+
+    /// llama-server `get_common_prefix` with media: whole image or none.
+    pub fn common_prefix(&self, other: &Self) -> usize {
+        let max = self.tokens.len().min(other.tokens.len());
+        let mut i = 0;
+        while i < max {
+            match (self.image_at(i), other.image_at(i)) {
+                (Some(a), Some(b)) => {
+                    if !a.id.is_empty() && a.id == b.id && a.n_tokens == b.n_tokens {
+                        i = i.saturating_add(a.n_tokens as usize);
+                        continue;
+                    }
+                    return i;
+                }
+                (None, None) => {
+                    if self.tokens[i] != other.tokens[i] {
+                        return i;
+                    }
+                    i += 1;
+                }
+                _ => return i,
+            }
+        }
+        max
+    }
+
+    /// Bind-time reuse in **token cells**. Leaves one cell for logits and
+    /// never splits an image. 0 → caller `clear_seq`.
+    pub fn reuse_for_bind(&self, prompt: &Self, gpu_n_past: u32) -> usize {
+        if prompt.tokens.is_empty() {
+            return 0;
+        }
+        let mut n = self.common_prefix(prompt);
+        n = n.min(prompt.tokens.len() - 1);
+        if let Some(img) = prompt.image_covering(n) {
+            n = img.start;
+        }
+        if n == 0 || gpu_n_past < prompt.pos_next(n) {
+            return 0;
+        }
+        n
+    }
+
+    pub fn append_generated(&mut self, generated: &[Token]) {
+        self.tokens.extend_from_slice(generated);
+    }
+
+    /// Drop cells whose position is at or past `n_pos` (cancel mid-decode).
+    /// A partial image at the cut is dropped whole.
+    pub fn truncate_to_pos(&mut self, n_pos: u32) {
+        let mut idx = 0;
+        let mut pos = 0u32;
+        while idx < self.tokens.len() && pos < n_pos {
+            if let Some(img) = self.image_at(idx) {
+                if pos.saturating_add(img.n_pos) > n_pos {
+                    break;
+                }
+                pos = pos.saturating_add(img.n_pos);
+                idx = idx.saturating_add(img.n_tokens as usize);
+            } else {
+                pos = pos.saturating_add(1);
+                idx += 1;
+            }
+        }
+        self.tokens.truncate(idx);
+        self.images.retain(|im| im.start < idx);
+    }
+}
+
 /// Per-slot cache of the last bound prompt's prefix KV.
 ///
 /// `tokens` is the prefix whose KV is already resident in the slot's seq.
@@ -34,6 +213,9 @@ pub fn common_prefix_len(a: &[Token], b: &[Token]) -> usize {
 pub struct SlotPrefixCache {
     pub tokens: Vec<Token>,
     pub prefix_len: usize,
+    /// Last vision prompt (+ generated text cells). `None` after a text bind
+    /// or a full reset. Next `--mmproj` bind LCPs against this, not `tokens`.
+    pub vision: Option<VisionSeq>,
 }
 
 impl SlotPrefixCache {
@@ -60,6 +242,15 @@ impl SlotPrefixCache {
     pub fn reset(&mut self) {
         self.tokens.clear();
         self.prefix_len = 0;
+        self.vision = None;
+    }
+
+    pub fn remember_vision(&mut self, mut seq: VisionSeq, generated: &[Token], n_pos: u32) {
+        seq.append_generated(generated);
+        seq.truncate_to_pos(n_pos);
+        self.prefix_len = seq.n_tokens();
+        self.vision = Some(seq);
+        self.tokens.clear();
     }
 
     /// After a successful Stop/Length, record the tokens whose KV is actually
@@ -211,5 +402,116 @@ mod tests {
         c.remember(&prompt, &t(&[6, 7]), 7);
         // Retry of the same prompt: keep all but one cell for logits.
         assert_eq!(c.reuse_for_bind(&prompt, 7), 4);
+    }
+
+    fn media(id: &str, n_tokens: u32, n_pos: u32) -> VisionChunk {
+        VisionChunk::Media {
+            id: id.into(),
+            n_tokens,
+            n_pos,
+        }
+    }
+
+    #[test]
+    fn vision_lcp_matches_same_image_hash() {
+        let a = VisionSeq::from_chunks([
+            VisionChunk::Text(t(&[1, 2, 3])),
+            media("img-a", 4, 2),
+            VisionChunk::Text(t(&[9])),
+        ]);
+        let b = VisionSeq::from_chunks([
+            VisionChunk::Text(t(&[1, 2, 3])),
+            media("img-a", 4, 2),
+            VisionChunk::Text(t(&[9, 8])),
+        ]);
+        assert_eq!(a.common_prefix(&b), 8);
+        assert_eq!(a.pos_next(3), 3);
+        assert_eq!(a.pos_next(7), 5);
+        assert_eq!(a.n_pos(), 6);
+    }
+
+    #[test]
+    fn vision_lcp_stops_at_different_image() {
+        let a = VisionSeq::from_chunks([VisionChunk::Text(t(&[1, 2])), media("img-a", 3, 2)]);
+        let b = VisionSeq::from_chunks([VisionChunk::Text(t(&[1, 2])), media("img-b", 3, 2)]);
+        assert_eq!(a.common_prefix(&b), 2);
+    }
+
+    #[test]
+    fn vision_lcp_does_not_split_image() {
+        let a = VisionSeq::from_chunks([
+            VisionChunk::Text(t(&[1])),
+            media("img-a", 4, 2),
+            VisionChunk::Text(t(&[7])),
+        ]);
+        let b = VisionSeq::from_chunks([VisionChunk::Text(t(&[1])), media("img-a", 4, 2)]);
+        assert_eq!(a.common_prefix(&b), 5);
+    }
+
+    #[test]
+    fn vision_reuse_leaves_logits_and_skips_mid_image() {
+        let prev = VisionSeq::from_chunks([
+            VisionChunk::Text(t(&[1, 2, 3])),
+            media("img-a", 4, 2),
+            VisionChunk::Text(t(&[9, 8])),
+        ]);
+        // Exact same prompt: clamp off last text token (not mid-image).
+        let n = prev.reuse_for_bind(&prev, prev.n_pos());
+        assert_eq!(n, 8);
+        assert_eq!(prev.pos_next(n), prev.n_pos() - 1);
+
+        // Prompt that ends on an image: snap reuse to image start.
+        let img_only =
+            VisionSeq::from_chunks([VisionChunk::Text(t(&[1, 2, 3])), media("img-a", 4, 2)]);
+        let n = prev.reuse_for_bind(&img_only, prev.n_pos());
+        assert_eq!(n, 3, "must not reuse a partial image for logits");
+        assert_eq!(img_only.pos_next(n), 3);
+    }
+
+    #[test]
+    fn vision_reuse_rejects_when_gpu_shorter_than_pos() {
+        let prev = VisionSeq::from_chunks([VisionChunk::Text(t(&[1, 2, 3])), media("img-a", 4, 2)]);
+        let n = prev.reuse_for_bind(&prev, 2);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn vision_append_and_truncate_keeps_full_images() {
+        let mut seq = VisionSeq::from_chunks([
+            VisionChunk::Text(t(&[1, 2])),
+            media("img-a", 4, 2),
+            VisionChunk::Text(t(&[9])),
+        ]);
+        // n_pos = 2 + 2 + 1 = 5
+        seq.append_generated(&t(&[10, 11, 12]));
+        assert_eq!(seq.n_pos(), 8);
+        seq.truncate_to_pos(6);
+        assert_eq!(seq.n_pos(), 6);
+        assert_eq!(seq.tokens, t(&[1, 2, 0, 0, 0, 0, 9, 10]));
+
+        seq.truncate_to_pos(3);
+        // pos 3 is inside the image (pos 2..4); drop the image.
+        assert_eq!(seq.tokens, t(&[1, 2]));
+        assert!(seq.images.is_empty());
+    }
+
+    #[test]
+    fn remember_vision_clears_text_tokens() {
+        let mut c = SlotPrefixCache::new();
+        c.remember(&t(&[1, 2, 3]), &[], 3);
+        let seq = VisionSeq::from_chunks([VisionChunk::Text(t(&[1, 2, 3])), media("img-a", 2, 1)]);
+        c.remember_vision(seq, &t(&[9]), 5);
+        assert!(c.tokens.is_empty());
+        let vs = c.vision.as_ref().unwrap();
+        assert_eq!(vs.n_tokens(), 6);
+        assert_eq!(vs.n_pos(), 5);
+    }
+
+    #[test]
+    fn reset_clears_vision() {
+        let mut c = SlotPrefixCache::new();
+        c.vision = Some(VisionSeq::from_chunks([VisionChunk::Text(t(&[1]))]));
+        c.reset();
+        assert!(c.vision.is_none());
     }
 }

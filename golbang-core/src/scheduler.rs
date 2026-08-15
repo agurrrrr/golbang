@@ -495,13 +495,50 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         return false;
     }
     let seq = slot.id.0 as i32;
-    engine.clear_seq(seq);
-    slot.prefix_cache.reset();
-    slot.prefix_ckpt = None;
+    let tok = match engine.vision_tokenize(&job.prompt, &job.images) {
+        Ok(t) if !t.seq.tokens.is_empty() => t,
+        Ok(_) => {
+            let _ = job.events.send(SlotEvent::Failed(Error::EmptyPrompt));
+            return false;
+        }
+        Err(e) => {
+            let _ = job.events.send(SlotEvent::Failed(e));
+            return false;
+        }
+    };
+    let n_pos = tok.seq.n_pos();
+    if n_pos >= n_ctx_seq {
+        let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
+            prompt: n_pos,
+            n_ctx: n_ctx_seq,
+        }));
+        return false;
+    }
 
-    let n_past = match engine.vision_eval(seq, &job.prompt, &job.images) {
+    let gpu_n = engine.n_past_seq(seq);
+    let ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
+    let hint_n = gpu_n.max(ckpt_n);
+    let mut reuse_tok = slot
+        .prefix_cache
+        .vision
+        .as_ref()
+        .map(|prev| prev.reuse_for_bind(&tok.seq, hint_n))
+        .unwrap_or(0);
+    let mut reuse_pos = tok.seq.pos_next(reuse_tok);
+    reuse_pos = settle_prefix_kv(slot, engine, reuse_pos as usize, gpu_n) as u32;
+    if reuse_pos == 0 {
+        reuse_tok = 0;
+    } else if reuse_pos != tok.seq.pos_next(reuse_tok) {
+        reuse_tok = tok.seq.size_up_to_pos(reuse_pos);
+    }
+
+    let eval_t0 = Instant::now();
+    let n_past = match engine.vision_eval_from(seq, &tok, reuse_tok, reuse_pos) {
         Ok(n) => n,
         Err(e) => {
+            engine.clear_seq(seq);
+            slot.prefix_cache.reset();
+            slot.prefix_ckpt = None;
             let _ = job.events.send(SlotEvent::Failed(e));
             return false;
         }
@@ -513,16 +550,15 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         }));
         return false;
     }
-    let tokens = match engine.encode(&job.prompt) {
-        Ok(t) if !t.is_empty() => t,
-        _ => vec![0; n_past.max(1) as usize],
-    };
+
     let req = job.request_id;
     let n_img = job.images.len();
+    let vision_seq = tok.seq.clone();
+    drop(tok);
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
-        tokens,
-        0,
+        vision_seq.tokens.clone(),
+        reuse_pos as usize,
         job.params,
         job.cancel,
         job.timeout,
@@ -532,17 +568,28 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
     ));
     arm_think_budget(slot, engine);
     if let Some(active) = slot.job.as_mut() {
+        active.started = eval_t0;
+        active.generation_started_at = Some(Instant::now());
         active.n_past = n_past;
         active.n_prompt = n_past;
-        active.prompt_offset = n_past as usize;
+        active.prompt_offset = reuse_pos as usize;
         active.prompt_pos = 0;
         slot.phase = SlotPhase::Decoding;
+        let progress = if n_past == 0 {
+            1.0
+        } else {
+            f64::from(reuse_pos) / f64::from(n_past)
+        };
         let _ = active.events.send(SlotEvent::PromptProgress {
-            n_tokens: n_past,
-            progress: 1.0,
+            n_tokens: reuse_pos,
+            progress,
             tps: 0.0,
         });
     }
+    slot.prefix_cache.tokens.clear();
+    slot.prefix_cache.prefix_len = reuse_tok;
+    slot.prefix_cache.vision = Some(vision_seq);
+    capture_prefix_checkpoint(slot, engine);
     if let Err(e) = sample_from_existing_logits(slot, engine, n_ctx_seq) {
         if let Some(job) = slot.job.take() {
             let _ = job.events.send(SlotEvent::Failed(e));
@@ -556,6 +603,9 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         request_id = req,
         n_past,
         n_images = n_img,
+        reuse_tok,
+        reuse_pos,
+        gpu_n,
         "vision slot bound"
     );
     true
@@ -1142,8 +1192,13 @@ fn finish_slot(
             // Cancel/Timeout keep whatever was actually decoded (full prompt
             // or a mid-prefill prefix). llama-server does the same: the next
             // bind's LCP continues instead of throwing 10+ minutes of work.
-            slot.prefix_cache
-                .remember(&job.prompt_tokens, &job.generated, job.n_past);
+            if let Some(vs) = slot.prefix_cache.vision.take() {
+                slot.prefix_cache
+                    .remember_vision(vs, &job.generated, job.n_past);
+            } else {
+                slot.prefix_cache
+                    .remember(&job.prompt_tokens, &job.generated, job.n_past);
+            }
             tracing::info!(
                 slot = id.0,
                 request_id = job.request_id,

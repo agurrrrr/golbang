@@ -8,9 +8,9 @@ use golbang_sys::*;
 
 use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
-use crate::speculative::{topk_mode, NgramMod, SpecParams, SpecType};
+use crate::speculative::{NgramMod, SpecParams, SpecType, topk_mode};
 use crate::tokenizer::{Token, Tokenizer};
-use crate::vision::Vision;
+use crate::vision::{TokenizedVision, Vision};
 
 /// Matches llama.cpp `LLM_FFN_EXPS_REGEX` — expert tensors left on CPU by `-ncmoe`.
 const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
@@ -521,11 +521,7 @@ impl Model {
                 return 0;
             }
             let max = llama_memory_seq_pos_max(mem, seq_id);
-            if max < 0 {
-                0
-            } else {
-                (max + 1) as u32
-            }
+            if max < 0 { 0 } else { (max + 1) as u32 }
         }
     }
 
@@ -993,6 +989,24 @@ impl Model {
         let ctx = self.ctx;
         let vision = self.vision.as_mut().ok_or(Error::VisionDisabled)?;
         vision.eval_prompt(ctx, prompt, images, seq_id, n_batch)
+    }
+
+    pub fn vision_tokenize(&mut self, prompt: &str, images: &[Vec<u8>]) -> Result<TokenizedVision> {
+        let vision = self.vision.as_mut().ok_or(Error::VisionDisabled)?;
+        vision.tokenize(prompt, images)
+    }
+
+    pub fn vision_eval_from(
+        &mut self,
+        seq_id: i32,
+        tok: &TokenizedVision,
+        skip_tokens: usize,
+        n_past: u32,
+    ) -> Result<u32> {
+        let n_batch = self.n_batch() as i32;
+        let ctx = self.ctx;
+        let vision = self.vision.as_mut().ok_or(Error::VisionDisabled)?;
+        vision.eval_from(ctx, tok, seq_id, n_batch, skip_tokens, n_past)
     }
 
     fn decode_mtp(&mut self, items: &[crate::batch::BatchToken], embd: &[f32]) -> Result<()> {
