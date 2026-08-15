@@ -91,10 +91,14 @@ pub struct NgramMod {
     n: usize,
     used: usize,
     entries: Vec<Token>,
+    /// Per-seq last hist index from which ngrams were added (`draft_one` `i_last`).
+    i_last: Vec<usize>,
 }
 
 const NGRAM_EMPTY: Token = -1;
 const NGRAM_HASH: u64 = 6364136223846793005;
+/// llama.cpp `draft_one`: add `hist[i_last .. cur_len-n]` only after this growth.
+const NGRAM_CHUNK: usize = 32;
 
 impl NgramMod {
     pub fn new(n: u16, size: usize) -> Self {
@@ -102,12 +106,21 @@ impl NgramMod {
             n: n.max(1) as usize,
             used: 0,
             entries: vec![NGRAM_EMPTY; size.max(1)],
+            i_last: Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
         self.entries.fill(NGRAM_EMPTY);
         self.used = 0;
+    }
+
+    fn ensure_seq(&mut self, seq_id: i32) -> usize {
+        let i = seq_id.max(0) as usize;
+        if i >= self.i_last.len() {
+            self.i_last.resize(i + 1, 0);
+        }
+        i
     }
 
     fn idx(&self, tokens: &[Token]) -> usize {
@@ -148,6 +161,39 @@ impl NgramMod {
         if occ > 0.25 {
             self.reset();
         }
+    }
+
+    /// llama `begin`: seed the table from the prompt and set per-seq `i_last`.
+    pub fn begin(&mut self, seq_id: i32, tokens: &[Token]) {
+        let sid = self.ensure_seq(seq_id);
+        self.i_last[sid] = 0;
+        self.ingest(tokens);
+        if tokens.len() > self.n {
+            self.i_last[sid] = tokens.len() - self.n;
+        }
+    }
+
+    /// llama `draft_one` chunk add: when `hist` grew ≥32 past `i_last`, add
+    /// `hist[i_last .. len-n]` (includes self-generated tokens now in hist).
+    pub fn ingest_new(&mut self, seq_id: i32, hist: &[Token]) {
+        let sid = self.ensure_seq(seq_id);
+        let n = self.n;
+        let cur_len = hist.len();
+        if cur_len < n {
+            return;
+        }
+        let i_last = self.i_last[sid];
+        if i_last + NGRAM_CHUNK >= cur_len {
+            return;
+        }
+        let end = cur_len - n;
+        if i_last >= end {
+            return;
+        }
+        for i in i_last..end {
+            self.add(&hist[i..]);
+        }
+        self.i_last[sid] = end;
     }
 
     /// Draft up to `n_max` tokens after `id_last`. Empty if fewer than `n_min`.
@@ -290,6 +336,46 @@ mod tests {
         let mut ng = NgramMod::new(2, 64);
         ng.add(&[1, 2, 3]);
         assert!(ng.draft(&[1, 2], 3, 4, 2).is_empty());
+    }
+
+    #[test]
+    fn ngram_begin_sets_i_last_and_chunk_add_ingests_new_hist() {
+        let mut ng = NgramMod::new(2, 1024);
+        let mut hist: Vec<Token> = (0..10).collect();
+        ng.begin(0, &hist);
+        assert_eq!(ng.get(&[0, 1]), 2);
+        assert_eq!(ng.get(&[7, 8]), 9);
+        // i_last = 8; 8+32 >= 10 so a short tail is ignored
+        hist.extend_from_slice(&[10, 11, 12]);
+        ng.ingest_new(0, &hist);
+        assert_eq!(ng.get(&[8, 9]), NGRAM_EMPTY);
+        // cur_len > i_last+32 → add hist[8 .. len-2]
+        hist.extend((13..41).collect::<Vec<Token>>());
+        assert!(hist.len() > 8 + NGRAM_CHUNK);
+        ng.ingest_new(0, &hist);
+        assert_eq!(ng.get(&[8, 9]), 10);
+        assert_eq!(
+            ng.get(&[hist[hist.len() - 3], hist[hist.len() - 2]]),
+            hist[hist.len() - 1]
+        );
+    }
+
+    #[test]
+    fn ngram_chunk_add_is_per_seq() {
+        let mut ng = NgramMod::new(2, 1024);
+        let hist0: Vec<Token> = (0..41).collect();
+        let mut hist1: Vec<Token> = (100..108).collect();
+        ng.begin(0, &hist0[..10]);
+        ng.begin(1, &hist1);
+        hist1.extend_from_slice(&[108, 109, 110]);
+        ng.ingest_new(0, &hist0);
+        ng.ingest_new(1, &hist1);
+        assert_eq!(ng.get(&[8, 9]), 10);
+        assert_eq!(
+            ng.get(&[106, 107]),
+            NGRAM_EMPTY,
+            "seq 1 grew <32 so must not ingest 108"
+        );
     }
 
     #[test]

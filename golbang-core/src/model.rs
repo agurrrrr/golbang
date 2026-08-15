@@ -630,11 +630,11 @@ impl Model {
         Generate::start(self, prompt, params)
     }
 
-    pub fn spec_begin(&mut self, _seq_id: i32, prompt: &[Token]) {
+    pub fn spec_begin(&mut self, seq_id: i32, prompt: &[Token]) {
         // llama.cpp `common_speculative_begin` only seeds ngram. Do not wipe
         // `pending_h` — `spec_process` already filled it during prefill.
         if let Some(ng) = self.spec.ngram.as_mut() {
-            ng.ingest(prompt);
+            ng.begin(seq_id, prompt);
         }
     }
 
@@ -817,7 +817,10 @@ impl Model {
             return Vec::new();
         }
 
-        if let Some(ng) = self.spec.ngram.as_ref() {
+        if let Some(ng) = self.spec.ngram.as_mut() {
+            // llama `draft_one`: add hist[i_last..] before looking up drafts.
+            // Order and thresholds stay golbang's (ngram first, n_min=1, cap n_max).
+            ng.ingest_new(seq_id, prompt);
             let drafted = ng.draft(prompt, id_last, n_max.max(48), 1);
             let drafted: Vec<Token> = drafted.into_iter().take(n_max).collect();
             if !drafted.is_empty() {
