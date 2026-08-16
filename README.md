@@ -1,6 +1,6 @@
 # golbang
 
-> gfx906(AMD MI50)용 GGUF 채팅 서버.
+> gfx906(AMD MI50)용 GGUF LLM 추론 서버 (서빙 표면은 OpenAI 채팅 API 한 개).
 > 서빙·스케줄·배칭은 Rust, GPU 수학은 SHA 고정 `ggml-hip`을 C ABI로 호출한다.
 
 llama-server와 **같은 HIP 커널**을 쓴다. 이기는 지점은 처리량이 아니라
