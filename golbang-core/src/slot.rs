@@ -109,6 +109,11 @@ pub(crate) struct ActiveJob {
     pub n_generated: u32,
     pub n_prompt: u32,
     pub max_tokens: u32,
+    /// Original `max_tokens` request. `max_tokens` is clamped to the current
+    /// slot cap and can rise again when a neighbor leaves.
+    pub max_tokens_req: u32,
+    /// Dynamic KV cap for this job (cells). Recomputed on join/leave.
+    pub ctx_cap: u32,
     pub pending: Option<Token>,
     /// Speculative draft tokens to verify on the next decode (after `pending`).
     pub drafts: Vec<Token>,
@@ -169,12 +174,13 @@ impl ActiveJob {
         cancel: CancellationToken,
         timeout: Option<Duration>,
         events: mpsc::UnboundedSender<SlotEvent>,
-        n_ctx_seq: u32,
+        ctx_cap: u32,
         images: Vec<Vec<u8>>,
     ) -> Self {
         let n_prompt = tokens.len() as u32;
-        let remaining = n_ctx_seq.saturating_sub(n_prompt).max(1);
-        let max_tokens = params.max_tokens.max(1).min(remaining);
+        let max_tokens_req = params.max_tokens.max(1);
+        let remaining = ctx_cap.saturating_sub(n_prompt).max(1);
+        let max_tokens = max_tokens_req.min(remaining);
         let now = Instant::now();
         let deadline = timeout.map(|d| now + d);
         Self {
@@ -186,6 +192,8 @@ impl ActiveJob {
             n_generated: 0,
             n_prompt,
             max_tokens,
+            max_tokens_req,
+            ctx_cap,
             pending: None,
             drafts: Vec::new(),
             generated: Vec::new(),

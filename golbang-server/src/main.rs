@@ -29,9 +29,14 @@ struct Args {
     #[arg(long, env = "GOLBANG_PORT", default_value_t = 8088)]
     port: u16,
 
-    /// Per-sequence context. Total KV is n_ctx * n_parallel.
+    /// Per-sequence fair share. Total KV is n_ctx * n_parallel.
     #[arg(long, env = "GOLBANG_N_CTX", default_value_t = 256)]
     n_ctx: u32,
+
+    /// Solo-slot KV cap. 0 = full pool (`n_ctx * n_parallel`). When a second
+    /// slot joins, caps become min(this, max(used, pool / n_active)).
+    #[arg(long, env = "GOLBANG_SINGLE_MAX_CTX", default_value_t = 0)]
+    single_max_ctx: u32,
 
     #[arg(long, env = "GOLBANG_N_GPU_LAYERS", default_value_t = 99)]
     n_gpu_layers: i32,
@@ -323,6 +328,7 @@ async fn main() -> Result<()> {
             n_parallel,
             queue_capacity: args.queue_size.max(1),
             default_timeout: args.timeout_secs.map(Duration::from_secs),
+            single_max_ctx: args.single_max_ctx,
         },
     );
 
@@ -354,7 +360,14 @@ async fn main() -> Result<()> {
                 tracing::debug!(error = %err, "TCP_NODELAY failed");
             }
         });
-    tracing::info!(%addr, n_parallel, queue = args.queue_size, "listening");
+    tracing::info!(
+        %addr,
+        n_parallel,
+        queue = args.queue_size,
+        n_ctx = args.n_ctx,
+        single_max_ctx = args.single_max_ctx,
+        "listening"
+    );
 
     axum::serve(listener, router(state))
         .await

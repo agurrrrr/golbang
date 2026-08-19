@@ -3,6 +3,7 @@
 
 mod batch;
 mod chat;
+mod ctx_cap;
 mod engine;
 mod error;
 mod generate;

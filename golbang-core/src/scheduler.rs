@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::batch::{BatchBuilder, BatchToken};
+use crate::ctx_cap::{cap_for_join, effective_cap, resolve_single_max, slot_cap};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
@@ -41,6 +42,8 @@ pub struct SchedulerConfig {
     pub n_parallel: u32,
     pub queue_capacity: usize,
     pub default_timeout: Option<Duration>,
+    /// Solo-slot KV cap (`--single-max-ctx`). `0` = full pool (`n_ctx * n_seq_max`).
+    pub single_max_ctx: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -49,6 +52,7 @@ impl Default for SchedulerConfig {
             n_parallel: 2,
             queue_capacity: 2,
             default_timeout: None,
+            single_max_ctx: 0,
         }
     }
 }
@@ -152,6 +156,7 @@ pub fn spawn_scheduler(
         policy = policy.name(),
         n_parallel = config.n_parallel,
         queue_capacity = cap,
+        single_max_ctx = config.single_max_ctx,
         "scheduler start"
     );
     let worker = tokio::spawn(run_loop(engine, policy, config, rx, metrics));
@@ -188,7 +193,14 @@ async fn run_loop(
         decode_max = budget.decode_max,
         "scheduler budget"
     );
-    let n_ctx_seq = engine.n_ctx_seq();
+    let pool = engine.n_ctx();
+    let single_max = resolve_single_max(config.single_max_ctx, pool);
+    tracing::info!(
+        pool,
+        single_max,
+        n_ctx_seq = engine.n_ctx_seq(),
+        "scheduler ctx pool"
+    );
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut iter = 0u64;
 
@@ -224,10 +236,12 @@ async fn run_loop(
             &mut waiting,
             &mut *policy,
             &engine,
-            n_ctx_seq,
+            pool,
+            single_max,
             iter,
             &metrics,
         );
+        recompute_slot_caps(&mut slots, pool, single_max);
 
         let mut order = policy.rank(&slot_views(&slots));
         if order.is_empty() {
@@ -263,7 +277,6 @@ async fn run_loop(
         }
 
         let engine_d = engine.clone();
-        let n_ctx = n_ctx_seq;
         let metrics_d = metrics.clone();
         let n_slots = slots.len();
         tracing::debug!(
@@ -296,8 +309,8 @@ async fn run_loop(
             };
             apply_plan(&mut slots, &plan, &engine_d);
             maybe_log_prefill_progress(&mut slots);
-            sample_and_emit(&mut slots, &plan, &samples, &engine_d, n_ctx, &metrics_d);
-            fill_drafts_sync(&mut slots, &engine_d, n_ctx);
+            sample_and_emit(&mut slots, &plan, &samples, &engine_d, &metrics_d);
+            fill_drafts_sync(&mut slots, &engine_d);
             (slots, Ok(()))
         })
         .await;
@@ -319,6 +332,7 @@ async fn run_loop(
             }
         }
         evict_finished(&mut slots, &engine, iter, &metrics);
+        recompute_slot_caps(&mut slots, pool, single_max);
     }
 }
 
@@ -361,7 +375,8 @@ fn join_waiting(
     waiting: &mut VecDeque<Job>,
     policy: &mut dyn SchedulePolicy,
     engine: &Engine,
-    n_ctx_seq: u32,
+    pool: u32,
+    single_max: u32,
     iter: u64,
     metrics: &SchedulerMetrics,
 ) {
@@ -408,23 +423,45 @@ fn join_waiting(
     *waiting = remain;
 
     for (slot_id, job) in extracted {
-        let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) else {
+        if !slots.iter().any(|s| s.id == slot_id) {
             waiting.push_front(job);
             continue;
+        }
+        let n_active_after = slots.iter().filter(|s| s.is_active()).count() as u32 + 1;
+        let others_used: u32 = slots
+            .iter()
+            .filter(|s| s.id != slot_id)
+            .map(slot_kv_used)
+            .sum();
+        let cap = cap_for_join(others_used, n_active_after, pool, single_max);
+        let bound = {
+            let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) else {
+                waiting.push_front(job);
+                continue;
+            };
+            bind_slot(slot, job, engine, cap)
         };
-        if bind_slot(slot, job, engine, n_ctx_seq) {
+        if bound {
             metrics.joins.fetch_add(1, Ordering::Relaxed);
-            tracing::info!(iter, slot = slot_id.0, "join after decode boundary");
+            tracing::info!(
+                iter,
+                slot = slot_id.0,
+                cap,
+                others_used,
+                n_active_after,
+                "join after decode boundary"
+            );
+            recompute_slot_caps(slots, pool, single_max);
         }
     }
 }
 
-fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool {
+fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
     let seq = slot.id.0 as i32;
     engine.spec_reset_seq(seq);
 
     if !job.images.is_empty() {
-        return bind_vision_slot(slot, job, engine, n_ctx_seq);
+        return bind_vision_slot(slot, job, engine, ctx_cap);
     }
 
     let tokens = match engine.encode(&job.prompt) {
@@ -439,10 +476,10 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         }
     };
     let n_prompt = tokens.len() as u32;
-    if n_prompt >= n_ctx_seq {
+    if n_prompt >= ctx_cap {
         let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
             prompt: n_prompt,
-            n_ctx: n_ctx_seq,
+            n_ctx: ctx_cap,
         }));
         return false;
     }
@@ -462,7 +499,7 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         job.cancel,
         job.timeout,
         job.events,
-        n_ctx_seq,
+        ctx_cap,
         job.images,
     ));
     arm_think_budget(slot, engine);
@@ -484,12 +521,13 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool
         n_prompt,
         reused = reuse_len,
         gpu_n,
+        ctx_cap,
         "slot bound"
     );
     true
 }
 
-fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) -> bool {
+fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
     if !engine.vision_enabled() {
         let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
         return false;
@@ -507,10 +545,10 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         }
     };
     let n_pos = tok.seq.n_pos();
-    if n_pos >= n_ctx_seq {
+    if n_pos >= ctx_cap {
         let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
             prompt: n_pos,
-            n_ctx: n_ctx_seq,
+            n_ctx: ctx_cap,
         }));
         return false;
     }
@@ -543,10 +581,10 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
             return false;
         }
     };
-    if n_past >= n_ctx_seq {
+    if n_past >= ctx_cap {
         let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
             prompt: n_past,
-            n_ctx: n_ctx_seq,
+            n_ctx: ctx_cap,
         }));
         return false;
     }
@@ -563,7 +601,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         job.cancel,
         job.timeout,
         job.events,
-        n_ctx_seq,
+        ctx_cap,
         job.images,
     ));
     arm_think_budget(slot, engine);
@@ -590,14 +628,14 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
     slot.prefix_cache.prefix_len = reuse_tok;
     slot.prefix_cache.vision = Some(vision_seq);
     capture_prefix_checkpoint(slot, engine);
-    if let Err(e) = sample_from_existing_logits(slot, engine, n_ctx_seq) {
+    if let Err(e) = sample_from_existing_logits(slot, engine) {
         if let Some(job) = slot.job.take() {
             let _ = job.events.send(SlotEvent::Failed(e));
         }
         slot.phase = SlotPhase::Empty;
         return false;
     }
-    maybe_fill_drafts(slot, engine, n_ctx_seq);
+    maybe_fill_drafts(slot, engine);
     tracing::info!(
         slot = slot.id.0,
         request_id = req,
@@ -606,6 +644,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, n_ctx_seq: u32) 
         reuse_tok,
         reuse_pos,
         gpu_n,
+        ctx_cap,
         "vision slot bound"
     );
     true
@@ -643,11 +682,7 @@ fn arm_think_budget(slot: &mut Slot, engine: &Engine) {
     }
 }
 
-fn sample_from_existing_logits(
-    slot: &mut Slot,
-    engine: &Engine,
-    n_ctx_seq: u32,
-) -> crate::error::Result<()> {
+fn sample_from_existing_logits(slot: &mut Slot, engine: &Engine) -> crate::error::Result<()> {
     let row = engine.last_logits()?;
     let token = match slot.job.as_mut() {
         Some(job) => job
@@ -656,7 +691,7 @@ fn sample_from_existing_logits(
             .unwrap_or_else(|| job.sampler.sample(&row)),
         None => return Ok(()),
     };
-    emit_sampled(slot, engine, &[token], n_ctx_seq, None);
+    emit_sampled(slot, engine, &[token], None);
     Ok(())
 }
 
@@ -796,7 +831,6 @@ fn sample_and_emit(
     plan: &crate::batch::BatchPlan,
     samples: &[Token],
     engine: &Engine,
-    n_ctx_seq: u32,
     metrics: &SchedulerMetrics,
 ) {
     let mut i = 0;
@@ -817,7 +851,7 @@ fn sample_and_emit(
         if slot.job.as_ref().is_none_or(|j| j.finish.is_some()) {
             continue;
         }
-        emit_sampled(slot, engine, toks, n_ctx_seq, Some(metrics));
+        emit_sampled(slot, engine, toks, Some(metrics));
     }
 }
 
@@ -825,7 +859,6 @@ fn emit_sampled(
     slot: &mut Slot,
     engine: &Engine,
     samples: &[Token],
-    n_ctx_seq: u32,
     metrics: Option<&SchedulerMetrics>,
 ) {
     let n_verify = samples.len().saturating_sub(1);
@@ -836,7 +869,7 @@ fn emit_sampled(
         .unwrap_or_default();
 
     if n_verify > 0 && !drafts.is_empty() {
-        verify_and_emit(slot, engine, samples, &drafts, n_ctx_seq, metrics);
+        verify_and_emit(slot, engine, samples, &drafts, metrics);
         return;
     }
 
@@ -850,7 +883,7 @@ fn emit_sampled(
         return;
     }
     record_token_latency(job, metrics);
-    if !push_token(slot, engine, token, n_ctx_seq) {
+    if !push_token(slot, engine, token) {
         return;
     }
 }
@@ -860,7 +893,6 @@ fn verify_and_emit(
     engine: &Engine,
     samples: &[Token],
     drafts: &[Token],
-    n_ctx_seq: u32,
     metrics: Option<&SchedulerMetrics>,
 ) {
     let seq = slot.id.0 as i32;
@@ -961,7 +993,7 @@ fn verify_and_emit(
             break;
         }
         record_token_latency(job, metrics);
-        if !push_token(slot, engine, tok, n_ctx_seq) {
+        if !push_token(slot, engine, tok) {
             break;
         }
     }
@@ -988,7 +1020,7 @@ fn record_token_latency(job: &mut ActiveJob, metrics: Option<&SchedulerMetrics>)
 
 /// Emit one sampled token. `pending` becomes this token (not yet in KV if it
 /// is a bonus / correction). Returns false if the job finished without emit.
-fn push_token(slot: &mut Slot, engine: &Engine, token: Token, n_ctx_seq: u32) -> bool {
+fn push_token(slot: &mut Slot, engine: &Engine, token: Token) -> bool {
     let Some(job) = slot.job.as_mut() else {
         return false;
     };
@@ -1037,7 +1069,7 @@ fn push_token(slot: &mut Slot, engine: &Engine, token: Token, n_ctx_seq: u32) ->
             job.finish = Some(FinishReason::Stop);
         }
     }
-    if job.n_past + 1 > n_ctx_seq && job.finish.is_none() {
+    if job.n_past + 1 > job.ctx_cap && job.finish.is_none() {
         job.finish = Some(FinishReason::Length);
     }
     let _ = job
@@ -1055,7 +1087,7 @@ struct DraftJob {
     n_max: i32,
 }
 
-fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<DraftJob> {
+fn take_draft_jobs(slots: &mut [Slot], engine: &Engine) -> Vec<DraftJob> {
     let spec_on = engine.spec_enabled();
     let spec_n_max = if spec_on { engine.spec_n_max() } else { 0 };
     let mut jobs = Vec::new();
@@ -1087,7 +1119,7 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<D
         }
         // llama `get_n_draft_max`: remaining ctx and remaining gen tokens,
         // not MTP n_max. ngram-mod then drafts up to its own n_max (64).
-        let remain_ctx = n_ctx_seq.saturating_sub(job.n_past.saturating_add(1)) as i32;
+        let remain_ctx = job.ctx_cap.saturating_sub(job.n_past.saturating_add(1)) as i32;
         let remain_gen = job.max_tokens.saturating_sub(job.n_generated) as i32;
         let n_max = spec_n_max
             .min(remain_ctx.saturating_sub(1))
@@ -1108,8 +1140,8 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) -> Vec<D
     jobs
 }
 
-fn fill_drafts_sync(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) {
-    let reqs = take_draft_jobs(slots, engine, n_ctx_seq);
+fn fill_drafts_sync(slots: &mut [Slot], engine: &Engine) {
+    let reqs = take_draft_jobs(slots, engine);
     for r in reqs {
         let t0 = Instant::now();
         let drafts = engine.spec_draft(r.seq, &r.hist, r.id_last, r.n_past, r.n_max);
@@ -1126,8 +1158,8 @@ fn fill_drafts_sync(slots: &mut [Slot], engine: &Engine, n_ctx_seq: u32) {
 }
 
 /// Sync path for vision bind (one shot, not the decode loop).
-fn maybe_fill_drafts(slot: &mut Slot, engine: &Engine, n_ctx_seq: u32) {
-    let reqs = take_draft_jobs(std::slice::from_mut(slot), engine, n_ctx_seq);
+fn maybe_fill_drafts(slot: &mut Slot, engine: &Engine) {
+    let reqs = take_draft_jobs(std::slice::from_mut(slot), engine);
     let Some(r) = reqs.into_iter().next() else {
         return;
     };
@@ -1398,6 +1430,51 @@ fn maybe_log_decode_progress(slot: u32, job: &mut ActiveJob) {
     job.last_progress_n = job.n_generated;
 }
 
+/// KV cells this slot currently occupies (active job or retained prefix).
+fn slot_kv_used(slot: &Slot) -> u32 {
+    if let Some(job) = slot.job.as_ref() {
+        return job.n_past.max(job.n_prompt);
+    }
+    let cached = match slot.prefix_cache.vision.as_ref() {
+        Some(vs) => vs.n_pos(),
+        None => slot.prefix_cache.prefix_len as u32,
+    };
+    let ckpt = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
+    cached.max(ckpt)
+}
+
+/// Recompute per-job `ctx_cap` from occupancy. Call on join/leave.
+fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32) {
+    let n_active = slots.iter().filter(|s| s.is_active()).count() as u32;
+    if n_active == 0 {
+        return;
+    }
+    let used: Vec<u32> = slots.iter().map(slot_kv_used).collect();
+    let total_used: u32 = used.iter().copied().sum();
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let Some(job) = slot.job.as_mut() else {
+            continue;
+        };
+        let policy = slot_cap(single_max, used[i], pool, n_active);
+        let others = total_used.saturating_sub(used[i]);
+        let cap = effective_cap(policy, used[i], pool, others);
+        if job.ctx_cap != cap {
+            tracing::info!(
+                slot = slot.id.0,
+                from = job.ctx_cap,
+                to = cap,
+                used = used[i],
+                n_active,
+                others_used = others,
+                "slot ctx cap"
+            );
+        }
+        job.ctx_cap = cap;
+        let remaining = cap.saturating_sub(job.n_prompt).max(1);
+        job.max_tokens = job.max_tokens_req.min(remaining);
+    }
+}
+
 fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
     for slot in slots.iter_mut() {
         let id = slot.id;
@@ -1573,6 +1650,67 @@ mod tests {
         assert!(keeps_prefix_kv(FinishReason::Timeout));
     }
 
+    #[test]
+    fn slot_kv_used_is_max_of_n_past_and_n_prompt() {
+        let mut slot = Slot::new(SlotId(0));
+        let mut job = ActiveJob::for_test(vec![1, 2, 3, 4, 5]);
+        job.n_past = 2;
+        slot.occupy(job);
+        assert_eq!(slot_kv_used(&slot), 5);
+        if let Some(j) = slot.job.as_mut() {
+            j.n_past = 9;
+        }
+        assert_eq!(slot_kv_used(&slot), 9);
+    }
+
+    #[test]
+    fn empty_slot_kv_used_counts_prefix_cache() {
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.prefix_len = 12_000;
+        assert_eq!(slot_kv_used(&slot), 12_000);
+        slot.prefix_ckpt = Some(crate::slot::SeqCheckpoint {
+            n_tokens: 20_000,
+            data: Vec::new(),
+        });
+        assert_eq!(slot_kv_used(&slot), 20_000);
+    }
+
+    #[test]
+    fn recompute_caps_matches_work_order_examples() {
+        const T: u32 = 80_000;
+        const S: u32 = 60_000;
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+
+        let mut solo = ActiveJob::for_test(vec![1]);
+        solo.n_prompt = 0;
+        solo.n_past = 0;
+        solo.max_tokens_req = 100_000;
+        slots[0].occupy(solo);
+        recompute_slot_caps(&mut slots, T, S);
+        assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
+
+        slots[0].job.as_mut().unwrap().n_past = 35_000;
+        slots[0].job.as_mut().unwrap().n_prompt = 1_000;
+        let mut second = ActiveJob::for_test(vec![1]);
+        second.n_prompt = 0;
+        second.n_past = 0;
+        second.max_tokens_req = 100_000;
+        slots[1].occupy(second);
+        recompute_slot_caps(&mut slots, T, S);
+        assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 40_000);
+        assert_eq!(slots[1].job.as_ref().unwrap().ctx_cap, 40_000);
+
+        slots[0].job.as_mut().unwrap().n_past = 60_000;
+        slots[0].job.as_mut().unwrap().n_prompt = 1_000;
+        recompute_slot_caps(&mut slots, T, S);
+        assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
+        assert_eq!(slots[1].job.as_ref().unwrap().ctx_cap, 20_000);
+
+        let _ = slots[1].evict();
+        recompute_slot_caps(&mut slots, T, S);
+        assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
+    }
+
     #[tokio::test]
     async fn try_submit_rejects_when_full() {
         let (tx, _rx) = mpsc::channel(1);
@@ -1697,7 +1835,7 @@ mod gpu_tests {
             SchedulerConfig {
                 n_parallel: 1,
                 queue_capacity: 4,
-                default_timeout: None,
+                ..Default::default()
             },
         );
         let prompt = "<|im_start|>user\n안녕<|im_end|>\n<|im_start|>assistant\n";
@@ -1716,7 +1854,7 @@ mod gpu_tests {
             SchedulerConfig {
                 n_parallel: 2,
                 queue_capacity: 2,
-                default_timeout: None,
+                ..Default::default()
             },
         );
         assert!(parallel.handle.metrics.joins.load(Ordering::Relaxed) == 0);
@@ -1773,7 +1911,7 @@ mod gpu_tests {
             SchedulerConfig {
                 n_parallel: 1,
                 queue_capacity: 1,
-                default_timeout: None,
+                ..Default::default()
             },
         );
 
@@ -1878,7 +2016,7 @@ mod gpu_tests {
             SchedulerConfig {
                 n_parallel: 1,
                 queue_capacity: 1,
-                default_timeout: None,
+                ..Default::default()
             },
         );
 

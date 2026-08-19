@@ -88,7 +88,9 @@ impl<'m> Generate<'m> {
         if tokens.is_empty() {
             return Err(Error::EmptyPrompt);
         }
-        let n_ctx = model.n_ctx_seq();
+        // Single-sequence path: the pool (`n_ctx`), not `n_ctx_seq`. The
+        // scheduler applies `--single-max-ctx` on top of this for slots.
+        let n_ctx = model.n_ctx();
         let n_prompt = tokens.len() as u32;
         if n_prompt >= n_ctx {
             return Err(Error::ContextFull {
@@ -143,7 +145,7 @@ impl<'m> Generate<'m> {
         }
 
         if let Some(tok) = self.pending.take() {
-            if self.model.n_past() + 1 > self.model.n_ctx_seq() {
+            if self.model.n_past() + 1 > self.model.n_ctx() {
                 self.finish_with(FinishReason::Length);
                 return Ok(None);
             }

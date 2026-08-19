@@ -162,8 +162,11 @@ join/evict/chunk/우선순위를 바꾸기 어렵기 때문이다.
 | `SchedulePolicy` | `join` / `evict` / `rank` / `budget`. P2는 `fifo`만 |
 | `IterationBudget` | `n_parallel==1`이면 `prefill_max=n_batch`, 아니면 `n_ubatch`. `decode_max=n_parallel` |
 
-`--n-ctx`는 **슬롯당**이다. 총 KV는 `n_ctx * n_parallel`.
+`--n-ctx`는 **슬롯당 기본 몫**이다. 총 KV 풀은 `n_ctx * n_parallel`.
 `--n-parallel`은 슬롯 수이자 `llama n_seq_max`이다.
+혼자일 때는 `--single-max-ctx`(기본=풀 전체)까지 자란다. 두 번째 슬롯이
+붙으면 `min(single_max, max(used, 풀/활성수))`로 다시 나눈다. 이미 쓴
+셀은 줄이지 않고, 남은 셀만 신규 슬롯에 준다.
 
 과부하 계약: bounded mpsc가 가득이면 **즉시** `503` + `Retry-After: 1`.
 llama-server는 같은 상황에서 대기할 수 있다. 이건 버그가 아니라 선택이다.
@@ -298,8 +301,9 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 |--------|------|------|
 | `--model` | `GOLBANG_MODEL` / `GOLBANG_TEST_MODEL` | GGUF 경로 |
 | `--host` / `--port` | `127.0.0.1` / `8088` | 바인드 |
-| `--n-ctx` | `256` | **슬롯당** 컨텍스트 |
+| `--n-ctx` | `256` | 슬롯당 기본 몫. 총 KV = n_ctx × n_parallel |
 | `--n-parallel` | `2` | 슬롯 수 / `n_seq_max` |
+| `--single-max-ctx` | `0` = 풀 전체 | 솔로 슬롯 상한. 0이면 `n_ctx × n_parallel` |
 | `--queue-size` | `2` | 대기 큐. 가득 → 503 |
 | `--n-gpu-layers` | `99` | GPU 오프로드 |
 | `--n-cpu-moe` | `0` | 앞 N층 expert를 CPU에 고정 |

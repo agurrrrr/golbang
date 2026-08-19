@@ -42,7 +42,7 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
         SchedulerConfig {
             n_parallel,
             queue_capacity: queue_size,
-            default_timeout: None,
+            ..Default::default()
         },
     );
     let state = AppState {

@@ -15,8 +15,9 @@ use crate::vision::{TokenizedVision, Vision};
 /// Matches llama.cpp `LLM_FFN_EXPS_REGEX` — expert tensors left on CPU by `-ncmoe`.
 const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-/// Load options. `n_ctx` is **per sequence**. Total KV is `n_ctx * n_seq_max`
-/// so P1's 256-token slot stays 256 when `--n-parallel` grows.
+/// Load options. `n_ctx` is the **per-sequence fair share**. Total KV is
+/// `n_ctx * n_seq_max`. The scheduler may let a solo slot grow past `n_ctx`
+/// up to `--single-max-ctx` (default: the full pool).
 /// Keep both small when another llama-server already holds most of VRAM.
 ///
 /// `n_cpu_moe` pins expert weights of the first N layers to CPU (`-ncmoe`).

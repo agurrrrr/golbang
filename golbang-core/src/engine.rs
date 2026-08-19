@@ -24,6 +24,12 @@ impl Engine {
         self.model.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Total KV cells (`n_ctx * n_seq_max`). One sequence may occupy more
+    /// than `n_ctx_seq` of this pool; the scheduler caps that per slot.
+    pub fn n_ctx(&self) -> u32 {
+        self.lock().n_ctx()
+    }
+
     pub fn n_ctx_seq(&self) -> u32 {
         self.lock().n_ctx_seq()
     }
