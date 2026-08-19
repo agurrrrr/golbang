@@ -262,6 +262,13 @@ impl Model {
                 mparams_ctx.n_batch = n_batch;
                 mparams_ctx.n_ubatch = n_ubatch;
                 mparams_ctx.n_seq_max = n_seq_max;
+                // llama-server `common_base_params_to_speculative`:
+                // n_outputs_max = n_parallel. Default 0 (= n_batch) reserves a
+                // 2048×vocab logits tensor (~2 GiB) in the MTP compute buffer.
+                // First 2048-token spec_process then pool-allocs on top and
+                // GGML_ABORTs when VRAM is already 99% (n_parallel=2 on MI50).
+                mparams_ctx.n_outputs_max = mtp_n_outputs_max(n_seq_max);
+                mparams_ctx.n_outputs_max_per_seq = 1;
                 mparams_ctx.flash_attn_type = params.flash_attn;
                 mparams_ctx.n_rs_seq = 0;
                 mparams_ctx.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -286,6 +293,7 @@ impl Model {
                         n_embd,
                         n_max = spec.params.n_max,
                         p_min = spec.params.p_min,
+                        n_outputs_max = mtp_n_outputs_max(n_seq_max),
                         "MTP draft context ready"
                     );
                 }
@@ -762,7 +770,11 @@ impl Model {
             }
         }
 
-        self.decode_mtp(items, &embd)?;
+        // llama-server process() adds tokens with logits=0. Catch-up only
+        // writes MTP KV; nextn/verify_h come from the target. Passing the
+        // target's logits flags through would request 2048 outputs and
+        // overflow n_outputs_max = n_seq_max.
+        self.decode_mtp(&mtp_process_items(items), &embd)?;
 
         for sid in 0..self.spec.pending_h.len() {
             let idxs: Vec<usize> = items
@@ -1087,6 +1099,23 @@ impl Drop for Model {
     }
 }
 
+/// llama-server `common_base_params_to_speculative`: `n_outputs_max = n_parallel`.
+fn mtp_n_outputs_max(n_seq_max: u32) -> u32 {
+    n_seq_max.max(1)
+}
+
+/// Strip logits so MTP process() stays within `n_outputs_max = n_seq_max`.
+fn mtp_process_items(items: &[crate::batch::BatchToken]) -> Vec<crate::batch::BatchToken> {
+    items
+        .iter()
+        .copied()
+        .map(|it| crate::batch::BatchToken {
+            logits: false,
+            ..it
+        })
+        .collect()
+}
+
 fn init_backend() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -1177,7 +1206,39 @@ impl CpuMoeOverrides {
 
 #[cfg(test)]
 mod tests {
-    use super::FFN_EXPS_REGEX;
+    use super::{mtp_n_outputs_max, mtp_process_items, FFN_EXPS_REGEX};
+    use crate::batch::BatchToken;
+
+    #[test]
+    fn mtp_outputs_match_llama_server_n_parallel() {
+        assert_eq!(mtp_n_outputs_max(0), 1);
+        assert_eq!(mtp_n_outputs_max(1), 1);
+        assert_eq!(mtp_n_outputs_max(2), 2);
+    }
+
+    #[test]
+    fn mtp_process_drops_target_logits_flags() {
+        let items = [
+            BatchToken {
+                token: 1,
+                pos: 10,
+                seq_id: 0,
+                logits: true,
+            },
+            BatchToken {
+                token: 2,
+                pos: 11,
+                seq_id: 0,
+                logits: true,
+            },
+        ];
+        let out = mtp_process_items(&items);
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].logits && !out[1].logits);
+        assert_eq!(out[0].token, 1);
+        assert_eq!(out[0].pos, 10);
+        assert_eq!(out[1].seq_id, 0);
+    }
 
     #[test]
     fn cpu_moe_block_regex_matches_llama_cpp() {
