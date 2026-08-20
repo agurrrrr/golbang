@@ -35,8 +35,14 @@ struct Args {
 
     /// Solo-slot KV cap. 0 = full pool (`n_ctx * n_parallel`). When a second
     /// slot joins, caps become min(this, max(used, pool / n_active)).
+    /// llama only honours a cap above `n_ctx` when `--kv-unified` is set.
     #[arg(long, env = "GOLBANG_SINGLE_MAX_CTX", default_value_t = 0)]
     single_max_ctx: u32,
+
+    /// Share one KV stream across sequences (llama-server `--kv-unified`).
+    /// Lets a solo slot grow to the full pool when `--n-parallel > 1`.
+    #[arg(long, env = "GOLBANG_KV_UNIFIED", default_value_t = false)]
+    kv_unified: bool,
 
     #[arg(long, env = "GOLBANG_N_GPU_LAYERS", default_value_t = 99)]
     n_gpu_layers: i32,
@@ -263,6 +269,7 @@ async fn main() -> Result<()> {
             load_mtp,
             spec,
             mmproj: args.mmproj.clone(),
+            kv_unified: args.kv_unified,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
@@ -366,6 +373,7 @@ async fn main() -> Result<()> {
         queue = args.queue_size,
         n_ctx = args.n_ctx,
         single_max_ctx = args.single_max_ctx,
+        kv_unified = args.kv_unified,
         "listening"
     );
 

@@ -1,8 +1,10 @@
 //! Dynamic per-slot context caps over a shared KV pool.
 //!
-//! llama.cpp allocates `T = n_ctx * n_seq_max` cells in one pool. `n_ctx_seq`
-//! is informational; a single sequence can occupy more than `T / n_seq_max`
-//! cells. The Rust scheduler used to hard-cap every slot at `n_ctx_seq`.
+//! llama.cpp allocates `T = n_ctx` cells (`n_ctx_cli * n_seq_max`, then padded).
+//! That pool is actually shared across sequences only when `--kv-unified` is
+//! on (`n_stream = 1`, `n_ctx_seq = T`). Default `kv_unified=false` gives each
+//! sequence its own stream of `n_ctx_seq = T / n_seq_max` cells; a solo slot
+//! cannot grow past that, even if the scheduler offers a larger cap.
 //!
 //! Policy (`--single-max-ctx` = `S`, 0 means `S = T`):
 //!

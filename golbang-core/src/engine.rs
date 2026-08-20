@@ -24,8 +24,8 @@ impl Engine {
         self.model.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Total KV cells (`n_ctx * n_seq_max`). One sequence may occupy more
-    /// than `n_ctx_seq` of this pool; the scheduler caps that per slot.
+    /// Total KV cells (`llama_n_ctx`). With `--kv-unified` a sequence may
+    /// occupy the whole pool; without it llama caps each stream at `n_ctx_seq`.
     pub fn n_ctx(&self) -> u32 {
         self.lock().n_ctx()
     }

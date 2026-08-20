@@ -168,6 +168,10 @@ join/evict/chunk/우선순위를 바꾸기 어렵기 때문이다.
 붙으면 `min(single_max, max(used, 풀/활성수))`로 다시 나눈다. 이미 쓴
 셀은 줄이지 않고, 남은 셀만 신규 슬롯에 준다.
 
+llama 기본은 `kv_unified=false`라 시퀀스마다 독립 스트림이고, 한 슬롯은
+`n_ctx_seq ≈ n_ctx`를 넘지 못한다. 스케줄러가 풀 전체를 주려면
+`--kv-unified`가 필요하다 (Qwen3.8 생산 유닛).
+
 과부하 계약: bounded mpsc가 가득이면 **즉시** `503` + `Retry-After: 1`.
 llama-server는 같은 상황에서 대기할 수 있다. 이건 버그가 아니라 선택이다.
 
@@ -304,6 +308,7 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 | `--n-ctx` | `256` | 슬롯당 기본 몫. 총 KV = n_ctx × n_parallel |
 | `--n-parallel` | `2` | 슬롯 수 / `n_seq_max` |
 | `--single-max-ctx` | `0` = 풀 전체 | 솔로 슬롯 상한. 0이면 `n_ctx × n_parallel` |
+| `--kv-unified` | off | llama 공유 KV 스트림. 솔로가 풀 전체를 쓰려면 필요 |
 | `--queue-size` | `2` | 대기 큐. 가득 → 503 |
 | `--n-gpu-layers` | `99` | GPU 오프로드 |
 | `--n-cpu-moe` | `0` | 앞 N층 expert를 CPU에 고정 |

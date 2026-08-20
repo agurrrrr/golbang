@@ -17,7 +17,9 @@ const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
 /// Load options. `n_ctx` is the **per-sequence fair share**. Total KV is
 /// `n_ctx * n_seq_max`. The scheduler may let a solo slot grow past `n_ctx`
-/// up to `--single-max-ctx` (default: the full pool).
+/// up to `--single-max-ctx` (default: the full pool). That only matches
+/// llama when `kv_unified` is on — otherwise a sequence is hard-capped at
+/// `n_ctx_seq = n_ctx` (padded).
 /// Keep both small when another llama-server already holds most of VRAM.
 ///
 /// `n_cpu_moe` pins expert weights of the first N layers to CPU (`-ncmoe`).
@@ -50,6 +52,10 @@ pub struct LoadParams {
     pub spec: SpecParams,
     /// CLIP / projector GGUF (`--mmproj`). None = text only.
     pub mmproj: Option<PathBuf>,
+    /// `llama_context_params.kv_unified`. One KV stream of `n_ctx * n_seq_max`
+    /// cells, so a solo sequence can occupy the whole pool. llama-server
+    /// `--kv-unified`. Off: each sequence is capped at `n_ctx_seq`.
+    pub kv_unified: bool,
 }
 
 impl Default for LoadParams {
@@ -69,6 +75,7 @@ impl Default for LoadParams {
             load_mtp: false,
             spec: SpecParams::default(),
             mmproj: None,
+            kv_unified: false,
         }
     }
 }
@@ -172,6 +179,7 @@ impl Model {
             n_rs_seq,
             use_mmap = params.use_mmap,
             load_mtp,
+            kv_unified = params.kv_unified,
             spec = ?params.spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             mmproj = params.mmproj.as_ref().map(|p| p.display().to_string()),
             "loading GGUF"
@@ -219,6 +227,7 @@ impl Model {
         cparams.n_batch = n_batch;
         cparams.n_ubatch = n_ubatch;
         cparams.n_seq_max = n_seq_max;
+        cparams.kv_unified = params.kv_unified;
         cparams.flash_attn_type = params.flash_attn;
         if n_rs_seq > 0 {
             cparams.n_rs_seq = n_rs_seq;
@@ -263,6 +272,7 @@ impl Model {
                 mparams_ctx.n_batch = n_batch;
                 mparams_ctx.n_ubatch = n_ubatch;
                 mparams_ctx.n_seq_max = n_seq_max;
+                mparams_ctx.kv_unified = params.kv_unified;
                 // llama-server `common_base_params_to_speculative`:
                 // n_outputs_max = n_parallel. Default 0 (= n_batch) reserves a
                 // 2048×vocab logits tensor (~2 GiB) in the MTP compute buffer.
@@ -322,6 +332,7 @@ impl Model {
             n_ctx = unsafe { llama_n_ctx(ctx) },
             n_ctx_seq = unsafe { llama_n_ctx_seq(ctx) },
             n_seq_max = unsafe { llama_n_seq_max(ctx) },
+            kv_unified = params.kv_unified,
             n_batch = unsafe { llama_n_batch(ctx) },
             n_ubatch = unsafe { llama_n_ubatch(ctx) },
             n_vocab,
@@ -422,7 +433,8 @@ impl Model {
         unsafe { llama_n_ctx(self.ctx) }
     }
 
-    /// Per-sequence context (KV cells one slot may occupy).
+    /// llama `n_ctx_seq`: KV cells per stream. Equals `n_ctx` when
+    /// `kv_unified`; otherwise `n_ctx / n_seq_max` (padded).
     pub fn n_ctx_seq(&self) -> u32 {
         unsafe { llama_n_ctx_seq(self.ctx) }
     }
