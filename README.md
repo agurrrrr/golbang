@@ -279,16 +279,16 @@ curl -sS -X POST http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":false,"max_tokens":32}'
 ```
 
-생산에 가까운 기동 예 (Qwen3.8 27B Q6, 텍스트만. 유닛 파일은 `deploy/`):
+생산에 가까운 기동 예 (Qwen3.8 27B UD-Q4_K_XL, 텍스트만. 유닛 파일은 `deploy/`):
 
 ```bash
 ./target/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-Q6_K.gguf \
+  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   --alias qwen3.8-27b-q6 \
   --host 127.0.0.1 --port 8083 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 80000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 \
-  --n-parallel 1 --queue-size 1 \
+  --n-ctx 70000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 \
+  --n-parallel 2 --queue-size 2 --single-max-ctx 128000 --kv-unified \
   --no-mmap --jinja --reasoning-format deepseek \
   --spec-type draft-mtp,ngram-mod \
   --spec-draft-n-max 3 --spec-draft-p-min 0.90
@@ -344,7 +344,7 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 
 | 유닛 | 모델 | 포트 |
 |------|------|------|
-| `deploy/golbang-qwen38.service` | Qwen3.8-27B Q6_K + mmproj + MTP | 8083 |
+| `deploy/golbang-qwen38.service` | Qwen3.8-27B UD-Q4_K_XL + mmproj + MTP, KV 140k / solo 128k | 8083 |
 | `deploy/golbang-deepseek.service` | DSV4-Flash IQ2_M, `n_cpu_moe=32` | 8080 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,

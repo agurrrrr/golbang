@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - Qwen3.8-27B Q6_K (MI50)
+Description=golbang OpenAI server - Qwen3.8-27B UD-Q4_K_XL (MI50)
 After=network.target
 Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service
 
@@ -15,12 +15,12 @@ Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-upgrade/buil
 Environment=RUST_LOG=info
 ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
 ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-Q6_K.gguf \
+  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   --alias qwen3.8-27b-q6 \
   --host 0.0.0.0 --port 8083 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 40000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 2 --queue-size 2 --single-max-ctx 60000 --kv-unified \
+  --n-ctx 70000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 2 --queue-size 2 --single-max-ctx 128000 --kv-unified \
   --no-mmap --jinja --reasoning-format deepseek \
   --reasoning-effort high --reasoning-budget 4096 \
   --mmproj /home/agurrrrr/models/qwen3.8/mmproj-F16.gguf \
