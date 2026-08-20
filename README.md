@@ -241,7 +241,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export GOLBANG_LLAMA_DIR=/home/agurrrrr/code/local-llm/llama.cpp-upgrade
-export GOLBANG_TEST_MODEL=/home/agurrrrr/code/local-llm/models/Qwen3-0.6B-Q4_K_M.gguf
+export GOLBANG_TEST_MODEL=/home/agurrrrr/models/Qwen3-0.6B-Q4_K_M.gguf
 
 cargo build -p golbang-server --release
 cargo test  -p golbang-sys -- --nocapture   # P0: Hello 1회 decode

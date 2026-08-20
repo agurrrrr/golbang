@@ -28,7 +28,7 @@ PARA = (
     "golbang serves DeepSeek-V4-Flash IQ2_M through ggml-hip. "
 )
 MODEL = (
-    "/home/agurrrrr/code/local-llm/models/dsv4/UD-IQ2_M/"
+    "/home/agurrrrr/models/dsv4/UD-IQ2_M/"
     "DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf"
 )
 SERVER = "/home/agurrrrr/code/golbang/target/release/golbang-server"

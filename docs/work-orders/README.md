@@ -36,7 +36,7 @@ llama-server도 이미 continuous batching(슬롯 + 통합 batch + `llama_decode
 | HIP 커널 | llama.cpp `ggml-hip`이 gfx906으로 빌드됨 (`GGML_HIP=ON`, `CMAKE_HIP_ARCHITECTURES=gfx906`) |
 | FFI 진입점 | `llama.h` C API 존재 (`llama_decode`, `llama_tokenize` 등) |
 | 기존 자산 | `/home/agurrrrr/code/local-llm/llama.cpp` (빌드 산출물 `.so` 존재) |
-| GGUF 모델 | `/home/agurrrrr/code/local-llm/models` (Qwen 계열 GGUF) |
+| GGUF 모델 | `/home/agurrrrr/models` (Qwen 계열 GGUF, DSV4) |
 | 벤치 기록 | `docs/bench/` — `p2.md`, `p3.md`, `p5.md`, `p6.md` (각 지시서 완료 시 채움) |
 
 ## 단계별 지시서
