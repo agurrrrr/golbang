@@ -15,7 +15,8 @@ use crate::ctx_cap::{cap_for_join, effective_cap, resolve_single_max, slot_cap};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
-use crate::policy::{IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
+use crate::policy::{EmptySlotView, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
+use crate::prefix_cache::common_prefix_len;
 use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 use crate::speculative::accept_drafts;
 use crate::tokenizer::Token;
@@ -66,6 +67,8 @@ pub struct Job {
     pub events: mpsc::UnboundedSender<SlotEvent>,
     /// Decoded image bytes for `--mmproj` (one per `<__media__>` marker).
     pub images: Vec<Vec<u8>>,
+    /// Filled at join so prefix-aware pick and bind share one tokenize.
+    pub prompt_tokens: Option<Vec<Token>>,
 }
 
 impl Job {
@@ -84,6 +87,7 @@ impl Job {
             timeout: None,
             events,
             images: Vec::new(),
+            prompt_tokens: None,
         }
     }
 }
@@ -388,14 +392,38 @@ fn join_waiting(
     if empty.is_empty() || waiting.is_empty() {
         return;
     }
-    let views: Vec<WaitingJobView> = waiting
-        .iter()
-        .map(|j| WaitingJobView {
-            request_id: j.request_id,
-            n_prompt: 0,
-        })
-        .collect();
-    let matches = policy.join(&empty, &views);
+    let n_cand = empty.len().min(waiting.len());
+    for job in waiting.iter_mut().take(n_cand) {
+        if job.images.is_empty() && job.prompt_tokens.is_none() {
+            if let Ok(t) = engine.encode(&job.prompt) {
+                job.prompt_tokens = Some(t);
+            }
+        }
+    }
+    let matches = {
+        let empty_views: Vec<EmptySlotView<'_>> = empty
+            .iter()
+            .filter_map(|id| slots.iter().find(|s| s.id == *id))
+            .map(|s| EmptySlotView {
+                id: s.id,
+                prefix: s.prefix_cache.tokens.as_slice(),
+                prefix_len: s.prefix_cache.prefix_len as u32,
+                ckpt_n: s.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0),
+            })
+            .collect();
+        let views: Vec<WaitingJobView<'_>> = waiting
+            .iter()
+            .map(|j| {
+                let tokens = j.prompt_tokens.as_deref().unwrap_or(&[]);
+                WaitingJobView {
+                    request_id: j.request_id,
+                    n_prompt: tokens.len() as u32,
+                    tokens,
+                }
+            })
+            .collect();
+        policy.join(&empty_views, &views)
+    };
 
     let mut taken = vec![false; waiting.len()];
     let mut picks: Vec<(SlotId, usize)> = Vec::new();
@@ -434,6 +462,21 @@ fn join_waiting(
             .map(slot_kv_used)
             .sum();
         let cap = cap_for_join(others_used, n_active_after, pool, single_max);
+        let (prefix_n, ckpt_n, lcp) = slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .map(|s| {
+                let prefix_n = s.prefix_cache.tokens.len();
+                let ckpt_n = s.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
+                let lcp = job
+                    .prompt_tokens
+                    .as_deref()
+                    .map(|t| common_prefix_len(&s.prefix_cache.tokens, t))
+                    .unwrap_or(0);
+                (prefix_n, ckpt_n, lcp)
+            })
+            .unwrap_or((0, 0, 0));
+        let req = job.request_id;
         let bound = {
             let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) else {
                 waiting.push_front(job);
@@ -446,9 +489,13 @@ fn join_waiting(
             tracing::info!(
                 iter,
                 slot = slot_id.0,
+                request_id = req,
                 cap,
                 others_used,
                 n_active_after,
+                lcp,
+                prefix_n,
+                ckpt_n,
                 "join after decode boundary"
             );
             recompute_slot_caps(slots, pool, single_max);
@@ -456,7 +503,7 @@ fn join_waiting(
     }
 }
 
-fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
+fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bool {
     let seq = slot.id.0 as i32;
     engine.spec_reset_seq(seq);
 
@@ -464,16 +511,23 @@ fn bind_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
         return bind_vision_slot(slot, job, engine, ctx_cap);
     }
 
-    let tokens = match engine.encode(&job.prompt) {
-        Ok(t) if !t.is_empty() => t,
-        Ok(_) => {
+    let tokens = match job.prompt_tokens.take() {
+        Some(t) if !t.is_empty() => t,
+        Some(_) => {
             let _ = job.events.send(SlotEvent::Failed(Error::EmptyPrompt));
             return false;
         }
-        Err(e) => {
-            let _ = job.events.send(SlotEvent::Failed(e));
-            return false;
-        }
+        None => match engine.encode(&job.prompt) {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) => {
+                let _ = job.events.send(SlotEvent::Failed(Error::EmptyPrompt));
+                return false;
+            }
+            Err(e) => {
+                let _ = job.events.send(SlotEvent::Failed(e));
+                return false;
+            }
+        },
     };
     let n_prompt = tokens.len() as u32;
     if n_prompt >= ctx_cap {
@@ -1527,11 +1581,13 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
     if trim_seq_to(engine, seq, reuse_len) {
         return reuse_len;
     }
+    let gpu_after = engine.n_past_seq(seq);
     let Some(ckpt) = slot.prefix_ckpt.as_ref() else {
         tracing::warn!(
             slot = slot.id.0,
             reuse_len,
             gpu_n,
+            gpu_after,
             "prefix seq_rm failed and no checkpoint; full prefill"
         );
         engine.clear_seq(seq);
@@ -1546,6 +1602,7 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
             reuse_len,
             ckpt_n = ckpt.n_tokens,
             gpu_n,
+            gpu_after,
             "prefix checkpoint not usable; full prefill"
         );
         engine.clear_seq(seq);
