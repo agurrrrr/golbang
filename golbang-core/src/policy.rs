@@ -51,15 +51,27 @@ pub struct WaitingJobView<'a> {
 /// must not count against `decode_max`, or `n_parallel=1` never verifies).
 /// `prefill_max` bounds how many prefill tokens one slot may consume per
 /// iteration, so a very long prompt is split across several iterations.
+/// `mixed_prefill_max` bounds **total** prefill tokens in an iteration that
+/// already has decode tokens. `0` = decode-only.
 ///
-/// [`Default`] is the P3 unit-test placeholder (32 / 16). Production must call
-/// [`IterationBudget::for_context`] so the chunk size matches llama.cpp
+/// [`Default`] is the P3 unit-test placeholder (32 / 16 / 0). Production must
+/// call [`IterationBudget::for_context`] so the chunk size matches llama.cpp
 /// `n_batch` / `n_ubatch` — a 32-token cap on a 1024-ubatch context is the
 /// DSV4 long-prompt stall (≈15 tok/s, ~100 decode launches per 3k tokens).
+///
+/// Issue #33: production `--n-batch 2048 --n-ubatch 2048 --n-parallel 2`
+/// mixed a leftover 2048-token prefill into the same `llama_decode` as a
+/// generating slot and dropped gfx906 decode from ~18 t/s to 0.68 t/s.
+/// P3's "other slots decode between ubatches" needs `n_batch > n_ubatch`;
+/// when they are equal the mix is one kernel. `mixed_prefill_max = 0`
+/// keeps that iteration decode-only. Dual-prefill fairness is the planner
+/// splitting leftover across prefilling slots, not this per-slot cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IterationBudget {
     pub prefill_max: usize,
     pub decode_max: usize,
+    /// Total prefill tokens allowed alongside decode. `0` = decode-only.
+    pub mixed_prefill_max: usize,
 }
 
 impl Default for IterationBudget {
@@ -67,6 +79,7 @@ impl Default for IterationBudget {
         Self {
             prefill_max: 32,
             decode_max: 16,
+            mixed_prefill_max: 0,
         }
     }
 }
@@ -76,8 +89,10 @@ impl IterationBudget {
     ///
     /// - `n_parallel == 1`: fill the logical `n_batch`. `llama_decode` splits
     ///   internally by `n_ubatch`, same as llama-server on a single slot.
-    /// - `n_parallel > 1`: cap one slot at `n_ubatch` so other slots' decode
-    ///   can run between physical ubatches (P3 fairness).
+    /// - `n_parallel > 1`: cap one slot at `n_ubatch`. The planner splits that
+    ///   leftover across prefilling slots. Decode-only when any slot is
+    ///   generating (`mixed_prefill_max = 0`) — gfx906 cannot mix a large
+    ///   prefill chunk into the same `llama_decode` as decode.
     pub fn for_context(n_batch: usize, n_ubatch: usize, n_parallel: usize) -> Self {
         let n_ubatch = n_ubatch.max(1);
         let n_batch = n_batch.max(n_ubatch);
@@ -85,6 +100,7 @@ impl IterationBudget {
         Self {
             prefill_max: if n_parallel == 1 { n_batch } else { n_ubatch },
             decode_max: n_parallel,
+            mixed_prefill_max: 0,
         }
     }
 }
@@ -431,6 +447,7 @@ mod tests {
             IterationBudget {
                 prefill_max: 5800,
                 decode_max: 1,
+                mixed_prefill_max: 0,
             }
         );
     }
@@ -443,7 +460,17 @@ mod tests {
             IterationBudget {
                 prefill_max: 1024,
                 decode_max: 2,
+                mixed_prefill_max: 0,
             }
         );
+    }
+
+    #[test]
+    fn context_budget_mixed_prefill_is_decode_only_on_equal_n_batch() {
+        // Production Qwen: --n-batch 2048 --n-ubatch 2048 --n-parallel 2.
+        let b = IterationBudget::for_context(2048, 2048, 2);
+        assert_eq!(b.prefill_max, 2048);
+        assert_eq!(b.decode_max, 2);
+        assert_eq!(b.mixed_prefill_max, 0);
     }
 }

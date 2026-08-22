@@ -44,9 +44,14 @@ impl BatchBuilder {
     /// Decode tokens first (keep generation moving), then fill leftover
     /// capacity with prefill. Does not mutate slots — apply after decode.
     ///
-    /// P3 §4.2: the iteration budget bounds decode tokens per iteration and
-    /// splits any single slot's prefill into `prefill_max`-token chunks so a
-    /// long prompt does not starve other slots' decode.
+    /// P3 §4.2: the iteration budget bounds decode slots per iteration and
+    /// splits any single slot's prefill into `prefill_max`-token chunks.
+    ///
+    /// Issue #33: when every active slot is prefilling, leftover `n_batch` is
+    /// split across those slots so slot 0 cannot take `prefill_max == n_batch`
+    /// and leave slot 1 at `n_tokens=0`. When any slot is decoding, total
+    /// prefill this iteration is `mixed_prefill_max` (`0` = decode-only). A
+    /// 2048-token mix on gfx906 dropped decode from ~18 t/s to 0.68 t/s.
     pub fn plan(&self, slots: &[Slot], order: &[SlotId], budget: IterationBudget) -> BatchPlan {
         let mut plan = BatchPlan::default();
         let cap = self.n_batch;
@@ -93,12 +98,18 @@ impl BatchBuilder {
             }
         }
 
-        // Prefill pass — each slot consumes at most `budget.prefill_max` tokens
-        // per iteration (chunked prefill).
+        let leftover = cap.saturating_sub(plan.tokens.len());
+        let prefill_cap = if decode_slots > 0 {
+            leftover.min(budget.mixed_prefill_max)
+        } else {
+            leftover
+        };
+        if prefill_cap == 0 {
+            return plan;
+        }
+
+        let mut prefills: Vec<(SlotId, &crate::slot::ActiveJob)> = Vec::new();
         for &id in order {
-            if plan.tokens.len() >= cap {
-                break;
-            }
             let Some(slot) = slots.iter().find(|s| s.id == id) else {
                 continue;
             };
@@ -108,13 +119,25 @@ impl BatchBuilder {
             let Some(job) = slot.job.as_ref() else {
                 continue;
             };
-            let remaining = job.prefill_remaining();
-            if remaining == 0 {
+            if job.prefill_remaining() == 0 {
                 continue;
             }
-            let take = remaining
-                .min(cap - plan.tokens.len())
-                .min(budget.prefill_max);
+            prefills.push((id, job));
+        }
+        if prefills.is_empty() {
+            return plan;
+        }
+
+        let remaining: Vec<usize> = prefills
+            .iter()
+            .map(|(_, job)| job.prefill_remaining())
+            .collect();
+        let quotas = split_prefill_quota(prefill_cap, budget.prefill_max, &remaining);
+
+        for ((id, job), take) in prefills.into_iter().zip(quotas) {
+            if take == 0 {
+                continue;
+            }
             // n_past already accounts for the reused prefix (prompt_offset).
             // The first prefill token is `prompt_offset + prompt_pos`.
             let start_pos = job.n_past;
@@ -136,6 +159,47 @@ impl BatchBuilder {
 
         plan
     }
+}
+
+/// Split `cap` prefill tokens across slots that still have prompt left.
+///
+/// Each slot is also bound by `per_slot_max` (`budget.prefill_max`). Equal
+/// shares first; unused remainder from a short slot goes to still-hungry
+/// neighbors so `n_batch` is not left idle.
+fn split_prefill_quota(cap: usize, per_slot_max: usize, remaining: &[usize]) -> Vec<usize> {
+    let n = remaining.len();
+    let mut take = vec![0usize; n];
+    if n == 0 || cap == 0 || per_slot_max == 0 {
+        return take;
+    }
+    let mut left = cap;
+    loop {
+        let hungry: Vec<usize> = (0..n)
+            .filter(|&i| take[i] < remaining[i].min(per_slot_max))
+            .collect();
+        if hungry.is_empty() || left == 0 {
+            break;
+        }
+        let share = (left / hungry.len()).max(1);
+        let mut progressed = false;
+        for &i in &hungry {
+            if left == 0 {
+                break;
+            }
+            let room = remaining[i].min(per_slot_max) - take[i];
+            let add = room.min(share).min(left);
+            if add == 0 {
+                continue;
+            }
+            take[i] += add;
+            left -= add;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    take
 }
 
 #[cfg(test)]
@@ -216,6 +280,7 @@ mod tests {
         let budget = IterationBudget {
             prefill_max: 32,
             decode_max: 16,
+            mixed_prefill_max: 0,
         };
         let plan = BatchBuilder::new(4096).plan(&[slot], &[SlotId(2)], budget);
         assert_eq!(
@@ -243,6 +308,7 @@ mod tests {
         let budget = IterationBudget {
             prefill_max: 32,
             decode_max: 3,
+            mixed_prefill_max: 0,
         };
         let plan = BatchBuilder::new(4096).plan(&slots, &order, budget);
         assert_eq!(plan.tokens.len(), 3, "decode capped at budget.decode_max");
@@ -281,10 +347,120 @@ mod tests {
         let budget = IterationBudget {
             prefill_max: 32,
             decode_max: 1,
+            mixed_prefill_max: 0,
         };
         let plan = BatchBuilder::new(16).plan(&[slot], &[SlotId(0)], budget);
         let toks: Vec<i32> = plan.tokens.iter().map(|t| t.token).collect();
         assert_eq!(toks, vec![1, 2, 3, 4]);
         assert_eq!(plan.logit_slots.len(), 4);
+    }
+
+    fn prefill_slot(id: u32, n: usize) -> Slot {
+        let mut slot = Slot::new(SlotId(id));
+        slot.phase = SlotPhase::Prefilling;
+        slot.job = Some(crate::slot::ActiveJob::for_test(vec![1; n]));
+        slot
+    }
+
+    fn decode_slot(id: u32, pending: Token) -> Slot {
+        let mut slot = Slot::new(SlotId(id));
+        slot.phase = SlotPhase::Decoding;
+        let mut job = crate::slot::ActiveJob::for_test(vec![]);
+        job.pending = Some(pending);
+        slot.job = Some(job);
+        slot
+    }
+
+    /// Production Qwen: --n-batch 2048 --n-ubatch 2048 --n-parallel 2.
+    fn production_np2() -> (BatchBuilder, IterationBudget) {
+        (
+            BatchBuilder::new(2048),
+            IterationBudget::for_context(2048, 2048, 2),
+        )
+    }
+
+    /// Issue #33: two Prefilling slots must both consume in one iteration.
+    /// The old planner gave slot 0 `prefill_max == n_batch` and slot 1 nothing.
+    #[test]
+    fn two_prefill_slots_both_consume_one_iteration() {
+        let (builder, budget) = production_np2();
+        let slots = [prefill_slot(0, 33155), prefill_slot(1, 30815)];
+        let plan = builder.plan(&slots, &[SlotId(0), SlotId(1)], budget);
+        let got: Vec<(u32, u32)> = plan
+            .prefill_consumed
+            .iter()
+            .map(|(id, n)| (id.0, *n))
+            .collect();
+        assert_eq!(got, vec![(0, 1024), (1, 1024)], "n_batch split across both");
+        assert_eq!(plan.tokens.len(), 2048);
+    }
+
+    /// Issue #33: leftover from a short slot must not stay unused while the
+    /// other still has prompt — otherwise n_batch/n_prefill wastes the GPU.
+    #[test]
+    fn two_prefill_slots_short_slot_gives_remainder_to_neighbor() {
+        let (builder, budget) = production_np2();
+        let slots = [prefill_slot(0, 10), prefill_slot(1, 30815)];
+        let plan = builder.plan(&slots, &[SlotId(0), SlotId(1)], budget);
+        let got: Vec<(u32, u32)> = plan
+            .prefill_consumed
+            .iter()
+            .map(|(id, n)| (id.0, *n))
+            .collect();
+        assert_eq!(got, vec![(0, 10), (1, 2038)]);
+        assert_eq!(plan.tokens.len(), 2048);
+    }
+
+    /// Issue #33: a Decoding slot must not share llama_decode with a 2048-token
+    /// prefill chunk. mixed_prefill_max=0 → decode-only, batch stays small.
+    #[test]
+    fn decoding_with_prefill_keeps_the_decode_batch_small() {
+        let (builder, budget) = production_np2();
+        assert_eq!(budget.mixed_prefill_max, 0);
+        let slots = [decode_slot(0, 42), prefill_slot(1, 30815)];
+        let plan = builder.plan(&slots, &[SlotId(0), SlotId(1)], budget);
+        assert_eq!(
+            plan.tokens.len(),
+            1,
+            "decode-only so gfx906 stays ~18 t/s, not 0.68"
+        );
+        assert_eq!(plan.logit_slots, vec![SlotId(0)]);
+        assert!(
+            plan.prefill_consumed.is_empty(),
+            "large leftover must not fill with prefill"
+        );
+        assert_eq!(plan.tokens[0].token, 42);
+    }
+
+    /// mixed_prefill_max > 0 still caps the mix so decode is not buried in n_batch.
+    #[test]
+    fn decoding_with_prefill_honors_mixed_prefill_max() {
+        let builder = BatchBuilder::new(2048);
+        let budget = IterationBudget {
+            prefill_max: 2048,
+            decode_max: 2,
+            mixed_prefill_max: 64,
+        };
+        let slots = [decode_slot(0, 7), prefill_slot(1, 30815)];
+        let plan = builder.plan(&slots, &[SlotId(0), SlotId(1)], budget);
+        assert_eq!(plan.tokens.len(), 1 + 64);
+        assert_eq!(plan.prefill_consumed, vec![(SlotId(1), 64)]);
+        assert_eq!(plan.logit_slots[0], SlotId(0));
+    }
+
+    #[test]
+    fn split_prefill_quota_table() {
+        let cases: &[(&str, usize, usize, &[usize], &[usize])] = &[
+            ("equal two", 2048, 2048, &[33155, 30815], &[1024, 1024]),
+            ("short then long", 2048, 2048, &[10, 30815], &[10, 2038]),
+            ("one slot", 2048, 2048, &[33155], &[2048]),
+            ("per-slot cap", 2048, 512, &[10000, 10000], &[512, 512]),
+            ("empty remaining", 2048, 2048, &[0, 100], &[0, 100]),
+            ("odd leftover", 3, 32, &[10, 10], &[2, 1]),
+        ];
+        for (name, cap, per, remaining, want) in cases {
+            let got = split_prefill_quota(*cap, *per, remaining);
+            assert_eq!(&got, want, "{name}");
+        }
     }
 }

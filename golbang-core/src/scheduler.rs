@@ -195,6 +195,7 @@ async fn run_loop(
         n_ubatch,
         prefill_max = budget.prefill_max,
         decode_max = budget.decode_max,
+        mixed_prefill_max = budget.mixed_prefill_max,
         "scheduler budget"
     );
     let pool = engine.n_ctx();
@@ -354,6 +355,7 @@ fn resolve_budget(
     IterationBudget {
         prefill_max: requested.prefill_max.min(n_batch).max(1),
         decode_max: requested.decode_max.max(1),
+        mixed_prefill_max: requested.mixed_prefill_max.min(n_batch),
     }
 }
 
@@ -1682,6 +1684,7 @@ mod tests {
         let b = resolve_budget(IterationBudget::default(), 5800, 1024, 1);
         assert_eq!(b.prefill_max, 5800);
         assert_eq!(b.decode_max, 1);
+        assert_eq!(b.mixed_prefill_max, 0);
     }
 
     #[test]
@@ -1690,6 +1693,7 @@ mod tests {
             IterationBudget {
                 prefill_max: 99999,
                 decode_max: 4,
+                mixed_prefill_max: 99999,
             },
             5800,
             1024,
@@ -1697,6 +1701,7 @@ mod tests {
         );
         assert_eq!(b.prefill_max, 5800);
         assert_eq!(b.decode_max, 4);
+        assert_eq!(b.mixed_prefill_max, 5800);
     }
 
     #[test]
