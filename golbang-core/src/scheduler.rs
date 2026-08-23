@@ -45,6 +45,10 @@ pub struct SchedulerConfig {
     pub default_timeout: Option<Duration>,
     /// Solo-slot KV cap (`--single-max-ctx`). `0` = full pool (`n_ctx * n_seq_max`).
     pub single_max_ctx: u32,
+    /// Speculative verify budget (`SpecParams::verify_n_max()`). `0` = spec off.
+    /// Caps reserve `(spec_n_max + 1) * n_active` draft cells from the pool so
+    /// a verify step never overruns into another sequence's cells (#8565).
+    pub spec_n_max: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -54,6 +58,7 @@ impl Default for SchedulerConfig {
             queue_capacity: 2,
             default_timeout: None,
             single_max_ctx: 0,
+            spec_n_max: 0,
         }
     }
 }
@@ -200,9 +205,11 @@ async fn run_loop(
     );
     let pool = engine.n_ctx();
     let single_max = resolve_single_max(config.single_max_ctx, pool);
+    let spec_n_max = config.spec_n_max;
     tracing::info!(
         pool,
         single_max,
+        spec_n_max,
         n_ctx_seq = engine.n_ctx_seq(),
         "scheduler ctx pool"
     );
@@ -243,10 +250,11 @@ async fn run_loop(
             &engine,
             pool,
             single_max,
+            spec_n_max,
             iter,
             &metrics,
         );
-        recompute_slot_caps(&mut slots, pool, single_max);
+        recompute_slot_caps(&mut slots, pool, single_max, spec_n_max);
 
         let mut order = policy.rank(&slot_views(&slots));
         if order.is_empty() {
@@ -337,7 +345,8 @@ async fn run_loop(
             }
         }
         evict_finished(&mut slots, &engine, iter, &metrics);
-        recompute_slot_caps(&mut slots, pool, single_max);
+        release_retained_under_pressure(&mut slots, &engine, pool);
+        recompute_slot_caps(&mut slots, pool, single_max, spec_n_max);
     }
 }
 
@@ -383,6 +392,7 @@ fn join_waiting(
     engine: &Engine,
     pool: u32,
     single_max: u32,
+    spec_n_max: u32,
     iter: u64,
     metrics: &SchedulerMetrics,
 ) {
@@ -463,7 +473,7 @@ fn join_waiting(
             .filter(|s| s.id != slot_id)
             .map(slot_kv_used)
             .sum();
-        let cap = cap_for_join(others_used, n_active_after, pool, single_max);
+        let cap = cap_for_join(others_used, n_active_after, pool, single_max, spec_n_max);
         let (prefix_n, ckpt_n, lcp) = slots
             .iter()
             .find(|s| s.id == slot_id)
@@ -500,7 +510,7 @@ fn join_waiting(
                 ckpt_n,
                 "join after decode boundary"
             );
-            recompute_slot_caps(slots, pool, single_max);
+            recompute_slot_caps(slots, pool, single_max, spec_n_max);
         }
     }
 }
@@ -1295,10 +1305,12 @@ fn finish_slot(
                 ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0),
                 "prefix kv retained"
             );
+            slot.retained_at = Some(Instant::now());
         } else {
             engine.clear_seq(id.0 as i32);
             slot.prefix_cache.reset();
             slot.prefix_ckpt = None;
+            slot.retained_at = None;
         }
         let timings = job.timings(Instant::now());
         record_request_totals(metrics, &timings);
@@ -1500,7 +1512,7 @@ fn slot_kv_used(slot: &Slot) -> u32 {
 }
 
 /// Recompute per-job `ctx_cap` from occupancy. Call on join/leave.
-fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32) {
+fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32, spec_n_max: u32) {
     let n_active = slots.iter().filter(|s| s.is_active()).count() as u32;
     if n_active == 0 {
         return;
@@ -1511,9 +1523,9 @@ fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32) {
         let Some(job) = slot.job.as_mut() else {
             continue;
         };
-        let policy = slot_cap(single_max, used[i], pool, n_active);
+        let policy = slot_cap(single_max, used[i], pool, n_active, spec_n_max);
         let others = total_used.saturating_sub(used[i]);
-        let cap = effective_cap(policy, used[i], pool, others);
+        let cap = effective_cap(policy, used[i], pool, others, spec_n_max, n_active);
         if job.ctx_cap != cap {
             tracing::info!(
                 slot = slot.id.0,
@@ -1538,8 +1550,42 @@ fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
             engine.clear_seq(id.0 as i32);
             slot.prefix_cache.reset();
             slot.prefix_ckpt = None;
+            slot.retained_at = None;
             let _ = job.events.send(SlotEvent::Failed(err.clone()));
         }
+    }
+}
+
+/// Retained prefix KV (#8554 affinity) is released once it has idled past
+/// `RETAINED_TTL`, or immediately when total pool occupancy crosses
+/// `RETAINED_WATERMARK` — otherwise a finished 70k session starves a live
+/// one into `failed to find a memory slot` (#8565).
+const RETAINED_TTL: Duration = Duration::from_secs(30);
+const RETAINED_WATERMARK: f64 = 0.85;
+
+fn retained_release_due(age_secs: f64, total_used: u32, pool: u32) -> bool {
+    if age_secs >= RETAINED_TTL.as_secs_f64() {
+        return true;
+    }
+    pool > 0 && f64::from(total_used) > RETAINED_WATERMARK * f64::from(pool)
+}
+
+fn release_retained_under_pressure(slots: &mut [Slot], engine: &Engine, pool: u32) {
+    let total_used: u32 = slots.iter().map(slot_kv_used).sum();
+    for slot in slots.iter_mut() {
+        let Some(at) = slot.retained_at else {
+            continue; // active job or nothing retained
+        };
+        if !retained_release_due(at.elapsed().as_secs_f64(), total_used, pool) {
+            continue;
+        }
+        let id = slot.id;
+        let n = slot_kv_used(slot);
+        engine.clear_seq(id.0 as i32);
+        slot.prefix_cache.reset();
+        slot.prefix_ckpt = None;
+        slot.retained_at = None;
+        tracing::info!(slot = id.0, retained_cells = n, total_used, pool, "retained prefix kv released");
     }
 }
 
@@ -1748,7 +1794,7 @@ mod tests {
         solo.n_past = 0;
         solo.max_tokens_req = 100_000;
         slots[0].occupy(solo);
-        recompute_slot_caps(&mut slots, T, S);
+        recompute_slot_caps(&mut slots, T, S, 0);
         assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
 
         slots[0].job.as_mut().unwrap().n_past = 35_000;
@@ -1758,19 +1804,34 @@ mod tests {
         second.n_past = 0;
         second.max_tokens_req = 100_000;
         slots[1].occupy(second);
-        recompute_slot_caps(&mut slots, T, S);
+        recompute_slot_caps(&mut slots, T, S, 0);
         assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 40_000);
         assert_eq!(slots[1].job.as_ref().unwrap().ctx_cap, 40_000);
 
         slots[0].job.as_mut().unwrap().n_past = 60_000;
         slots[0].job.as_mut().unwrap().n_prompt = 1_000;
-        recompute_slot_caps(&mut slots, T, S);
+        recompute_slot_caps(&mut slots, T, S, 0);
         assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
         assert_eq!(slots[1].job.as_ref().unwrap().ctx_cap, 20_000);
 
         let _ = slots[1].evict();
-        recompute_slot_caps(&mut slots, T, S);
+        recompute_slot_caps(&mut slots, T, S, 0);
         assert_eq!(slots[0].job.as_ref().unwrap().ctx_cap, 60_000);
+    }
+
+    #[test]
+    fn retained_release_due_on_ttl_or_watermark() {
+        let pool = 140_032;
+        // Under TTL and under watermark: keep.
+        assert!(!retained_release_due(10.0, 60_000, pool));
+        // Over TTL: release regardless of occupancy.
+        assert!(retained_release_due(31.0, 60_000, pool));
+        // Under TTL but past the 85% watermark: release.
+        assert!(retained_release_due(1.0, 125_000, pool));
+        // Exactly at the watermark boundary (not strictly above): keep.
+        let at_mark = (RETAINED_WATERMARK * f64::from(pool)) as u32;
+        assert!(!retained_release_due(1.0, at_mark, pool));
+        assert!(retained_release_due(1.0, at_mark + 1, pool));
     }
 
     #[tokio::test]

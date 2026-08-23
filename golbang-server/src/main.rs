@@ -242,6 +242,9 @@ async fn main() -> Result<()> {
         cache_type_v: parse_ggml_type(&args.spec_draft_type_v).map_err(anyhow::Error::msg)?,
     };
     let load_mtp = args.load_mtp || spec.wants_mtp();
+    // Captured before `spec` is moved into Model::load: the scheduler reserves
+    // (verify_n_max + 1) * n_active draft cells from the KV pool (#8565).
+    let spec_n_max = spec.verify_n_max().max(0) as u32;
     if spec.enabled() {
         tracing::info!(
             types = ?spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
@@ -336,6 +339,7 @@ async fn main() -> Result<()> {
             queue_capacity: args.queue_size.max(1),
             default_timeout: args.timeout_secs.map(Duration::from_secs),
             single_max_ctx: args.single_max_ctx,
+            spec_n_max,
         },
     );
 

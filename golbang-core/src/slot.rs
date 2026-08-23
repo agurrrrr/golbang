@@ -313,6 +313,8 @@ pub struct Slot {
     /// Prefill-end snapshot. DSV4 cannot `seq_rm` a long generated suffix
     /// (`n_rs_seq` is tiny), so the next bind restores this then trims 1 token.
     pub(crate) prefix_ckpt: Option<SeqCheckpoint>,
+    /// When this empty slot last retained prefix KV. `None` if nothing is held.
+    pub(crate) retained_at: Option<Instant>,
 }
 
 /// Host copy of one sequence at a known length (see [`Slot::prefix_ckpt`]).
@@ -329,6 +331,7 @@ impl Slot {
             job: None,
             prefix_cache: Default::default(),
             prefix_ckpt: None,
+            retained_at: None,
         }
     }
 
@@ -343,6 +346,7 @@ impl Slot {
     pub(crate) fn occupy(&mut self, job: ActiveJob) {
         self.phase = SlotPhase::Prefilling;
         self.job = Some(job);
+        self.retained_at = None;
     }
 
     pub(crate) fn evict(&mut self) -> Option<ActiveJob> {
@@ -386,6 +390,14 @@ mod tests {
         job.prompt_pos = 3;
         assert!(job.prefill_done());
         assert_eq!(job.prefill_cursor(), 3);
+    }
+
+    #[test]
+    fn occupy_clears_retained_at() {
+        let mut slot = Slot::new(SlotId(0));
+        slot.retained_at = Some(Instant::now());
+        slot.occupy(ActiveJob::for_test(vec![1]));
+        assert!(slot.retained_at.is_none());
     }
 
     #[test]
