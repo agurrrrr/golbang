@@ -481,7 +481,13 @@ impl Model {
         }
     }
 
-    /// Drop one sequence's KV. Whole-sequence remove never fails (llama.h).
+    /// Drop one sequence's KV from every context we own (target + MTP).
+    /// Whole-sequence remove never fails (llama.h).
+    ///
+    /// The MTP context mirrors the target 1:1 but has its **own** pool of the
+    /// same size. Clearing only the target leaves stale MTP cells behind: a
+    /// retained 70k session starves the next 70k decode into `failed to find
+    /// a memory slot` while main decode stays healthy (#8565 recurrence).
     pub fn clear_seq(&mut self, seq_id: i32) {
         unsafe {
             let mem = llama_get_memory(self.ctx);
@@ -489,6 +495,7 @@ impl Model {
                 llama_memory_seq_rm(mem, seq_id, -1, -1);
             }
         }
+        self.spec_clear_mtp_kv(seq_id);
     }
 
     /// Drop KV cells at positions `[p0, inf)` for `seq_id`. False if llama.cpp

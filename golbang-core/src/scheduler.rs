@@ -1297,6 +1297,14 @@ fn finish_slot(
                 slot.prefix_cache
                     .remember(&job.prompt_tokens, &job.generated, job.n_past);
             }
+            // The MTP context mirrors the target 1:1 in its OWN pool of the
+            // same size, but a rebind always resets it (`bind_slot` →
+            // `spec_reset_seq`). Keeping the retained session's MTP cells
+            // only blocks that pool: a 70k retained session left ~70k stale
+            // MTP cells behind and starved the next 70k decode into
+            // `failed to find a memory slot` while main decode stayed healthy
+            // (#8565 recurrence, 2026-08-23 23:37). Drop them now.
+            engine.spec_reset_seq(id.0 as i32);
             tracing::info!(
                 slot = id.0,
                 request_id = job.request_id,
