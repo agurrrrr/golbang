@@ -471,7 +471,7 @@ fn join_waiting(
         let others_used: u32 = slots
             .iter()
             .filter(|s| s.id != slot_id)
-            .map(slot_kv_used)
+            .map(slot_kv_used_for_cap)
             .sum();
         let cap = cap_for_join(others_used, n_active_after, pool, single_max, spec_n_max);
         let (prefix_n, ckpt_n, lcp) = slots
@@ -1506,7 +1506,11 @@ fn maybe_log_decode_progress(slot: u32, job: &mut ActiveJob) {
     job.last_progress_n = job.n_generated;
 }
 
-/// KV cells this slot currently occupies (active job or retained prefix).
+/// KV cells this slot actually occupies (active job or retained prefix).
+///
+/// Used for pressure accounting (`release_retained_under_pressure`) where the
+/// real occupancy matters. Cap assignment must NOT include retained slots —
+/// see [`slot_kv_used_for_cap`].
 fn slot_kv_used(slot: &Slot) -> u32 {
     if let Some(job) = slot.job.as_ref() {
         return job.n_past.max(job.n_prompt);
@@ -1519,13 +1523,27 @@ fn slot_kv_used(slot: &Slot) -> u32 {
     cached.max(ckpt)
 }
 
+/// KV cells a slot counts against the shared pool when assigning ctx caps.
+///
+/// A retained slot (`job.is_none()`) still holds prefix KV, but that is
+/// released under pressure and must not shrink a live job's cap — otherwise a
+/// solo slot could be starved below its full `S` even though nothing else is
+/// actively running (#8565). So retained slots count as 0 for cap purposes.
+fn slot_kv_used_for_cap(slot: &Slot) -> u32 {
+    if slot.job.is_some() {
+        slot_kv_used(slot)
+    } else {
+        0
+    }
+}
+
 /// Recompute per-job `ctx_cap` from occupancy. Call on join/leave.
 fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32, spec_n_max: u32) {
     let n_active = slots.iter().filter(|s| s.is_active()).count() as u32;
     if n_active == 0 {
         return;
     }
-    let used: Vec<u32> = slots.iter().map(slot_kv_used).collect();
+    let used: Vec<u32> = slots.iter().map(slot_kv_used_for_cap).collect();
     let total_used: u32 = used.iter().copied().sum();
     for (i, slot) in slots.iter_mut().enumerate() {
         let Some(job) = slot.job.as_mut() else {
@@ -1789,6 +1807,39 @@ mod tests {
             data: Vec::new(),
         });
         assert_eq!(slot_kv_used(&slot), 20_000);
+    }
+
+    /// #8565 regression: a retained slot (job None) must NOT shrink a live
+    /// slot's cap. `slot_kv_used` still reports the retained prefix for
+    /// pressure accounting, but cap assignment uses `slot_kv_used_for_cap`.
+    #[test]
+    fn retained_slot_counts_zero_for_cap() {
+        let mut retained = Slot::new(SlotId(0));
+        retained.prefix_cache.prefix_len = 69_638;
+        // pressure accounting still sees the real occupancy
+        assert_eq!(slot_kv_used(&retained), 69_638);
+        // cap assignment ignores it
+        assert_eq!(slot_kv_used_for_cap(&retained), 0);
+    }
+
+    #[test]
+    fn retained_slot_does_not_shrink_solo_cap() {
+        const T: u32 = 80_000;
+        const S: u32 = 60_000;
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+
+        // slot1 retains a huge prefix (job finished), slot2 is the live solo job.
+        slots[0].prefix_cache.prefix_len = 60_000;
+        let mut live = ActiveJob::for_test(vec![1]);
+        live.n_prompt = 0;
+        live.n_past = 0;
+        live.max_tokens_req = 100_000;
+        slots[1].occupy(live);
+        recompute_slot_caps(&mut slots, T, S, 0);
+
+        // Without the fix, others_used=60000 would cap slot2 at 20000.
+        let cap = slots[1].job.as_ref().unwrap().ctx_cap;
+        assert_eq!(cap, S, "retained prefix must not shrink the live solo cap");
     }
 
     #[test]
