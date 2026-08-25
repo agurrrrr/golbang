@@ -1,4 +1,7 @@
-//! P0 connection check: load a small GGUF, decode `"Hello"` once on gfx906.
+//! P0 connection check: load a small GGUF, decode `"Hello"` once.
+//!
+//! Backend (`hip` | `cuda`) is selected by `GOLBANG_GPU` at build time; the
+//! test asserts the matching backend/device strings.
 //!
 //! ```text
 //! GOLBANG_TEST_MODEL=/path/to/small.gguf cargo test -p golbang-sys -- --nocapture
@@ -71,7 +74,14 @@ fn parse_offloaded_layers(logs: &str) -> Option<(u32, u32)> {
 }
 
 #[test]
-fn hello_decode_once_on_gfx906() {
+fn hello_decode_once_on_gpu() {
+    let gpu = env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
+    let gpu = gpu.trim().to_lowercase();
+    let (expect_backend, expect_device): (Vec<&str>, Vec<&str>) = match gpu.as_str() {
+        "cuda" => (vec!["CUDA"], vec!["CUDA", "NVIDIA", "GeForce"]),
+        _ => (vec!["HIP", "ROCm"], vec!["gfx906", "0x66a1"]),
+    };
+
     let model_path = match env::var("GOLBANG_TEST_MODEL") {
         Ok(p) if !p.is_empty() => p,
         _ => {
@@ -126,8 +136,8 @@ fn hello_decode_once_on_gfx906() {
         assert!(
             backend_names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case("HIP") || n.eq_ignore_ascii_case("ROCm")),
-            "no HIP/ROCm backend registered; got {backend_names:?}"
+                .any(|n| expect_backend.iter().any(|b| n.eq_ignore_ascii_case(b))),
+            "no expected backend registered; got {backend_names:?} (expected {expect_backend:?})"
         );
 
         let mut device_blob = String::new();
@@ -253,23 +263,25 @@ fn hello_decode_once_on_gfx906() {
         );
 
         let logs = logs_snapshot();
-        let hipish = logs.contains("HIP")
-            || logs.contains("ROCm")
-            || logs.contains("hip")
+        let backendish = expect_backend
+            .iter()
+            .any(|b| logs.to_uppercase().contains(&b.to_uppercase()))
             || backend_names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case("HIP") || n.eq_ignore_ascii_case("ROCm"));
-        let gfx = logs.contains("gfx906")
-            || logs.contains("0x66a1")
-            || device_blob.contains("gfx906")
-            || device_blob.contains("0x66a1");
+                .any(|n| expect_backend.iter().any(|b| n.eq_ignore_ascii_case(b)));
+        let deviceish = expect_device
+            .iter()
+            .any(|d| logs.to_uppercase().contains(&d.to_uppercase()))
+            || device_blob
+                .to_uppercase()
+                .contains(&expect_device[0].to_uppercase());
         assert!(
-            hipish,
-            "logs/backends do not mention HIP/ROCm — possible CPU fallback\n{logs}"
+            backendish,
+            "logs/backends do not mention expected backend {expect_backend:?} — possible CPU fallback\n{logs}"
         );
         assert!(
-            gfx,
-            "logs/devices do not mention gfx906/0x66a1\nlogs:\n{logs}\ndevices:\n{device_blob}"
+            deviceish,
+            "logs/devices do not mention expected device {expect_device:?}\nlogs:\n{logs}\ndevices:\n{device_blob}"
         );
 
         drop(session);

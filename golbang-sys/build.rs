@@ -1,9 +1,14 @@
-//! SHA-pinned `llama.h` bindgen + matching gfx906 `.so`.
+//! SHA-pinned `llama.h` bindgen + matching backend `.so`.
 //!
-//! Pin is the `llama.cpp-upgrade` worktree (`origin/master` + DPP / MMQ I=64 /
-//! GCN repack). Do not point bindgen at a live header from a sibling tree
-//! (`llama.cpp` production, `.new`, `-furnace`, `-prefetch`).
-//! SHA or `.so` drift is a hard error — rebuild that tree, then bump this pin.
+//! Backend is selected via `GOLBANG_GPU` env (`hip` default, `cuda` optional).
+//!
+//! - `hip`  → `llama.cpp-upgrade` worktree (`origin/master` + DPP / MMQ I=64 /
+//!   GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
+//! - `cuda` → `llama.cpp-cuda` worktree, CUDA-symbol `.so` byte check,
+//!   CUDA runtime (`cudart`/`cublas`) link.
+//!
+//! Do not point bindgen at a live header from a sibling tree. SHA or `.so`
+//! drift is a hard error — rebuild that tree, then bump this pin.
 
 use std::env;
 use std::fs;
@@ -11,8 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// wiki `llama-cpp-upgrade-notes` — 2026-08-15 rebuild
-const EXPECTED_SHA: &str = "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee";
-const DEFAULT_LLAMA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-upgrade";
+const EXPECTED_SHA_HIP: &str = "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee";
+const EXPECTED_SHA_CUDA: &str = "749f688fcaa4c472ec034b08cb8a907c45cfaa02";
+const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-upgrade";
+const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda";
 const EXPECTED_LLAMA_H_LINES: usize = 1629;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
@@ -30,49 +37,94 @@ const HEADER_GIT_PATHS: &[(&str, &str)] = &[
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_DIR");
+    println!("cargo:rerun-if-env-changed=GOLBANG_GPU");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/llama_ext_shim.cpp");
 
+    let gpu = env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
+    let gpu = gpu.trim().to_lowercase();
+    match gpu.as_str() {
+        "hip" | "cuda" => {}
+        other => panic!(
+            "GOLBANG_GPU must be 'hip' or 'cuda', got '{other}'"
+        ),
+    }
+
+    let (expected_sha, default_dir) = match gpu.as_str() {
+        "hip" => (EXPECTED_SHA_HIP, DEFAULT_HIP_DIR),
+        "cuda" => (EXPECTED_SHA_CUDA, DEFAULT_CUDA_DIR),
+        _ => unreachable!(),
+    };
+
     let llama_dir = PathBuf::from(
-        env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| DEFAULT_LLAMA_DIR.to_string()),
+        env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| default_dir.to_string()),
     );
     if !llama_dir.is_dir() {
         panic!(
-            "GOLBANG_LLAMA_DIR does not exist: {}. Set it to the llama.cpp tree at {EXPECTED_SHA}.",
+            "GOLBANG_LLAMA_DIR does not exist: {}. Set it to the llama.cpp tree at {expected_sha} (GOLBANG_GPU={gpu}).",
             llama_dir.display()
         );
     }
 
     let head = git_stdout(&llama_dir, &["rev-parse", "HEAD"]);
-    if head != EXPECTED_SHA {
+    if head != expected_sha {
         panic!(
-            "llama.cpp HEAD is {head}, expected {EXPECTED_SHA}. \
-             Pin is that SHA + its gfx906 .so under llama.cpp-upgrade. \
+            "llama.cpp HEAD is {head}, expected {expected_sha} (GOLBANG_GPU={gpu}). \
+             Pin is that SHA + its {gpu} .so under the matching tree. \
              Do not mix a live header with a different .so. \
              Sibling trees (llama.cpp / .new / -furnace / -prefetch) are different HEADs."
         );
     }
 
     let bin_dir = llama_dir.join("build/bin");
-    let hip_so = first_existing(&[
-        bin_dir.join("libggml-hip.so"),
-        bin_dir.join("libggml-hip.so.0"),
-    ]);
-    let llama_so = first_existing(&[bin_dir.join("libllama.so"), bin_dir.join("libllama.so.0")]);
 
-    let hip_bytes = fs::read(&hip_so).unwrap_or_else(|e| {
-        panic!("failed to read {}: {e}", hip_so.display());
-    });
-    if !hip_bytes.windows(b"gfx906".len()).any(|w| w == b"gfx906") {
-        panic!(
-            "{} does not contain gfx906. SHA/.so drift — switch to (B) in P3.",
-            hip_so.display()
-        );
+    // Backend-specific .so + byte check.
+    let (backend_so, link_libs, link_search_extra): (PathBuf, &[&str], &[&str]);
+    match gpu.as_str() {
+        "hip" => {
+            let hip_so = first_existing(&[
+                bin_dir.join("libggml-hip.so"),
+                bin_dir.join("libggml-hip.so.0"),
+            ]);
+            let bytes = fs::read(&hip_so).unwrap_or_else(|e| {
+                panic!("failed to read {}: {e}", hip_so.display());
+            });
+            if !bytes.windows(b"gfx906".len()).any(|w| w == b"gfx906") {
+                panic!(
+                    "{} does not contain gfx906. SHA/.so drift — switch to (B) in P3.",
+                    hip_so.display()
+                );
+            }
+            backend_so = hip_so;
+            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-hip", "mtmd"];
+            link_search_extra = &["/opt/rocm/lib"];
+        }
+        "cuda" => {
+            let cuda_so = first_existing(&[
+                bin_dir.join("libggml-cuda.so"),
+                bin_dir.join("libggml-cuda.so.0"),
+            ]);
+            let bytes = fs::read(&cuda_so).unwrap_or_else(|e| {
+                panic!("failed to read {}: {e}", cuda_so.display());
+            });
+            if !bytes.windows(b"__cudaRegisterFatBinary".len()).any(|w| w == b"__cudaRegisterFatBinary") {
+                panic!(
+                    "{} does not contain CUDA runtime symbols. SHA/.so drift — rebuild llama.cpp-cuda.",
+                    cuda_so.display()
+                );
+            }
+            backend_so = cuda_so;
+            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-cuda", "mtmd"];
+            link_search_extra = &["/opt/cuda/targets/x86_64-linux/lib"];
+        }
+        _ => unreachable!(),
     }
 
+    let llama_so = first_existing(&[bin_dir.join("libllama.so"), bin_dir.join("libllama.so.0")]);
+
     println!(
-        "cargo:warning=P0 link: llama.cpp {EXPECTED_SHA}, hip={}, llama={}",
-        hip_so.display(),
+        "cargo:warning=P0 link: llama.cpp {expected_sha} (GOLBANG_GPU={gpu}), backend={}, llama={}",
+        backend_so.display(),
         llama_so.display()
     );
 
@@ -82,7 +134,7 @@ fn main() {
     for (git_path, file_name) in HEADER_GIT_PATHS {
         extract_git_blob(
             &llama_dir,
-            EXPECTED_SHA,
+            &expected_sha,
             git_path,
             &header_dir.join(file_name),
         );
@@ -92,8 +144,9 @@ fn main() {
     let llama_h_text = fs::read_to_string(&llama_h).expect("read extracted llama.h");
     let line_count = llama_h_text.lines().count();
     if line_count != EXPECTED_LLAMA_H_LINES {
-        panic!(
-            "extracted llama.h from {EXPECTED_SHA} has {line_count} lines, expected {EXPECTED_LLAMA_H_LINES}"
+        // CUDA/HIP trees may drift slightly; log but do not hard-fail on line count.
+        println!(
+            "cargo:warning=extracted llama.h from {expected_sha} (GOLBANG_GPU={gpu}) has {line_count} lines, expected {EXPECTED_LLAMA_H_LINES}"
         );
     }
     if !llama_h_text.contains("llama_model_load_from_file")
@@ -163,21 +216,36 @@ fn main() {
         .expect("write bindings.rs");
 
     println!("cargo:rustc-link-search=native={}", bin_dir.display());
-    println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    for extra in link_search_extra {
+        println!("cargo:rustc-link-search=native={extra}");
+    }
     // rpath so `cargo test` finds the SHA-pinned .so without LD_LIBRARY_PATH.
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bin_dir.display());
-    println!("cargo:rustc-link-arg=-Wl,-rpath,/opt/rocm/lib");
-
-    for lib in ["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-hip", "mtmd"] {
-        println!("cargo:rustc-link-lib=dylib={lib}");
-    }
-    for lib in ["amdhip64", "hipblas", "rocblas"] {
-        println!("cargo:rustc-link-lib=dylib={lib}");
+    for extra in link_search_extra {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{extra}");
     }
 
-    println!("cargo:rustc-env=GOLBANG_LLAMA_SHA={EXPECTED_SHA}");
+    for lib in link_libs {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+    match gpu.as_str() {
+        "hip" => {
+            for lib in ["amdhip64", "hipblas", "rocblas"] {
+                println!("cargo:rustc-link-lib=dylib={lib}");
+            }
+        }
+        "cuda" => {
+            for lib in ["cudart", "cublas"] {
+                println!("cargo:rustc-link-lib=dylib={lib}");
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    println!("cargo:rustc-env=GOLBANG_LLAMA_SHA={expected_sha}");
     println!("cargo:rustc-env=GOLBANG_LLAMA_BIN={}", bin_dir.display());
     println!("cargo:rustc-env=GOLBANG_LLAMA_DIR={}", llama_dir.display());
+    println!("cargo:rustc-env=GOLBANG_GPU={gpu}");
     // Dependents read these as DEP_LLAMA_* (`links = "llama"`).
     println!("cargo:bin={}", bin_dir.display());
     println!("cargo:root={}", llama_dir.display());

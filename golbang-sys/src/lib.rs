@@ -1,8 +1,8 @@
 //! Low-level FFI for the SHA-pinned `llama.h` (P0).
 //!
 //! Safe wrappers live in `golbang-core` (P1). This crate only exposes the C ABI
-//! generated from `/home/agurrrrr/code/local-llm/llama.cpp-upgrade` @
-//! `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
+//! generated from the SHA-pinned llama.cpp tree selected by `GOLBANG_GPU`
+//! (`hip` → `llama.cpp-upgrade` / `cuda` → `llama.cpp-cuda`).
 //!
 //! Current names: [`llama_model_load_from_file`], [`llama_init_from_model`],
 //! [`llama_model_free`]. The older `llama_load_model_from_file` /
@@ -51,6 +51,12 @@ mod api_names {
         let _get_h = golbang_llama_get_embeddings_nextn;
         let _mtmd = mtmd_init_from_file;
         let _bmp = mtmd_helper_bitmap_init_from_buf;
-        assert_eq!(LLAMA_CPP_SHA, "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee");
+        let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
+        let expected = if gpu.trim().eq_ignore_ascii_case("cuda") {
+            "749f688fcaa4c472ec034b08cb8a907c45cfaa02"
+        } else {
+            "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee"
+        };
+        assert_eq!(LLAMA_CPP_SHA, expected);
     }
 }
