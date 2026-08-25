@@ -1,7 +1,7 @@
 [Unit]
 Description=golbang OpenAI server - Qwen3.8-27B UD-IQ2_S (RTX 3060 CUDA)
 After=network.target
-Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service llama-server.service golbang-deepseek.service golbang-qwen48.service
+Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service
 
 [Service]
 Type=simple
@@ -19,7 +19,7 @@ ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
   --n-ctx 40000 --n-batch 512 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 2 --queue-size 2 --single-max-ctx 64000 --kv-unified \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 40000 \
   --no-mmap --jinja \
   --api-key REDACTED_KEY1
 Restart=on-failure
