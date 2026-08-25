@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Safe GGUF model / tokenizer / sampler / generate (P1)"
+links = "golbang_core"
 
 [dependencies]
 golbang-sys = { workspace = true }

@@ -1142,13 +1142,38 @@ fn init_backend() {
         unsafe {
             llama_log_set(Some(forward_llama_log), ptr::null_mut());
             llama_backend_init();
-            // cargo test / the server binary do not sit next to libggml-hip.so
+            // cargo test / the server binary do not sit next to libggml-{hip,cuda}.so
             let bin = CString::new(golbang_sys::LLAMA_BIN_DIR).expect("LLAMA_BIN_DIR");
             ggml_backend_load_all_from_path(bin.as_ptr());
+
+            // Enumerate registered backends + their devices so the CUDA (or HIP)
+            // backend is visible in the boot log.
+            let reg_count = ggml_backend_reg_count();
+            for reg_idx in 0..reg_count {
+                let reg = ggml_backend_reg_get(reg_idx);
+                if reg.is_null() {
+                    continue;
+                }
+                let name = CStr::from_ptr(ggml_backend_reg_name(reg)).to_string_lossy();
+                let dev_count = ggml_backend_reg_dev_count(reg);
+                tracing::info!(backend = %name, devices = dev_count, "registered backend");
+                for dev_idx in 0..dev_count {
+                    let dev = ggml_backend_reg_dev_get(reg, dev_idx);
+                    if dev.is_null() {
+                        continue;
+                    }
+                    let dev_name =
+                        CStr::from_ptr(ggml_backend_dev_name(dev)).to_string_lossy();
+                    let desc = CStr::from_ptr(ggml_backend_dev_description(dev))
+                        .to_string_lossy();
+                    tracing::info!(backend = %name, device = %dev_name, desc = %desc, "backend device");
+                }
+            }
         }
         tracing::info!(
             bin = golbang_sys::LLAMA_BIN_DIR,
             sha = golbang_sys::LLAMA_CPP_SHA,
+            gpu = golbang_sys::GOLBANG_GPU,
             "llama backend initialized"
         );
     });
