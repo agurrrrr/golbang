@@ -1,4 +1,6 @@
 /target
+/target-hip/
+/target-cuda/
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb
