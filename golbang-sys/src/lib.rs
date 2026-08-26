@@ -32,6 +32,9 @@ pub const LLAMA_CPP_SHA: &str = env!("GOLBANG_LLAMA_SHA");
 /// `build/bin` of the SHA-pinned tree — pass to [`ggml_backend_load_all_from_path`].
 pub const LLAMA_BIN_DIR: &str = env!("GOLBANG_LLAMA_BIN");
 
+/// Selected backend at build time: `"hip"` or `"cuda"`.
+pub const GOLBANG_GPU: &str = env!("GOLBANG_GPU");
+
 #[cfg(test)]
 mod api_names {
     use super::*;
