@@ -18,8 +18,8 @@ ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
   --alias qwen3.8-27b-cuda \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 40000 --n-batch 512 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 1 --queue-size 1 --single-max-ctx 40000 \
+  --n-ctx 80000 --n-batch 512 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 40000 --kv-type-k q8_0 --kv-type-v q8_0 \
   --no-mmap --jinja \
   --api-key REDACTED_KEY1
 Restart=on-failure
