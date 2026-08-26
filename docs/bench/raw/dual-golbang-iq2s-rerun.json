@@ -1,0 +1,180 @@
+{
+  "label": "cuda-golbang-rerun",
+  "when": "2026-08-26T06:11:58.988693+00:00",
+  "base": "http://localhost:8084",
+  "model": "qwen3.8-27b-cuda",
+  "gpu_before": {
+    "edge": "68.0",
+    "junction": "72.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "28.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "67.0",
+        "junction": "71.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "28.0"
+      },
+      "gpu_after": {
+        "edge": "67.0",
+        "junction": "70.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "28.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 0,
+        "draft_accepted_total": 0
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 0.3656288429920096,
+      "finish_reason": "stop",
+      "prompt_n": 1,
+      "predicted_n": 3,
+      "cache_n": 16,
+      "prompt_ms": 91.974539,
+      "predicted_ms": 271.07669699999997,
+      "prompt_per_second": 10.872574202301792,
+      "predicted_per_second": 11.066978582817837,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 12,
+      "reasoning_n": 0,
+      "content": "</think>\n\nOK",
+      "reasoning": "",
+      "error": null
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "62.0",
+        "junction": "65.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "60.0",
+        "junction": "63.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 0,
+        "draft_accepted_total": 0
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 6.529976458987221,
+      "finish_reason": "length",
+      "prompt_n": 35,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 235.117997,
+      "predicted_ms": 6290.067047,
+      "prompt_per_second": 148.86142467435192,
+      "predicted_per_second": 13.354388653148487,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 483,
+      "reasoning_n": 0,
+      "content": "Speculative decoding is a technique where a smaller, faster \"draft\" model generates a sequence of candidate tokens, which are then verified in parallel by a larger, slower \"target\" model; this process can raise tokens per second on a single GPU because it transforms the generation bottleneck from sequential, memory-bound autoregressive steps into a single, compute-bound verification pass, allowing the GPU to process multiple tokens simultaneously with higher hardware utilization",
+      "reasoning": "",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "57.0",
+        "junction": "60.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "53.0",
+        "junction": "55.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 0,
+        "draft_accepted_total": 0
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 15.283866027981276,
+      "finish_reason": "length",
+      "prompt_n": 44,
+      "predicted_n": 200,
+      "cache_n": 0,
+      "prompt_ms": 258.021872,
+      "predicted_ms": 15021.645926,
+      "prompt_per_second": 170.52817909948348,
+      "predicted_per_second": 13.314120235907897,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 1136,
+      "reasoning_n": 0,
+      "content": "Flash Attention fundamentally optimizes memory bandwidth during the transformer decoding phase by eliminating the explicit materialization of the full attention matrix in High Bandwidth Memory (HBM). In standard attention implementations, the query, key, and value tensors are first used to compute the full $N \\times N$ attention score matrix, which is then written to HBM, followed by a separate read operation to apply the softmax and multiply by the value vectors. This process incurs significant HBM traffic, scaling quadratically with sequence length, which becomes a severe bottleneck during autoregressive decoding where sequence lengths grow rapidly. Flash Attention addresses this by tiling the computation into smaller blocks that fit entirely within the GPU's fast on-chip SRAM. By processing these tiles sequentially, the algorithm computes attention scores, applies the online softmax normalization, and aggregates results directly in SRAM without ever writing the intermediate attention matrix to HBM. This \"fused\" kernel approach drastically reduces the number of memory accesses, transforming the memory-bound operation",
+      "reasoning": "",
+      "error": null
+    },
+    {
+      "id": "long1024",
+      "max_tokens": 1024,
+      "gpu_before": {
+        "edge": "51.0",
+        "junction": "53.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "40.0",
+        "junction": "43.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "24.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 0,
+        "draft_accepted_total": 0
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 77.69195059101912,
+      "finish_reason": "length",
+      "prompt_n": 50,
+      "predicted_n": 1024,
+      "cache_n": 0,
+      "prompt_ms": 290.68771399999997,
+      "predicted_ms": 77396.97443500001,
+      "prompt_per_second": 172.00589358241677,
+      "predicted_per_second": 13.230491339942258,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 6040,
+      "reasoning_n": 0,
+      "content": "The landscape of large language model inference has undergone a profound transformation in recent years, driven by the convergence of algorithmic innovations and hardware-specific optimizations. At the heart of this evolution lies the intricate dance between speculative decoding, flash attention, and the management of key-value (KV) cache traffic, all of which must be orchestrated on a single GPU to achieve maximum throughput and efficiency. These three components are not merely isolated techniques but are deeply interconnected, forming a symbiotic relationship that dictates the performance ceiling of modern generative AI systems. To understand the full scope of their impact, one must examine how they interact at the hardware level, particularly regarding memory bandwidth, compute utilization, and latency constraints.\n\nSpeculative decoding represents a paradigm shift in how we approach the autoregressive nature of language generation. Traditionally, generating a sequence of tokens is a sequential process where each token depends on the previous one, creating a bottleneck that prevents parallelization across the sequence dimension. Speculative decoding addresses this by employing a smaller, faster \"draft\" model to generate a sequence of candidate tokens, which are then verified in parallel by the larger, more accurate \"target\" model. The critical insight here is that the verification step is not a simple check but a complex operation that requires the target model to process multiple potential continuations simultaneously. This process is inherently memory-bound because the target model must load its massive weight matrices and, crucially, the accumulated KV cache for the entire context window. On a single GPU, this verification phase places immense pressure on the memory subsystem, as the model must access the KV cache for every speculative token, potentially multiplying the memory traffic by the number of speculative steps. If not managed carefully, this can lead to a situation where the GPU is starved of data, waiting for memory transfers rather than performing useful computation, a phenomenon known as memory-bound behavior.\n\nThis is where flash attention enters the narrative, acting as the foundational algorithm that makes efficient attention computation possible on modern hardware. Traditional attention mechanisms, as originally proposed in the Transformer architecture, require the explicit materialization of the attention matrix, which scales quadratically with the sequence length. This quadratic memory footprint is prohibitive for long-context inference, where the KV cache itself becomes a dominant consumer of GPU memory. Flash attention, by contrast, reformulates the attention computation to avoid ever materializing the full attention matrix in high-bandwidth memory. Instead, it processes the attention computation in blocks, keeping intermediate results in the fast on-chip SRAM of the GPU. This technique drastically reduces the memory footprint of the attention operation, allowing for longer sequences to be processed without exhausting the GPU's limited memory. However, in the context of speculative decoding, flash attention's role becomes even more critical. During the verification phase, the model must compute attention for multiple speculative tokens against the entire existing context. Without the memory efficiency provided by flash attention, the KV cache traffic would be overwhelming, leading to severe performance degradation. The algorithm ensures that the attention computation remains compute-bound rather than memory-bound, even when dealing with the expanded context required for speculative verification.\n\nThe management of KV-cache traffic is the silent hero of this triad, acting as the linchpin that connects the algorithmic efficiency of flash attention with the practical constraints of speculative decoding. The KV cache stores the key and value vectors for all previously generated tokens, allowing the model to attend to the entire history without recomputing these vectors. In a standard autoregressive generation, the KV cache grows linearly with the sequence length, and its management is relatively straightforward. However, speculative decoding introduces a new dimension of complexity. When the draft model proposes multiple tokens, the target model must compute the KV for these new tokens and integrate them into the cache. If the speculation is rejected, the KV entries for the rejected tokens must be discarded, and the cache must be rolled back to the last accepted state. This rollback process, if not optimized, can introduce significant latency and memory fragmentation. On a single GPU, where memory bandwidth is a precious resource, the overhead of managing these dynamic KV cache updates can negate the benefits of speculative decoding. Therefore, modern implementations employ sophisticated cache management strategies, such as paged attention, which allocates memory in fixed-size blocks rather than contiguous arrays. This approach minimizes memory fragmentation and allows for efficient management of the KV cache, even when speculative decoding introduces variable-length sequences.\n\nThe interplay between these three components on a single GPU is a delicate balance of compute, memory, and bandwidth. Speculative decoding increases the computational load by requiring the target model to process multiple tokens in parallel, but it also increases the memory traffic by requiring the KV cache to be accessed and updated for each speculative step. Flash attention mitigates the memory overhead of the attention computation, ensuring that the KV cache remains the primary memory consumer rather than the attention matrix. The efficient management of KV-cache traffic, through techniques like paged attention and optimized memory allocation, ensures that the memory bandwidth is used effectively, preventing bottlenecks that could otherwise cripple performance. Together, these techniques form a cohesive system that maximizes the",
+      "reasoning": "",
+      "error": null
+    }
+  ],
+  "metrics_before": {
+    "draft_tokens_total": 0,
+    "draft_accepted_total": 0
+  },
+  "gpu_after": {
+    "edge": "40.0",
+    "junction": "42.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "24.0"
+  },
+  "metrics_after": {
+    "draft_tokens_total": 0,
+    "draft_accepted_total": 0
+  }
+}

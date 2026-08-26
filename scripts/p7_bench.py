@@ -96,10 +96,10 @@ def parse_golbang_drafts(text: str | None) -> dict:
     return out
 
 
-def chat(base: str, content: str, max_tokens: int, timeout: float = 600.0) -> dict:
+def chat(base: str, content: str, max_tokens: int, model: str = "qwen3.8-27b-q6", timeout: float = 600.0) -> dict:
     body = json.dumps(
         {
-            "model": "qwen3.8-27b-q6",
+            "model": model,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
             "temperature": 0.0,
@@ -162,6 +162,7 @@ def chat(base: str, content: str, max_tokens: int, timeout: float = 600.0) -> di
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8083")
+    ap.add_argument("--model", default="qwen3.8-27b-q6", help="model name for chat requests")
     ap.add_argument("--label", required=True, help="e.g. llama-pre, golbang-pre")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--sleep", type=float, default=8.0, help="cool-down between cases")
@@ -180,6 +181,7 @@ def main() -> None:
         "label": args.label,
         "when": datetime.now(timezone.utc).isoformat(),
         "base": args.base,
+        "model": args.model,
         "gpu_before": rocm_snapshot(),
         "cases": [],
     }
@@ -191,7 +193,7 @@ def main() -> None:
             time.sleep(args.sleep)
         gpu0 = rocm_snapshot()
         m0 = parse_golbang_drafts(metrics_text(args.base))
-        r = chat(args.base, case["content"], case["max_tokens"])
+        r = chat(args.base, case["content"], case["max_tokens"], model=args.model)
         gpu1 = rocm_snapshot()
         m1 = parse_golbang_drafts(metrics_text(args.base))
         delta = {}
