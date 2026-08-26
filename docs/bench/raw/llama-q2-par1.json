@@ -1,0 +1,162 @@
+{
+  "label": "llama-q2-par1",
+  "when": "2026-08-26T06:55:25.372216+00:00",
+  "base": "http://localhost:8084",
+  "model": "qwen3.8-q2",
+  "gpu_before": {
+    "edge": "57.0",
+    "junction": "60.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "27.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "57.0",
+        "junction": "59.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "55.0",
+        "junction": "58.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 1.5708151870057918,
+      "finish_reason": "length",
+      "prompt_n": 15,
+      "predicted_n": 16,
+      "cache_n": 0,
+      "prompt_ms": 432.747,
+      "predicted_ms": 1133.142,
+      "prompt_per_second": 34.66228535379794,
+      "predicted_per_second": 13.2375289240007,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 0,
+      "reasoning_n": 70,
+      "content": "",
+      "reasoning": "The user wants me to reply with exactly \"OK\". This is a simple request",
+      "error": null
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "53.0",
+        "junction": "55.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "51.0",
+        "junction": "53.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 6.614392260991735,
+      "finish_reason": "length",
+      "prompt_n": 33,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 359.595,
+      "predicted_ms": 6190.794,
+      "prompt_per_second": 91.76990781295623,
+      "predicted_per_second": 13.407004012732456,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 0,
+      "reasoning_n": 418,
+      "content": "",
+      "reasoning": "The user wants a short paragraph explaining speculative decoding and why it increases tokens per second on a single GPU. Let me think about what speculative decoding is and why it helps.\n\nSpeculative decoding (also called speculative sampling) works by using a smaller, faster \"draft\" model to generate several candidate tokens (e.g., 5-8 tokens) in a short sequence, then the larger target model verifies all of those",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "49.0",
+        "junction": "51.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "46.0",
+        "junction": "48.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 15.276617418014212,
+      "finish_reason": "length",
+      "prompt_n": 42,
+      "predicted_n": 200,
+      "cache_n": 0,
+      "prompt_ms": 377.38,
+      "predicted_ms": 14828.012,
+      "prompt_per_second": 111.2936562615931,
+      "predicted_per_second": 13.420544844447118,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 0,
+      "reasoning_n": 922,
+      "content": "",
+      "reasoning": "The user wants a detailed technical paragraph of about 180 words explaining how flash attention reduces HBM (High Bandwidth Memory) traffic during transformer decode. No bullet lists. Let me think carefully about the technical content.\n\nDuring transformer decode (autoregressive generation), the key bottleneck is memory bandwidth, not compute. The attention mechanism in standard implementations requires loading Q, K, V tensors from HBM into SRAM (on-chip memory) to perform the computation. In a standard \"vanilla\" attention implementation, you compute QK^T, then softmax, then multiply by V. Each of these steps requires materializing intermediate results (like the attention scores matrix S = QK^T) in HBM, which means writing S to HBM and reading it back for the softmax, then writing the softmaxed result back to HBM, then reading it again for the final multiply with V.\n\nFlash attention (Dao et al., 2022) uses a t",
+      "error": null
+    },
+    {
+      "id": "long1024",
+      "max_tokens": 1024,
+      "gpu_before": {
+        "edge": "45.0",
+        "junction": "47.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "38.0",
+        "junction": "40.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "26.0"
+      },
+      "metrics_delta": {},
+      "ok": true,
+      "http": 200,
+      "wall_s": 76.95834578800714,
+      "finish_reason": "length",
+      "prompt_n": 48,
+      "predicted_n": 1024,
+      "cache_n": 0,
+      "prompt_ms": 396.803,
+      "predicted_ms": 76486.423,
+      "prompt_per_second": 120.96682736773664,
+      "predicted_per_second": 13.37492276243589,
+      "draft_n": null,
+      "draft_n_accepted": null,
+      "content_n": 2516,
+      "reasoning_n": 2439,
+      "content": "# Speculative Decoding, Flash Attention, and KV-Cache Traffic on a Single GPU\n\nThe central tension in large language model inference on a single GPU is the mismatch between the arithmetic intensity of the forward pass and the memory bandwidth available to feed that arithmetic. During the prefill phase, a long prompt is processed in one large matrix-multiply, and the GPU's tensor cores are kept busy because the operation is compute-bound: every FLOP is paired with a proportional number of bytes read from high-bandwidth memory, and the arithmetic intensity comfortably exceeds the roofline threshold of the hardware. The decode phase, by contrast, is a sequence of single-token steps, each of which must read the entire key-value cache from HBM before it can compute even one new token. The arithmetic intensity of a single decode step is vanishingly small relative to the bytes that must be fetched, and the GPU spends most of its time waiting on memory rather than performing useful floating-point work. Every technique that modern inference stacks employ—flash attention, speculative decoding, paged KV caches, quantized projections—is ultimately a negotiation with this single fact: the KV cache is the dominant traffic source on the GPU, and the decode step is the phase in which that traffic becomes the bottleneck.\n\nThe key-value cache is the concrete mechanism by which a transformer avoids recomputing attention over the full context at every decode step. After the prefill pass, every layer stores a key and a value vector for each position in the sequence, and these tensors are laid out in HBM in a format that is typically contiguous per layer and per head. When the model generates the next token, the attention kernel must read every stored key and value vector, project the new query against them, and write the updated cache entry. On a single GPU with, say, 1.5 terabytes per second of HBM bandwidth, a model with thirty-two layers, each holding a KV cache of a few megabytes per token, can easily see the decode step dominated by the cost of streaming that cache through the memory hierarchy. The arithmetic performed per byte read is on the order of a handful of multiply-accumulate operations, far below the ratio at which the tensor cores can sustain peak throughput. The GPU is, in effect, a memory device during decode, and the compute pipeline is starved.\n\nFlash attention reframes the attention computation so that it never materializes the full quadratic attention-score matrix in HBM.",
+      "reasoning": "The user wants a long technical essay (at least 800 words) on three topics: speculative decoding, flash attention, and KV-cache traffic on a single GPU. The format requirement is paragraphs only, no bullet lists. Let me write a thorough, technically accurate essay that weaves these three concepts together in a coherent narrative.\n\nLet me think about what to cover:\n\n1. **Speculative decoding**: The idea of using a small draft model to propose multiple tokens, then verifying them in parallel with the larger model. Key concepts: draft model, verification step, acceptance/rejection, parallelism of verification, the math of expected speedup, how it interacts with the GPU's compute vs. memory bandwidth bottleneck.\n\n2. **Flash attention**: The algorithm that recomputes attention in tiles to avoid materializing the full N×N attention matrix in HBM. Key concepts: tiling, online softmax, reduced memory traffic, how it changes the arithmetic intensity of the attention kernel, interaction with SRAM vs HBM.\n\n3. **KV-cache traffic on a single GPU**: During autoregressive decoding, the KV cache grows linearly with sequence length. Each decode step reads the entire KV cache. This is a memory-bandwidth-bound operation. How the KV cache lives in HBM, the read pattern, the arithmetic intensity of the decode step, how it becomes the bottleneck.\n\nI should weave these together: speculative decoding changes the shape of the decode step (you're verifying K tokens at once, which changes the arithmetic intensity), flash attention changes how the attention computation is structured (reducing HBM traffic for the attention scores), and KV-cache traffic is the fundamental bottleneck that both of the other two are trying to mitigate.\n\nLet me write this as flowing paragraphs, technically deep, at least 800 words. I'll aim for around 1000-1200 words to be safe. No bullet lists, no numbered lists. Just paragraphs.\n\nLet me structure it:\n- Opening: the fundamental tension in LLM inference on a single GPU (compute vs memory bandwidth)\n- KV-cache traffic: what it is, why it dominates decode\n- Flash attention: how it reshapes the attention computation to reduce HBM traffic\n- Speculative decoding: how it changes the decode step's shape\n- Interplay: how speculative decoding + flash attention interact on KV-cache traffic\n- Closing: the broader picture\n\nLet me write this now, making sure it's at least 800 words, all paragraphs, no lists.\n",
+      "error": null
+    }
+  ],
+  "metrics_before": {},
+  "gpu_after": {
+    "edge": "38.0",
+    "junction": "40.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "27.0"
+  },
+  "metrics_after": {}
+}
