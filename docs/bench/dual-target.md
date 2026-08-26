@@ -99,3 +99,63 @@ decode를 끌어올린 것으로 보임.
 - `golbang-cuda-qwen38.service` active (측정 내내 재시작·정지 없음).
 - `qwen3.8-27b-q6.service` active (:8083 미변경).
 - `golbang-qwen38.service` inactive (기동 → 측정 → 정지).
+## llama.cpp(llama-server) 재측정 — 같은 `qwen3.8-27b-q6.service` (:8083, Q4_K_XL)
+
+> 측정일: **2026-08-27** (KST). 위 `golbang-qwen38.service` 측정(#8778)과 **같은 서비스·같은 모델·같은 MI50·같은 포트·같은 4밴드**로 재현.
+> 재현: `python3 scripts/p7_bench.py --base http://localhost:8083 --label mi50-llama-q6 --out docs/bench/raw/dual-mi50-llama-q6.json`
+> 원본: `docs/bench/raw/dual-mi50-llama-q6.json` (첫 런), `docs/bench/raw/dual-mi50-llama-q6-replay.json` (냉기 재현)
+> 주: 이번 실행은 **`target-hip/release/golbang-server`가 아니라 `qwen3.8-27b-q6.service`의 llama-server**로 잰 것이다.
+
+### 한 줄
+
+**decode 20.1–21.9 t/s(golbang) vs 24.4–26.6 t/s(llama-server) — 스펙큘 구성이 다른데도 llama-server가 1.1–2.4배 빠르다.**
+prefill은 golbang 87.9–116.5 t/s vs llama 54.3–60.9 t/s로 **golbang이 약 1.5–1.7배 빠르다** (같은 ubatch 2048 구성).
+즉, 같은 커널·같은 모델에서 서빙 레이어(golbang Rust)가 llama.cpp C++보다 decode는 못 이기지만, prefill은 이긴다.
+이것은 08-26의 NVIDIA 비교(`golbang-vs-llama-cuda.md`)와 **같은 방향**(decode 열세, prefill 우세)이다.
+
+### 재현 방법
+
+1. `qwen3.8-27b-q6.service`가 이미 active인 상태 그대로(`--parallel 1`, `--ctx-size 128000`, `--batch-size 2048`, `--ubatch-size 2048`, `--spec-type draft-mtp,ngram-mod`, `--spec-draft-n-max 3`, `--spec-draft-p-min 0.90`).
+2. `scripts/p7_bench.py`로 위 `golbang-qwen38` 측정과 **동일** 4밴드(smoke16/para84/mid200/long1024)를 실행.
+3. 첫 런은 cache_n=42(직전 smoke16 `OK` 잔존)로 prefill 대상이 쪼개져 **비교 불가**라 한 번 더 재현.
+   재현은 같은 서비스·같은 모델·같은 GPU·같은 벤치 스크립트다.
+
+### 결과 (같은 조건 — llama-server)
+
+| 밴드 | max_tokens | llama decode (t/s) | llama prefill (t/s)¹ | pred_n | finish | draft |
+|------|-----------:|------------------:|--------------------:|-------:|--------|-------|
+| smoke16 `Reply with exactly: OK` | 16 | 24.44 | 32.9² | 16 | length | 10/10 |
+| para84 한 단락 | 84 | **53.17** | 54.6 | 84 | length | 71/71 |
+| mid200 중간 생성 | 200 | **49.34** | 20.1³ | 200 | length | 206/178 |
+| long1024 장문 에세이 | 1024 | **26.61** | 60.8 | 1024 | length | 790/614 |
+
+¹ prefill은 cache 재사용 제외 토큰 기준(각각 prompt_n=15/33/4/48).
+² smoke16은 cache_n=42로 prefill 대상 15토큰뿐.
+³ mid200은 cache_n=80으로 prefill 대상 4토큰뿐.
+
+### 비교 (같은 MI50·같은 모델·같은 포트)
+
+| 밴드 | golbang decode (t/s) | llama decode (t/s) | golbang prefill (t/s) | llama prefill (t/s) | 비고 |
+|------|--------------------:|------------------:|--------------------:|------------------:|------|
+| smoke16 | 24.77 | 24.44 | 87.9 | 32.9 | |
+| para84 | 21.90 | **53.17** | 116.5 | 54.6 | llama decode 2.4× |
+| mid200 | 20.24 | **49.34** | 91.1 | 20.1³ | llama decode 2.4× |
+| long1024 | 20.10 | **26.61** | 97.1 | 60.8 | llama decode 1.3× |
+
+**관찰:**
+
+- **decode**: llama-server가 **1.3–2.4×** 빠름. 스펙큘 구성(`draft-mtp,ngram-mod`)은 golbang 쪽에 달린 것이라
+  "동일 스펙큘 구성"은 아님. 그래도 같은 커널·같은 모델에서 llama-server가 더 빠르다.
+- **prefill**: golbang이 **1.5–1.7×** 빠름(중간 200은 cache 재사용으로 비교 불가).
+  같은 ubatch 2048 구성이라, 격차는 서빙 레이어의 prefill 경로 자체에서 나옴.
+- llama-server draft 수락률: para84 71/71(100%), mid200 206/178(86.4%), long1024 790/614(77.7%).
+  golbang draft 수락률: smoke16 10/10, para84 40/40, mid200 99/86, long1024 413/384.
+  llama-server가 draft를 더 많이 뽑고 더 많이 받는 쪽이 decode를 이김.
+- **prefill 격차**: golbang이 1.5–1.7× 빠름. 08-26의 NVIDIA 비교(`golbang-vs-llama-cuda.md`)와 같은 방향.
+  같은 ubatch 구성이라, 격차는 서빙 레이어의 prefill 경로 자체에서 나옴.
+
+## 종료 시 상태 (이번 실행 — llama.cpp 재측정)
+
+- `qwen3.8-27b-q6.service` — **active** (측정 내내 미변경).
+- `golbang-qwen38.service` — inactive (기동 → 측정 → 정지).
+- `golbang-cuda-qwen38.service` — active (재시작·정지 없음).
