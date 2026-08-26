@@ -56,6 +56,12 @@ pub struct LoadParams {
     /// cells, so a solo sequence can occupy the whole pool. llama-server
     /// `--kv-unified`. Off: each sequence is capped at `n_ctx_seq`.
     pub kv_unified: bool,
+    /// KV cache element type, K side (`llama_context_params.type_k`).
+    /// F16 = llama.cpp default. Q8_0 halves VRAM (llama-server `--cache-type-k`).
+    /// Quantized types require flash attention to be enabled.
+    pub cache_type_k: u32,
+    /// KV cache element type, V side (`llama_context_params.type_v`).
+    pub cache_type_v: u32,
 }
 
 impl Default for LoadParams {
@@ -76,6 +82,8 @@ impl Default for LoadParams {
             spec: SpecParams::default(),
             mmproj: None,
             kv_unified: false,
+            cache_type_k: GGML_TYPE_F16 as u32,
+            cache_type_v: GGML_TYPE_F16 as u32,
         }
     }
 }
@@ -229,6 +237,8 @@ impl Model {
         cparams.n_seq_max = n_seq_max;
         cparams.kv_unified = params.kv_unified;
         cparams.flash_attn_type = params.flash_attn;
+        cparams.type_k = params.cache_type_k as ggml_type;
+        cparams.type_v = params.cache_type_v as ggml_type;
         if n_rs_seq > 0 {
             cparams.n_rs_seq = n_rs_seq;
         }

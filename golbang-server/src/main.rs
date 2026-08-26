@@ -44,6 +44,16 @@ struct Args {
     #[arg(long, env = "GOLBANG_KV_UNIFIED", default_value_t = false)]
     kv_unified: bool,
 
+    /// KV cache element type for K (llama-server `--cache-type-k`).
+    /// q8_0 halves VRAM; requires flash attention. Default f16.
+    #[arg(long, env = "GOLBANG_KV_TYPE_K", default_value = "f16")]
+    kv_type_k: String,
+
+    /// KV cache element type for V (llama-server `--cache-type-v`).
+    /// q8_0 halves VRAM; requires flash attention. Default f16.
+    #[arg(long, env = "GOLBANG_KV_TYPE_V", default_value = "f16")]
+    kv_type_v: String,
+
     #[arg(long, env = "GOLBANG_N_GPU_LAYERS", default_value_t = 99)]
     n_gpu_layers: i32,
 
@@ -273,6 +283,8 @@ async fn main() -> Result<()> {
             spec,
             mmproj: args.mmproj.clone(),
             kv_unified: args.kv_unified,
+            cache_type_k: parse_ggml_type(&args.kv_type_k).map_err(anyhow::Error::msg)?,
+            cache_type_v: parse_ggml_type(&args.kv_type_v).map_err(anyhow::Error::msg)?,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;
