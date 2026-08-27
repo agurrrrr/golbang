@@ -438,6 +438,21 @@ fn join_waiting(
                 }
             })
             .collect();
+        for job in &views {
+            for slot in &empty_views {
+                let lcp = common_prefix_len(slot.prefix, job.tokens);
+                tracing::info!(
+                    slot = slot.id.0,
+                    request_id = job.request_id,
+                    lcp,
+                    prefix_n = slot.prefix.len(),
+                    ckpt_n = slot.ckpt_n,
+                    aff_bar = slot.affinity_bar(),
+                    affinity = crate::policy::is_prefix_affinity(lcp, slot.affinity_bar()),
+                    "join candidate"
+                );
+            }
+        }
         policy.join(&empty_views, &views)
     };
 

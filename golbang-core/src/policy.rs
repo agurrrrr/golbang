@@ -33,6 +33,21 @@ impl EmptySlotView<'_> {
             .max(self.prefix_len as usize)
             .max(self.ckpt_n as usize)
     }
+
+    /// Bar for same-session affinity (`settle_prefix_kv` restore).
+    ///
+    /// `resident()` includes generated tokens past the prefill checkpoint
+    /// (Qwen think body). The next turn's prompt does not replay those
+    /// tokens, so `lcp + 1 >= resident` fails and join picks the empty
+    /// slot — then watermark pressure drops the real prefix (#8799 live).
+    /// When a checkpoint exists, compare LCP to `ckpt_n` only.
+    pub fn affinity_bar(&self) -> usize {
+        if self.ckpt_n > 0 {
+            self.ckpt_n as usize
+        } else {
+            self.resident()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,8 +180,10 @@ impl FifoPolicy {
 ///
 /// Matches `settle_prefix_kv`: a checkpoint is only restored when
 /// `ckpt_n <= reuse_len + 1`. One token short covers `<think>` vs `</think>`.
-pub(crate) fn is_prefix_affinity(lcp: usize, resident: usize) -> bool {
-    lcp > 0 && lcp + 1 >= resident
+/// Pass [`EmptySlotView::affinity_bar`], not [`EmptySlotView::resident`]:
+/// generated think tokens sit past `ckpt_n` and are not in the next prompt.
+pub(crate) fn is_prefix_affinity(lcp: usize, bar: usize) -> bool {
+    lcp > 0 && lcp + 1 >= bar
 }
 
 fn prefix_aware_join(
@@ -205,7 +222,7 @@ fn pick_empty_slot(
         }
         let lcp = common_prefix_len(slot.prefix, job.tokens);
         let resident = slot.resident();
-        if is_prefix_affinity(lcp, resident) {
+        if is_prefix_affinity(lcp, slot.affinity_bar()) {
             if best_aff.is_none_or(|(_, best_lcp)| lcp > best_lcp) {
                 best_aff = Some((i, lcp));
             }
@@ -412,6 +429,69 @@ mod tests {
             tokens: &job_tok,
         }];
         assert_eq!(p.join(&empty, &waiting), vec![(SlotId(0), 0)]);
+    }
+
+    #[test]
+    fn join_think_body_past_ckpt_keeps_affinity() {
+        let mut p = FifoPolicy::default();
+        // Prefill ckpt 10, then 5 generated think tokens (n_past=15).
+        // Next prompt is the old prompt plus a tool result — LCP=10.
+        let prefix0: Vec<Token> = (1..11).chain(900..905).collect();
+        let mut job_tok: Vec<Token> = (1..11).collect();
+        job_tok.extend([200, 201, 202]);
+        let empty = [
+            EmptySlotView {
+                id: SlotId(1),
+                prefix: &[],
+                prefix_len: 0,
+                ckpt_n: 0,
+            },
+            EmptySlotView {
+                id: SlotId(0),
+                prefix: &prefix0,
+                prefix_len: 15,
+                ckpt_n: 10,
+            },
+        ];
+        let waiting = [WaitingJobView {
+            request_id: 5,
+            n_prompt: job_tok.len() as u32,
+            tokens: &job_tok,
+        }];
+        assert_eq!(p.join(&empty, &waiting), vec![(SlotId(0), 0)]);
+    }
+
+    #[test]
+    fn join_think_body_picks_later_ckpt_fork() {
+        let mut p = FifoPolicy::default();
+        // Two idle forks of the same session. Slot 0 stopped after turn 1
+        // (ckpt 10 + think). Slot 1 stopped after turn 2 (ckpt 20 + think).
+        // The new prompt continues turn 2. Picking the shorter fork (old
+        // resident() spare rule) is the #8799 ping-pong.
+        let prefix0: Vec<Token> = (1..11).chain(900..905).collect();
+        let prefix1: Vec<Token> = (1..21).chain(910..915).collect();
+        let mut job_tok: Vec<Token> = (1..21).collect();
+        job_tok.extend([200, 201]);
+        let empty = [
+            EmptySlotView {
+                id: SlotId(0),
+                prefix: &prefix0,
+                prefix_len: 15,
+                ckpt_n: 10,
+            },
+            EmptySlotView {
+                id: SlotId(1),
+                prefix: &prefix1,
+                prefix_len: 25,
+                ckpt_n: 20,
+            },
+        ];
+        let waiting = [WaitingJobView {
+            request_id: 6,
+            n_prompt: job_tok.len() as u32,
+            tokens: &job_tok,
+        }];
+        assert_eq!(p.join(&empty, &waiting), vec![(SlotId(1), 0)]);
     }
 
     #[test]
