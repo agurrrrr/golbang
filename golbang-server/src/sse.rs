@@ -215,16 +215,27 @@ pub fn stream_completion(
     submit_job(&state, &req, prompt, params, cancel, ev_tx)?;
 
     tokio::spawn(async move {
+        // Flush a comment before bind so proxies/clients see headers during
+        // a long queue wait (Shepherd "timeout awaiting response headers").
+        // Role is sent with the first Token, not up front. A ContextFull
+        // bind then produces a non-empty error chunk instead of HTTP 200 +
+        // empty assistant delta (Shepherd empty-response loop).
+        if sse_tx
+            .send(Event::default().comment("queued"))
+            .await
+            .is_err()
+        {
+            cancel_on_drop.cancel();
+            return;
+        }
+        // Empty `data:` chunk: some clients (Shepherd) only reset idle
+        // timers on `data:` events, not comments.
         if send_chunk(
             &sse_tx,
             &id,
             created,
             &model_name,
-            Delta {
-                role: Some("assistant"),
-                content: None,
-                ..Default::default()
-            },
+            Delta::default(),
             None,
             None,
         )
@@ -234,7 +245,7 @@ pub fn stream_completion(
             cancel_on_drop.cancel();
             return;
         }
-
+        let mut sent_role = false;
         let mut n = 0u32;
         let mut pending = PendingDelta::new();
         loop {
@@ -246,6 +257,28 @@ pub fn stream_completion(
                             n += 1;
                             if t.piece.is_empty() {
                                 continue;
+                            }
+                            if !sent_role {
+                                if send_chunk(
+                                    &sse_tx,
+                                    &id,
+                                    created,
+                                    &model_name,
+                                    Delta {
+                                        role: Some("assistant"),
+                                        content: None,
+                                        ..Default::default()
+                                    },
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    cancel_on_drop.cancel();
+                                    return;
+                                }
+                                sent_role = true;
                             }
                             let split = parser.push(&t.piece);
                             let content = match split.content {
@@ -287,12 +320,24 @@ pub fn stream_completion(
                         }
                         SlotEvent::Failed(e) => {
                             tracing::error!(error = %e, "stream generation failed");
-                            let payload = serde_json::json!({
-                                "error": { "message": e.to_string(), "type": "server_error" }
-                            });
-                            let _ = sse_tx
-                                .send(Event::default().data(payload.to_string()))
-                                .await;
+                            // HTTP 200 + `{error}` with no `choices` is parsed by
+                            // Shepherd as an empty completion (empty-response loop).
+                            // A real chunk with the message + finish_reason=error
+                            // is the last event, so accum is non-empty.
+                            let _ = send_chunk(
+                                &sse_tx,
+                                &id,
+                                created,
+                                &model_name,
+                                Delta {
+                                    role: Some("assistant"),
+                                    content: Some(e.to_string()),
+                                    ..Default::default()
+                                },
+                                Some("error".into()),
+                                None,
+                            )
+                            .await;
                             let _ = sse_tx.send(Event::default().data("[DONE]")).await;
                             break;
                         }

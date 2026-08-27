@@ -243,6 +243,10 @@ async fn run_loop(
             }
         }
 
+        // Free idle prefix before join so a waiting job sees the extra room
+        // in this iteration instead of failing ContextFull and retrying.
+        release_retained_under_pressure(&mut slots, &engine, pool);
+
         join_waiting(
             &mut slots,
             &mut waiting,
@@ -496,6 +500,20 @@ fn join_waiting(
             };
             bind_slot(slot, job, engine, cap)
         };
+        if !bound {
+            tracing::warn!(
+                iter,
+                slot = slot_id.0,
+                request_id = req,
+                cap,
+                others_used,
+                n_active_after,
+                lcp,
+                prefix_n,
+                ckpt_n,
+                "join bind rejected"
+            );
+        }
         if bound {
             metrics.joins.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
@@ -543,6 +561,13 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bo
     };
     let n_prompt = tokens.len() as u32;
     if n_prompt >= ctx_cap {
+        tracing::warn!(
+            slot = slot.id.0,
+            request_id = job.request_id,
+            n_prompt,
+            ctx_cap,
+            "prompt exceeds context cap"
+        );
         let _ = job.events.send(SlotEvent::Failed(Error::ContextFull {
             prompt: n_prompt,
             n_ctx: ctx_cap,
@@ -1582,28 +1607,25 @@ fn fail_all_active(slots: &mut [Slot], engine: &Engine, err: Error) {
     }
 }
 
-/// Retained prefix KV (#8554 affinity) is released once it has idled past
-/// `RETAINED_TTL`, or immediately when total pool occupancy crosses
-/// `RETAINED_WATERMARK` — otherwise a finished 70k session starves a live
-/// one into `failed to find a memory slot` (#8565).
-const RETAINED_TTL: Duration = Duration::from_secs(30);
+/// Retained prefix KV (#8554 affinity) is released only when total pool
+/// occupancy crosses `RETAINED_WATERMARK`. A wall-clock TTL used to wipe an
+/// idle session after 30s, which is shorter than a typical agent tool round,
+/// so the next turn of a 30k–70k prompt full-prefilled for minutes (#8785/86).
+/// The watermark still covers #8565 (two ~70k sessions filling the pool).
 const RETAINED_WATERMARK: f64 = 0.85;
 
-fn retained_release_due(age_secs: f64, total_used: u32, pool: u32) -> bool {
-    if age_secs >= RETAINED_TTL.as_secs_f64() {
-        return true;
-    }
+fn retained_release_due(total_used: u32, pool: u32) -> bool {
     pool > 0 && f64::from(total_used) > RETAINED_WATERMARK * f64::from(pool)
 }
 
 fn release_retained_under_pressure(slots: &mut [Slot], engine: &Engine, pool: u32) {
     let total_used: u32 = slots.iter().map(slot_kv_used).sum();
+    if !retained_release_due(total_used, pool) {
+        return;
+    }
     for slot in slots.iter_mut() {
-        let Some(at) = slot.retained_at else {
+        if slot.retained_at.is_none() {
             continue; // active job or nothing retained
-        };
-        if !retained_release_due(at.elapsed().as_secs_f64(), total_used, pool) {
-            continue;
         }
         let id = slot.id;
         let n = slot_kv_used(slot);
@@ -1879,18 +1901,19 @@ mod tests {
     }
 
     #[test]
-    fn retained_release_due_on_ttl_or_watermark() {
+    fn retained_release_due_on_watermark_only() {
         let pool = 140_032;
-        // Under TTL and under watermark: keep.
-        assert!(!retained_release_due(10.0, 60_000, pool));
-        // Over TTL: release regardless of occupancy.
-        assert!(retained_release_due(31.0, 60_000, pool));
-        // Under TTL but past the 85% watermark: release.
-        assert!(retained_release_due(1.0, 125_000, pool));
+        // Two ~44k sessions (typical agent pair) stay under 85% so each
+        // keeps prefix KV across tool rounds that last minutes, not 30s.
+        assert!(!retained_release_due(88_000, pool));
+        assert!(!retained_release_due(60_000, pool));
+        // Past the 85% watermark: release (two ~70k sessions, #8565).
+        assert!(retained_release_due(125_000, pool));
         // Exactly at the watermark boundary (not strictly above): keep.
         let at_mark = (RETAINED_WATERMARK * f64::from(pool)) as u32;
-        assert!(!retained_release_due(1.0, at_mark, pool));
-        assert!(retained_release_due(1.0, at_mark + 1, pool));
+        assert!(!retained_release_due(at_mark, pool));
+        assert!(retained_release_due(at_mark + 1, pool));
+        assert!(!retained_release_due(0, 0));
     }
 
     #[tokio::test]
