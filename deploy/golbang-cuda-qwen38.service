@@ -13,13 +13,13 @@ Environment=CUDA_VISIBLE_DEVICES=0
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda/build/bin
 Environment=RUST_LOG=info
-ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
+ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-IQ2_S.gguf \
   --alias qwen3.8-27b-cuda \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
   --n-ctx 80000 --n-batch 512 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 1 --queue-size 1 --single-max-ctx 40000 --kv-type-k q8_0 --kv-type-v q8_0 \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 80000 --kv-type-k q8_0 --kv-type-v q8_0 \
   --no-mmap --jinja \
   --api-key REDACTED_KEY1
 Restart=on-failure

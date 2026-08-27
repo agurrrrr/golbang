@@ -14,7 +14,7 @@ Environment=ROCBLAS_USE_HIPBLASLT=0
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-upgrade/build/bin
 Environment=RUST_LOG=info
 ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
-ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
+ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8-uncensored/Qwen3.8-27B-Uncensored-Q6_K.gguf \
   --alias qwen3.8-27b-q6 \
   --host 0.0.0.0 --port 8083 \

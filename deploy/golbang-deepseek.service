@@ -15,11 +15,11 @@ Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-upgrade/buil
 Environment=RUST_LOG=info
 # n-ubatch=1024: llama-server uses -b/-ub 5800, but this llama.cpp SHA needs ~5 GiB
 # compute at ubatch=5800 and OOMs next to 60k KV on 32 GiB. n-batch stays 5800.
-ExecStart=/home/agurrrrr/code/golbang/target/release/golbang-server \
+ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
   --n-gpu-layers 99 --n-cpu-moe 32 --flash-attn on \
-  --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 8 --n-rs-seq 1 \
+  --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 1 \
   --jinja --reasoning-format deepseek \
   --api-key REDACTED_KEY1
