@@ -26,7 +26,7 @@ pub use chat::{
 pub use engine::Engine;
 pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
-pub use model::{LoadParams, Model};
+pub use model::{LoadParams, Model, ModelCard};
 pub use policy::{
     EmptySlotView, FifoPolicy, IterationBudget, SchedulePolicy, SlotView, WaitingJobView,
 };

@@ -16,12 +16,13 @@ use crate::tokenizer::Token;
 #[derive(Debug)]
 pub enum SlotEvent {
     Token(GeneratedToken),
-    /// Prefill still running. HTTP uses this as an SSE heartbeat so a long
-    /// prompt does not look idle to the client.
+    /// Prefill still running. HTTP maps this to llama-server `prompt_progress`
+    /// (`total`/`cache`/`processed`/`time_ms`) so a long prompt stays observable.
     PromptProgress {
-        n_tokens: u32,
-        progress: f64,
-        tps: f64,
+        total: u32,
+        cache: u32,
+        processed: u32,
+        time_ms: u64,
     },
     Finished {
         reason: FinishReason,
@@ -166,6 +167,16 @@ pub(crate) struct ActiveJob {
 }
 
 impl ActiveJob {
+    /// llama-server `result_prompt_progress` snapshot for this request.
+    pub fn prompt_progress(&self) -> SlotEvent {
+        SlotEvent::PromptProgress {
+            total: self.n_prompt,
+            cache: self.prompt_offset as u32,
+            processed: self.prefill_cursor() as u32,
+            time_ms: self.started.elapsed().as_millis() as u64,
+        }
+    }
+
     pub fn from_parts(
         request_id: u64,
         tokens: Vec<Token>,
@@ -420,6 +431,19 @@ mod tests {
         assert_eq!(job.n_past, 2, "n_past seeded at reuse_len");
         assert_eq!(job.prompt_pos, 0);
         assert_eq!(job.n_prompt, 4);
+        match job.prompt_progress() {
+            SlotEvent::PromptProgress {
+                total,
+                cache,
+                processed,
+                time_ms: _,
+            } => {
+                assert_eq!(total, 4);
+                assert_eq!(cache, 2);
+                assert_eq!(processed, 2);
+            }
+            other => panic!("expected PromptProgress, got {other:?}"),
+        }
     }
 
     #[test]

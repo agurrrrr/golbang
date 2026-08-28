@@ -35,6 +35,8 @@ fn test_model() -> Option<String> {
 }
 
 async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
+    let model_card = model.card().clone();
+    let vision = model.vision_enabled();
     let engine = Arc::new(Engine::new(model));
     let spawned = spawn_scheduler(
         engine,
@@ -51,7 +53,10 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
         default_timeout: None,
         chat: ChatRuntime::default(),
         api_keys: Vec::new(),
-        vision: false,
+        vision,
+        model_card,
+        prompt_progress: true,
+        created: 1,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -186,6 +191,93 @@ async fn openai_sse_json_and_empty_messages() {
     assert_eq!(v["object"], "chat.completion");
     assert!(v["choices"][0]["message"]["content"].is_string());
     assert!(v["choices"][0]["finish_reason"].is_string());
+
+    let models = Command::new("curl")
+        .args(["-sS", &format!("http://127.0.0.1:{port}/v1/models")])
+        .output()
+        .expect("curl models");
+    assert!(models.status.success());
+    let models_txt = String::from_utf8_lossy(&models.stdout);
+    let models_v: serde_json::Value =
+        serde_json::from_str(&models_txt).unwrap_or_else(|e| panic!("models json: {e}: {models_txt}"));
+    assert_eq!(models_v["object"], "list");
+    assert_eq!(models_v["data"][0]["id"], "qwen-test");
+    assert_eq!(models_v["data"][0]["object"], "model");
+    assert!(models_v["data"][0]["meta"]["n_vocab"].as_i64().unwrap() > 0);
+
+    let models_alias = Command::new("curl")
+        .args(["-sS", &format!("http://127.0.0.1:{port}/models")])
+        .output()
+        .expect("curl /models");
+    assert!(models_alias.status.success());
+    let alias_txt = String::from_utf8_lossy(&models_alias.stdout);
+    let alias_v: serde_json::Value =
+        serde_json::from_str(&alias_txt).unwrap_or_else(|e| panic!("/models json: {e}: {alias_txt}"));
+    assert_eq!(alias_v["data"][0]["id"], "qwen-test");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sse_prompt_progress_field() {
+    let Some(path) = test_model() else {
+        return;
+    };
+    let _lock = lock_gpu();
+
+    let model = tokio::task::spawn_blocking(move || {
+        Model::load(
+            path,
+            LoadParams {
+                n_ctx: 256,
+                n_gpu_layers: 99,
+                n_seq_max: 1,
+                ..Default::default()
+            },
+        )
+    })
+    .await
+    .expect("join")
+    .expect("load");
+
+    let port = serve(model, 1, 1).await;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let sse = Command::new("curl")
+        .args([
+            "-sS",
+            "-N",
+            "-X",
+            "POST",
+            &url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":true,"max_tokens":4,"temperature":0,"return_progress":true}"#,
+        ])
+        .output()
+        .expect("curl sse progress");
+    assert!(sse.status.success());
+    let sse_txt = String::from_utf8_lossy(&sse.stdout);
+    assert!(
+        sse_txt.contains("prompt_progress"),
+        "missing prompt_progress in SSE\n{sse_txt}"
+    );
+    let mut saw = false;
+    for line in sse_txt.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap_or_else(|e| {
+            panic!("sse json: {e}: {data}");
+        });
+        if let Some(pp) = v.get("prompt_progress") {
+            assert!(pp["total"].as_u64().unwrap() > 0);
+            assert!(pp["processed"].as_u64().unwrap() <= pp["total"].as_u64().unwrap());
+            saw = true;
+        }
+    }
+    assert!(saw, "no prompt_progress object in SSE chunks\n{sse_txt}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

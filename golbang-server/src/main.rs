@@ -166,6 +166,20 @@ struct Args {
     /// Load MTP tensors even without `--spec-type draft-mtp`.
     #[arg(long, env = "GOLBANG_LOAD_MTP", default_value_t = false)]
     load_mtp: bool,
+
+    /// llama-server `return_progress`. SSE `data:` chunks include
+    /// `prompt_progress` (`total`/`cache`/`processed`/`time_ms`) so a long
+    /// prefill keeps HTTP idle timers from firing. Default on. Per-request
+    /// `return_progress` overrides. `--prompt-progress false` disables.
+    #[arg(
+        long,
+        env = "GOLBANG_PROMPT_PROGRESS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    prompt_progress: bool,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -342,6 +356,7 @@ async fn main() -> Result<()> {
     }
 
     let vision = model.vision_enabled();
+    let model_card = model.card().clone();
     let engine = Arc::new(Engine::new(model));
     let spawned = spawn_scheduler(
         engine,
@@ -370,6 +385,9 @@ async fn main() -> Result<()> {
         },
         api_keys,
         vision,
+        model_card,
+        prompt_progress: args.prompt_progress,
+        created: golbang_server::sse::unix_ts(),
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

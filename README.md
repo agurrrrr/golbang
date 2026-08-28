@@ -64,7 +64,7 @@ DSV4 decode wall의 ~2/3는 `n_cpu_moe=32` CPU expert였다. 상세는
 
 | 크레이트 | 역할 | 공개 표면 |
 |----------|------|-----------|
-| **golbang-server** | axum HTTP, SSE/JSON, `/metrics`, API 키 | `golbang-server` 바이너리 |
+| **golbang-server** | axum HTTP, SSE/JSON, `/v1/models`, `/metrics`, API 키 | `golbang-server` 바이너리 |
 | **golbang-core** | 스케줄러, 슬롯, 정책, 엔진, 템플릿, 샘플러, prefix, spec, vision, tools | RAII + async API |
 | **golbang-sys** | `llama.h` / `mtmd.h` / `llama-ext.h` bindgen + C++ 심볼 심 | C ABI만. safe wrapper 없음 |
 
@@ -72,7 +72,7 @@ DSV4 decode wall의 ~2/3는 `n_cpu_moe=32` CPU expert였다. 상세는
 golbang-server/src
   main.rs      CLI → Model::load → spawn_scheduler → axum::serve
   lib.rs       AppState, ChatRuntime, API 키 미들웨어
-  routes.rs    POST /v1/chat/completions
+  routes.rs    POST /v1/chat/completions, GET /v1/models, GET /models
   sse.rs       템플릿 적용, Job 제출, SSE / 비스트리밍
   types.rs     OpenAI 요청/응답, image_url, tools, reasoning_effort
   metrics.rs   Prometheus 텍스트
@@ -228,6 +228,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 ## 주요 기능
 
 - OpenAI `POST /v1/chat/completions` — `stream:true` SSE, `stream:false` JSON
+- OpenAI `GET /v1/models` (별칭 `GET /models`) — 로드된 모델 한 개. llama-server와 같은 `meta` 키
 - 슬롯 풀 + 교체 가능한 `SchedulePolicy` + chunked prefill
 - 다턴 slot-local prefix cache (`cache_n`, timings에 포함)
 - Qwen ChatML / GGUF jinja / `--chat-template-file`
@@ -235,6 +236,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 - MTP speculative + ngram-mod
 - `--mmproj` 비전
 - `/metrics` (토큰, TTFT/ITL, draft accept, 503)
+- `--prompt-progress` (기본 on): SSE `prompt_progress`로 긴 프리필 동안 연결 유지
 - `--api-key` (`Authorization: Bearer` 또는 `X-Api-Key`)
 - `--alias` (llama-server `-a`)
 
@@ -334,12 +336,13 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 | `--load-mtp` | off | spec 없이도 MTP 텐서 로드 |
 | `--policy` | `fifo` | P2는 fifo만 |
 | `--timeout-secs` | 없음 | 요청 생성 제한 |
-| `--api-key` | 없음 | 반복 또는 콤마. `/metrics`는 제외 |
+| `--api-key` | 없음 | 반복 또는 콤마. `/metrics` `/models`는 제외 |
+| `--prompt-progress` | on | SSE에 llama-server `prompt_progress` (`total`/`cache`/`processed`/`time_ms`). 긴 프리필 동안 연결 유지. 요청 `return_progress`가 덮어씀 |
 
-엔드포인트: `POST /v1/chat/completions`, `GET /metrics`.
+엔드포인트: `POST /v1/chat/completions`, `GET /v1/models`, `GET /models`, `GET /metrics`.
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,
 `tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget` (`reasoning_budget_tokens`),
-`image_url`.
+`image_url`, `return_progress`.
 
 ## 배포
 

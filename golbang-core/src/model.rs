@@ -88,6 +88,20 @@ impl Default for LoadParams {
     }
 }
 
+/// Snapshot of GGUF identity for `GET /v1/models` (llama-server `get_model_info`).
+#[derive(Clone, Debug)]
+pub struct ModelCard {
+    pub n_vocab: i32,
+    pub n_embd: i32,
+    pub n_ctx: u32,
+    pub n_ctx_train: i32,
+    pub n_params: u64,
+    pub size: u64,
+    pub vocab_type: i32,
+    pub ftype: i32,
+    pub vision: bool,
+}
+
 /// RAII owner of `llama_model` + `llama_context`. GPU access is serialized
 /// by the caller (P1: one request). `Send` so it can live on a worker thread.
 pub struct Model {
@@ -101,6 +115,7 @@ pub struct Model {
     path: PathBuf,
     vision: Option<Vision>,
     spec: SpecRuntime,
+    card: ModelCard,
 }
 
 struct SpecRuntime {
@@ -353,6 +368,18 @@ impl Model {
             "model ready"
         );
 
+        let card = ModelCard {
+            n_vocab,
+            n_embd: unsafe { llama_model_n_embd_inp(model) }.max(n_embd),
+            n_ctx: unsafe { llama_n_ctx(ctx) },
+            n_ctx_train: unsafe { llama_model_n_ctx_train(model) },
+            n_params: unsafe { llama_model_n_params(model) },
+            size: unsafe { llama_model_size(model) },
+            vocab_type: unsafe { llama_vocab_type(vocab) as i32 },
+            ftype: unsafe { llama_model_ftype(model) as i32 },
+            vision: vision.is_some(),
+        };
+
         Ok(Self {
             model,
             ctx,
@@ -364,11 +391,16 @@ impl Model {
             path: path.to_path_buf(),
             vision,
             spec,
+            card,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn card(&self) -> &ModelCard {
+        &self.card
     }
 
     pub fn n_vocab(&self) -> i32 {

@@ -637,16 +637,7 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bo
     ));
     arm_think_budget(slot, engine);
     if let Some(active) = slot.job.as_ref() {
-        let progress = if n_prompt == 0 {
-            1.0
-        } else {
-            f64::from(reuse_len as u32) / f64::from(n_prompt)
-        };
-        let _ = active.events.send(SlotEvent::PromptProgress {
-            n_tokens: reuse_len as u32,
-            progress,
-            tps: 0.0,
-        });
+        emit_prompt_progress(active);
     }
     tracing::info!(
         slot = slot.id.0,
@@ -746,16 +737,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) ->
         active.prompt_offset = reuse_pos as usize;
         active.prompt_pos = 0;
         slot.phase = SlotPhase::Decoding;
-        let progress = if n_past == 0 {
-            1.0
-        } else {
-            f64::from(reuse_pos) / f64::from(n_past)
-        };
-        let _ = active.events.send(SlotEvent::PromptProgress {
-            n_tokens: reuse_pos,
-            progress,
-            tps: 0.0,
-        });
+        emit_prompt_progress(active);
     }
     slot.prefix_cache.tokens.clear();
     slot.prefix_cache.prefix_len = reuse_tok;
@@ -835,6 +817,11 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engin
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
                 job.n_past += *take;
+                if *take > 0 {
+                    // llama-server sends `prompt_progress` after every ubatch.
+                    emit_prompt_progress(job);
+                    job.last_progress_n = job.prefill_cursor() as u32;
+                }
                 if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
                     job.last_progress_n = 0;
@@ -1484,7 +1471,13 @@ fn log_draft_acceptance(t: &SlotTimings) {
     );
 }
 
-/// llama-server `print_timings_pp`: long prefills emit a progress line every 3s.
+fn emit_prompt_progress(job: &ActiveJob) {
+    let _ = job.events.send(job.prompt_progress());
+}
+
+/// llama-server `print_timings_pp`: journal every 3s. SSE already got a
+/// `prompt_progress` event per ubatch in `apply_plan`; this still pings when
+/// the cursor is stuck behind a neighbor decode.
 fn maybe_log_prefill_progress(slots: &mut [Slot]) {
     const MIN_MS: u128 = 3000;
     let decode_busy = has_pending_decode(slots);
@@ -1536,11 +1529,7 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
             behind_decode,
             "prompt processing, n_tokens = {processed}/{total} ({pct:.1}%), remaining = {remaining}, t = {secs:.2} s / {tps:.2} tokens per second{behind_msg}"
         );
-        let _ = job.events.send(SlotEvent::PromptProgress {
-            n_tokens: processed,
-            progress,
-            tps,
-        });
+        emit_prompt_progress(job);
         job.last_progress_at = Instant::now();
         job.last_progress_n = processed;
     }

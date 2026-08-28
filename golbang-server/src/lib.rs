@@ -7,7 +7,7 @@ pub mod types;
 use axum::extract::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use golbang_core::{ReasoningFormat, SchedulerHandle};
+use golbang_core::{ModelCard, ReasoningFormat, SchedulerHandle};
 
 use crate::error::ApiError;
 
@@ -32,6 +32,10 @@ pub struct AppState {
     pub chat: ChatRuntime,
     pub api_keys: Vec<String>,
     pub vision: bool,
+    pub model_card: ModelCard,
+    /// llama-server `return_progress` default (`--prompt-progress`).
+    pub prompt_progress: bool,
+    pub created: u64,
 }
 
 pub fn router(state: AppState) -> axum::Router {
@@ -40,6 +44,8 @@ pub fn router(state: AppState) -> axum::Router {
             "/v1/chat/completions",
             axum::routing::post(routes::chat_completions),
         )
+        .route("/models", axum::routing::get(routes::list_models))
+        .route("/v1/models", axum::routing::get(routes::list_models))
         .route("/metrics", axum::routing::get(metrics::metrics))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -57,7 +63,12 @@ async fn api_key_middleware(
         return Ok(next.run(req).await);
     }
     let path = req.uri().path();
-    if path == "/metrics" || path == "/health" || path == "/v1/health" {
+    if path == "/metrics"
+        || path == "/health"
+        || path == "/v1/health"
+        || path == "/models"
+        || path == "/v1/models"
+    {
         return Ok(next.run(req).await);
     }
     if req.method() == axum::http::Method::OPTIONS {

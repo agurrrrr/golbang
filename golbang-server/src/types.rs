@@ -25,6 +25,9 @@ pub struct ChatCompletionRequest {
     /// Alias matches llama-server `reasoning_budget_tokens`.
     #[serde(default, alias = "reasoning_budget_tokens")]
     pub reasoning_budget: Option<i32>,
+    /// llama-server `return_progress`. `None` uses `--prompt-progress`.
+    #[serde(default)]
+    pub return_progress: Option<bool>,
 }
 
 impl ChatCompletionRequest {
@@ -307,6 +310,18 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<Timings>,
+    /// llama-server `prompt_progress` (stream only, when return_progress).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_progress: Option<PromptProgress>,
+}
+
+/// llama-server `result_prompt_progress`.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct PromptProgress {
+    pub total: u32,
+    pub cache: u32,
+    pub processed: u32,
+    pub time_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,6 +388,7 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             reasoning_budget: None,
+            return_progress: None,
         };
         assert_eq!(
             validate_request(&req).unwrap_err(),
@@ -403,6 +419,7 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             reasoning_budget: None,
+            return_progress: None,
         };
         assert!(validate_request(&req).is_ok());
     }
@@ -503,5 +520,32 @@ mod tests {
             assert!(v.get(key).is_some(), "missing {key}");
         }
         assert!((v["predicted_per_second"].as_f64().unwrap() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn return_progress_deserializes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true,"return_progress":true}"#,
+        )
+        .unwrap();
+        assert_eq!(req.return_progress, Some(true));
+        let req2: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert_eq!(req2.return_progress, None);
+    }
+
+    #[test]
+    fn prompt_progress_json_matches_llama_server() {
+        let p = PromptProgress {
+            total: 100,
+            cache: 40,
+            processed: 60,
+            time_ms: 1234,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["total"], 100);
+        assert_eq!(v["cache"], 40);
+        assert_eq!(v["processed"], 60);
+        assert_eq!(v["time_ms"], 1234);
     }
 }

@@ -50,6 +50,10 @@ impl Engine {
         self.lock().n_vocab()
     }
 
+    pub fn model_card(&self) -> crate::model::ModelCard {
+        self.lock().card().clone()
+    }
+
     pub fn spec_enabled(&self) -> bool {
         self.lock().spec_enabled()
     }

@@ -17,7 +17,7 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
-    Delta, DeltaFunction, DeltaToolCall, OutgoingToolCall, Timings, Usage,
+    Delta, DeltaFunction, DeltaToolCall, OutgoingToolCall, PromptProgress, Timings, Usage,
 };
 
 pub fn completion_id() -> String {
@@ -76,6 +76,10 @@ fn resolve_reasoning_budget(req: Option<i32>, server: u32) -> u32 {
         Some(n) if n <= 0 => 0,
         Some(n) => n as u32,
     }
+}
+
+fn want_prompt_progress(req: &ChatCompletionRequest, state: &AppState) -> bool {
+    req.return_progress.unwrap_or(state.prompt_progress)
 }
 
 pub fn model_name(req: &ChatCompletionRequest, state: &AppState) -> String {
@@ -211,6 +215,7 @@ pub fn stream_completion(
     let cancel_on_drop = cancel.clone();
     let mut parser = ReasoningParser::from_prompt(state.chat.reasoning_format, &prompt);
     let mut tools = ToolCallParser::new();
+    let show_progress = want_prompt_progress(&req, &state);
 
     submit_job(&state, &req, prompt, params, cancel, ev_tx)?;
 
@@ -248,6 +253,10 @@ pub fn stream_completion(
         let mut sent_role = false;
         let mut n = 0u32;
         let mut pending = PendingDelta::new();
+        let mut last_progress: Option<PromptProgress> = None;
+        let mut ping = tokio::time::interval(Duration::from_secs(2));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
         loop {
             tokio::select! {
                 ev = ev_rx.recv() => {
@@ -342,34 +351,24 @@ pub fn stream_completion(
                             break;
                         }
                         SlotEvent::PromptProgress {
-                            n_tokens,
-                            progress,
-                            tps,
+                            total,
+                            cache,
+                            processed,
+                            time_ms,
                         } => {
-                            // Comment + empty delta: axum KeepAlive is not enough for
-                            // clients that only reset idle timers on `data:` events.
-                            let comment = format!(
-                                "prompt processing n_tokens={n_tokens} progress={progress:.2} tps={tps:.1}"
-                            );
-                            if sse_tx
-                                .send(Event::default().comment(comment))
-                                .await
-                                .is_err()
-                            {
-                                cancel_on_drop.cancel();
-                                tracing::info!(
-                                    "client gone during prefill; cancel accepted, prefix kv retained"
-                                );
-                                break;
-                            }
-                            send_chunk(
+                            let pp = PromptProgress {
+                                total,
+                                cache,
+                                processed,
+                                time_ms,
+                            };
+                            last_progress = Some(pp.clone());
+                            send_prefill_heartbeat(
                                 &sse_tx,
                                 &id,
                                 created,
                                 &model_name,
-                                Delta::default(),
-                                None,
-                                None,
+                                show_progress.then_some(&pp),
                             )
                             .await
                         }
@@ -377,6 +376,19 @@ pub fn stream_completion(
                     if send.is_err() {
                         cancel_on_drop.cancel();
                         tracing::info!("client gone; cancel accepted, slot reclaim at next decode");
+                        break;
+                    }
+                }
+                _ = ping.tick(), if !sent_role => {
+                    let pp = last_progress.as_ref().filter(|_| show_progress);
+                    if send_prefill_heartbeat(&sse_tx, &id, created, &model_name, pp)
+                        .await
+                        .is_err()
+                    {
+                        cancel_on_drop.cancel();
+                        tracing::info!(
+                            "client gone during prefill ping; cancel accepted, prefix kv retained"
+                        );
                         break;
                     }
                 }
@@ -582,9 +594,62 @@ async fn send_chunk(
             finish_reason,
         }],
         timings,
+        prompt_progress: None,
     };
     let data = serde_json::to_string(&chunk).map_err(|_| ())?;
     tx.send(Event::default().data(data)).await.map_err(|_| ())
+}
+
+/// llama-server `return_progress` / `--sse-ping-interval`: a `data:` event
+/// during prefill so idle timers (Shepherd, undici) do not drop the stream.
+async fn send_prefill_heartbeat(
+    tx: &mpsc::Sender<Event>,
+    id: &str,
+    created: u64,
+    model: &str,
+    progress: Option<&PromptProgress>,
+) -> Result<(), ()> {
+    if let Some(pp) = progress {
+        let pct = if pp.total == 0 {
+            100.0
+        } else {
+            100.0 * f64::from(pp.processed) / f64::from(pp.total)
+        };
+        let comment = format!(
+            "prompt processing n_tokens={} progress={:.2} cache={} time_ms={}",
+            pp.processed,
+            pct / 100.0,
+            pp.cache,
+            pp.time_ms
+        );
+        tx.send(Event::default().comment(comment))
+            .await
+            .map_err(|_| ())?;
+        let chunk = ChatCompletionChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: Some("assistant"),
+                    content: None,
+                    ..Default::default()
+                },
+                finish_reason: None,
+            }],
+            timings: None,
+            prompt_progress: Some(pp.clone()),
+        };
+        let data = serde_json::to_string(&chunk).map_err(|_| ())?;
+        tx.send(Event::default().data(data)).await.map_err(|_| ())
+    } else {
+        tx.send(Event::default().comment("ping"))
+            .await
+            .map_err(|_| ())?;
+        send_chunk(tx, id, created, model, Delta::default(), None, None).await
+    }
 }
 
 fn nonempty_owned(s: String) -> Option<String> {
