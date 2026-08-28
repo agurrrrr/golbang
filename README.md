@@ -140,7 +140,8 @@ sequenceDiagram
    재사용 구간은 prefill하지 않는다. 이미지는 prefix를 쓰지 않고 `mtmd`로 한 번에 eval.
 5. **plan.** `BatchBuilder`는 decoding 슬롯을 먼저 넣는다 (`decode_max`는 **슬롯 수**).
    디코드가 있으면 큰 prefill을 같은 `llama_decode`에 넣지 않는다
-   (`mixed_prefill_max`, 기본 0 = decode-only). 전부 Prefilling이면
+   (`mixed_prefill_max`, 기본 0 = decode-only). 대신 `prefill_yield_every`마다
+   프리필 전용 이터레이션을 넣어 접미가 생성에 굶지 않게 한다. 전부 Prefilling이면
    남은 `n_batch`를 슬롯 수로 나눈다.
 6. **GPU.** `spawn_blocking` 한 워커에서 decode → 제자리 샘플 → MTP `process` → draft.
    Qwen3.8 vocab 248k logits를 async 쪽으로 복사하지 않는다.
@@ -162,7 +163,7 @@ join/evict/chunk/우선순위를 바꾸기 어렵기 때문이다.
 | Scheduler 태스크 | 큐 drain, 정책, 배치 계획, 이벤트 전달 |
 | `spawn_blocking` | 유일한 HIP 진입. `Engine`의 `Mutex<Model>`이 직렬화 |
 | `SchedulePolicy` | `join` / `evict` / `rank` / `budget`. P2는 `fifo`만 |
-| `IterationBudget` | `n_parallel==1`이면 `prefill_max=n_batch`, 아니면 `n_ubatch`. `decode_max=n_parallel`. `mixed_prefill_max=0` (디코드와 큰 prefill을 한 `llama_decode`에 안 섞음) |
+| `IterationBudget` | `n_parallel==1`이면 `prefill_max=n_batch`, 아니면 `n_ubatch`. `decode_max=n_parallel`. `mixed_prefill_max=0` (디코드와 큰 prefill을 한 `llama_decode`에 안 섞음). `n_parallel>1`이면 `prefill_yield_every=16` / `prefill_yield_max=256`으로 프리필 전용 이터레이션 |
 
 `--n-ctx`는 **슬롯당 기본 몫**이다. 총 KV 풀은 `n_ctx * n_parallel`.
 `--n-parallel`은 슬롯 수이자 `llama n_seq_max`이다.

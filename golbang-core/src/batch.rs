@@ -53,6 +53,27 @@ impl BatchBuilder {
     /// prefill this iteration is `mixed_prefill_max` (`0` = decode-only). A
     /// 2048-token mix on gfx906 dropped decode from ~18 t/s to 0.68 t/s.
     pub fn plan(&self, slots: &[Slot], order: &[SlotId], budget: IterationBudget) -> BatchPlan {
+        self.plan_ex(slots, order, budget, false)
+    }
+
+    /// Prefill-only iteration: skip decode tokens so gfx906 does not mix a
+    /// large prompt chunk into the same `llama_decode` as generation.
+    pub fn plan_prefill_only(
+        &self,
+        slots: &[Slot],
+        order: &[SlotId],
+        budget: IterationBudget,
+    ) -> BatchPlan {
+        self.plan_ex(slots, order, budget, true)
+    }
+
+    fn plan_ex(
+        &self,
+        slots: &[Slot],
+        order: &[SlotId],
+        budget: IterationBudget,
+        skip_decode: bool,
+    ) -> BatchPlan {
         let mut plan = BatchPlan::default();
         let cap = self.n_batch;
 
@@ -60,46 +81,50 @@ impl BatchBuilder {
         // cap. Counting drafts as tokens left n_parallel=1 units at ~10 t/s
         // with `/metrics` draft=0 (P7).
         let mut decode_slots = 0usize;
-        for &id in order {
-            if plan.tokens.len() >= cap || decode_slots >= budget.decode_max {
-                break;
-            }
-            let Some(slot) = slots.iter().find(|s| s.id == id) else {
-                continue;
-            };
-            if slot.phase != SlotPhase::Decoding {
-                continue;
-            }
-            let Some(job) = slot.job.as_ref() else {
-                continue;
-            };
-            let Some(tok) = job.pending else {
-                continue;
-            };
-            plan.tokens.push(BatchToken {
-                token: tok,
-                pos: job.n_past as i32,
-                seq_id: id.0 as i32,
-                logits: true,
-            });
-            plan.logit_slots.push(id);
-            decode_slots += 1;
-            for (k, &draft) in job.drafts.iter().enumerate() {
-                if plan.tokens.len() >= cap {
+        if !skip_decode {
+            for &id in order {
+                if plan.tokens.len() >= cap || decode_slots >= budget.decode_max {
                     break;
                 }
+                let Some(slot) = slots.iter().find(|s| s.id == id) else {
+                    continue;
+                };
+                if slot.phase != SlotPhase::Decoding {
+                    continue;
+                }
+                let Some(job) = slot.job.as_ref() else {
+                    continue;
+                };
+                let Some(tok) = job.pending else {
+                    continue;
+                };
                 plan.tokens.push(BatchToken {
-                    token: draft,
-                    pos: job.n_past as i32 + k as i32 + 1,
+                    token: tok,
+                    pos: job.n_past as i32,
                     seq_id: id.0 as i32,
                     logits: true,
                 });
                 plan.logit_slots.push(id);
+                decode_slots += 1;
+                for (k, &draft) in job.drafts.iter().enumerate() {
+                    if plan.tokens.len() >= cap {
+                        break;
+                    }
+                    plan.tokens.push(BatchToken {
+                        token: draft,
+                        pos: job.n_past as i32 + k as i32 + 1,
+                        seq_id: id.0 as i32,
+                        logits: true,
+                    });
+                    plan.logit_slots.push(id);
+                }
             }
         }
 
         let leftover = cap.saturating_sub(plan.tokens.len());
-        let prefill_cap = if decode_slots > 0 {
+        let prefill_cap = if skip_decode {
+            leftover
+        } else if decode_slots > 0 {
             leftover.min(budget.mixed_prefill_max)
         } else {
             leftover
@@ -158,6 +183,54 @@ impl BatchBuilder {
         }
 
         plan
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MixMode {
+    /// Decode first; leftover prefill only up to `mixed_prefill_max`.
+    Auto,
+    /// Skip decode; fill with prefill. Same kernel never mixes the two.
+    PrefillOnly,
+}
+
+pub(crate) fn max_prefill_remaining(slots: &[Slot]) -> usize {
+    slots
+        .iter()
+        .filter(|s| s.phase == SlotPhase::Prefilling)
+        .filter_map(|s| s.job.as_ref())
+        .map(|j| j.prefill_remaining())
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn has_pending_decode(slots: &[Slot]) -> bool {
+    slots.iter().any(|s| {
+        s.phase == SlotPhase::Decoding && s.job.as_ref().is_some_and(|j| j.pending.is_some())
+    })
+}
+
+/// Choose Auto (decode-only when mixed_prefill_max=0) vs a dedicated
+/// prefill-only iteration. Short suffixes finish immediately so a 12k
+/// generation cannot pin progress at the reused prefix for 13 minutes.
+pub(crate) fn decide_mix_mode(
+    slots: &[Slot],
+    budget: IterationBudget,
+    decode_iters_since_yield: u32,
+) -> MixMode {
+    let remaining = max_prefill_remaining(slots);
+    if remaining == 0 || !has_pending_decode(slots) {
+        return MixMode::Auto;
+    }
+    if remaining <= budget.prefill_finish_threshold() {
+        return MixMode::PrefillOnly;
+    }
+    if budget.prefill_yield_every > 0
+        && decode_iters_since_yield >= budget.prefill_yield_every as u32
+    {
+        MixMode::PrefillOnly
+    } else {
+        MixMode::Auto
     }
 }
 
@@ -281,6 +354,7 @@ mod tests {
             prefill_max: 32,
             decode_max: 16,
             mixed_prefill_max: 0,
+            ..IterationBudget::default()
         };
         let plan = BatchBuilder::new(4096).plan(&[slot], &[SlotId(2)], budget);
         assert_eq!(
@@ -309,6 +383,7 @@ mod tests {
             prefill_max: 32,
             decode_max: 3,
             mixed_prefill_max: 0,
+            ..IterationBudget::default()
         };
         let plan = BatchBuilder::new(4096).plan(&slots, &order, budget);
         assert_eq!(plan.tokens.len(), 3, "decode capped at budget.decode_max");
@@ -348,6 +423,7 @@ mod tests {
             prefill_max: 32,
             decode_max: 1,
             mixed_prefill_max: 0,
+            ..IterationBudget::default()
         };
         let plan = BatchBuilder::new(16).plan(&[slot], &[SlotId(0)], budget);
         let toks: Vec<i32> = plan.tokens.iter().map(|t| t.token).collect();
@@ -440,6 +516,7 @@ mod tests {
             prefill_max: 2048,
             decode_max: 2,
             mixed_prefill_max: 64,
+            ..IterationBudget::default()
         };
         let slots = [decode_slot(0, 7), prefill_slot(1, 30815)];
         let plan = builder.plan(&slots, &[SlotId(0), SlotId(1)], budget);
@@ -462,5 +539,79 @@ mod tests {
             let got = split_prefill_quota(*cap, *per, remaining);
             assert_eq!(&got, want, "{name}");
         }
+    }
+
+    fn prefill_with_reuse(id: u32, n_prompt: usize, reused: usize) -> Slot {
+        let mut slot = Slot::new(SlotId(id));
+        slot.phase = SlotPhase::Prefilling;
+        let mut job = crate::slot::ActiveJob::for_test(vec![1; n_prompt]);
+        job.prompt_offset = reused;
+        job.n_past = reused as u32;
+        slot.job = Some(job);
+        slot
+    }
+
+    #[test]
+    fn decide_mix_finishes_short_suffix_immediately() {
+        // req 170: n_prompt=53446 reused=51111 remaining=2335 ≤ 2*2048.
+        let budget = IterationBudget::for_context(2048, 2048, 2);
+        let slots = [
+            decode_slot(0, 42),
+            prefill_with_reuse(1, 53446, 51111),
+        ];
+        assert_eq!(max_prefill_remaining(&slots), 2335);
+        assert_eq!(
+            decide_mix_mode(&slots, budget, 0),
+            MixMode::PrefillOnly,
+            "short suffix must not wait for yield_every"
+        );
+    }
+
+    #[test]
+    fn decide_mix_waits_on_long_prefill_until_yield_every() {
+        let budget = IterationBudget::for_context(2048, 2048, 2);
+        let slots = [decode_slot(0, 42), prefill_slot(1, 50_000)];
+        assert_eq!(decide_mix_mode(&slots, budget, 0), MixMode::Auto);
+        assert_eq!(decide_mix_mode(&slots, budget, 15), MixMode::Auto);
+        assert_eq!(decide_mix_mode(&slots, budget, 16), MixMode::PrefillOnly);
+    }
+
+    #[test]
+    fn decide_mix_stays_auto_when_only_one_phase() {
+        let budget = IterationBudget::for_context(2048, 2048, 2);
+        let only_prefill = [prefill_slot(1, 50_000)];
+        let only_decode = [decode_slot(0, 42)];
+        assert_eq!(decide_mix_mode(&only_prefill, budget, 99), MixMode::Auto);
+        assert_eq!(decide_mix_mode(&only_decode, budget, 99), MixMode::Auto);
+    }
+
+    #[test]
+    fn plan_prefill_only_skips_decode_tokens() {
+        let (builder, budget) = production_np2();
+        let slots = [decode_slot(0, 42), prefill_slot(1, 30815)];
+        let plan = builder.plan_prefill_only(&slots, &[SlotId(0), SlotId(1)], budget);
+        assert!(plan.tokens.iter().all(|t| t.seq_id == 1));
+        assert_eq!(plan.prefill_consumed, vec![(SlotId(1), 2048)]);
+        assert_eq!(plan.tokens.len(), 2048);
+        assert!(!plan.logit_slots.contains(&SlotId(0)));
+    }
+
+    #[test]
+    fn plan_prefill_only_long_prefill_uses_yield_chunk() {
+        let (builder, budget) = production_np2();
+        let slots = [decode_slot(0, 42), prefill_slot(1, 50_000)];
+        let mut yield_budget = budget;
+        yield_budget.prefill_max = budget.yield_chunk(50_000);
+        assert_eq!(yield_budget.prefill_max, 256);
+        let plan = builder.plan_prefill_only(&slots, &[SlotId(0), SlotId(1)], yield_budget);
+        assert_eq!(plan.tokens.len(), 256);
+        assert_eq!(plan.prefill_consumed, vec![(SlotId(1), 256)]);
+    }
+
+    #[test]
+    fn default_budget_does_not_yield_a_long_prefill() {
+        let budget = IterationBudget::default();
+        let slots = [decode_slot(0, 42), prefill_slot(1, 10_000)];
+        assert_eq!(decide_mix_mode(&slots, budget, 100), MixMode::Auto);
     }
 }

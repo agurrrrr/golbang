@@ -231,7 +231,7 @@ impl ActiveJob {
             last_token_at: now,
             generation_started_at: None,
             last_progress_at: now,
-            last_progress_n: 0,
+            last_progress_n: prompt_offset as u32,
         }
     }
 

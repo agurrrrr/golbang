@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::batch::{BatchBuilder, BatchToken};
+use crate::batch::{
+    BatchBuilder, BatchToken, MixMode, decide_mix_mode, has_pending_decode, max_prefill_remaining,
+};
 use crate::ctx_cap::{cap_for_join, effective_cap, resolve_single_max, slot_cap};
 use crate::engine::Engine;
 use crate::error::Error;
@@ -201,6 +203,8 @@ async fn run_loop(
         prefill_max = budget.prefill_max,
         decode_max = budget.decode_max,
         mixed_prefill_max = budget.mixed_prefill_max,
+        prefill_yield_every = budget.prefill_yield_every,
+        prefill_yield_max = budget.prefill_yield_max,
         "scheduler budget"
     );
     let pool = engine.n_ctx();
@@ -215,6 +219,7 @@ async fn run_loop(
     );
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut iter = 0u64;
+    let mut decode_iters_since_prefill_yield = 0u32;
 
     loop {
         iter += 1;
@@ -268,7 +273,27 @@ async fn run_loop(
                 .map(|s| s.id)
                 .collect();
         }
-        let plan = builder.plan(&slots, &order, budget);
+        let mix = decide_mix_mode(&slots, budget, decode_iters_since_prefill_yield);
+        let remaining_prefill = max_prefill_remaining(&slots);
+        let plan = if mix == MixMode::PrefillOnly {
+            let mut yield_budget = budget;
+            yield_budget.prefill_max = budget.yield_chunk(remaining_prefill);
+            decode_iters_since_prefill_yield = 0;
+            tracing::info!(
+                remaining = remaining_prefill,
+                take = yield_budget.prefill_max,
+                "prefill yield; decode paused this iteration"
+            );
+            builder.plan_prefill_only(&slots, &order, yield_budget)
+        } else {
+            if remaining_prefill > 0 && has_pending_decode(&slots) {
+                decode_iters_since_prefill_yield =
+                    decode_iters_since_prefill_yield.saturating_add(1);
+            } else {
+                decode_iters_since_prefill_yield = 0;
+            }
+            builder.plan(&slots, &order, budget)
+        };
 
         if plan.is_empty() {
             if !has_active(&slots) && waiting.is_empty() {
@@ -369,6 +394,8 @@ fn resolve_budget(
         prefill_max: requested.prefill_max.min(n_batch).max(1),
         decode_max: requested.decode_max.max(1),
         mixed_prefill_max: requested.mixed_prefill_max.min(n_batch),
+        prefill_yield_every: requested.prefill_yield_every,
+        prefill_yield_max: requested.prefill_yield_max.min(n_batch),
     }
 }
 
@@ -810,6 +837,8 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engin
                 job.n_past += *take;
                 if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
+                    job.last_progress_n = 0;
+                    job.last_progress_at = Instant::now();
                     if job.generation_started_at.is_none() {
                         job.generation_started_at = Some(Instant::now());
                         need_ckpt = true;
@@ -1458,6 +1487,7 @@ fn log_draft_acceptance(t: &SlotTimings) {
 /// llama-server `print_timings_pp`: long prefills emit a progress line every 3s.
 fn maybe_log_prefill_progress(slots: &mut [Slot]) {
     const MIN_MS: u128 = 3000;
+    let decode_busy = has_pending_decode(slots);
     for slot in slots.iter_mut() {
         if slot.phase != SlotPhase::Prefilling {
             continue;
@@ -1474,11 +1504,13 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
         }
         let processed = job.prefill_cursor() as u32;
         let total = job.prompt_tokens.len() as u32;
+        let remaining = job.prefill_remaining() as u32;
         let progress = if total == 0 {
             1.0
         } else {
             f64::from(processed) / f64::from(total)
         };
+        let pct = progress * 100.0;
         let secs = elapsed.as_secs_f64();
         // tok/s is only the work this request actually prefills (not cache_n).
         let prefilled = job.prompt_pos as u32;
@@ -1487,13 +1519,22 @@ fn maybe_log_prefill_progress(slots: &mut [Slot]) {
         } else {
             0.0
         };
+        let behind_decode = remaining > 0 && processed == job.last_progress_n && decode_busy;
+        let behind_msg = if behind_decode {
+            " (waiting behind decode)"
+        } else {
+            ""
+        };
         tracing::info!(
             slot = slot.id.0,
             request_id = job.request_id,
             n_tokens = processed,
-            progress,
+            n_prompt = total,
+            remaining,
+            progress_pct = pct,
             tps,
-            "prompt processing, n_tokens = {processed}, progress = {progress:.2}, t = {secs:.2} s / {tps:.2} tokens per second"
+            behind_decode,
+            "prompt processing, n_tokens = {processed}/{total} ({pct:.1}%), remaining = {remaining}, t = {secs:.2} s / {tps:.2} tokens per second{behind_msg}"
         );
         let _ = job.events.send(SlotEvent::PromptProgress {
             n_tokens: processed,
@@ -1803,6 +1844,8 @@ mod tests {
                 prefill_max: 99999,
                 decode_max: 4,
                 mixed_prefill_max: 99999,
+                prefill_yield_every: 16,
+                prefill_yield_max: 99999,
             },
             5800,
             1024,
@@ -1811,6 +1854,8 @@ mod tests {
         assert_eq!(b.prefill_max, 5800);
         assert_eq!(b.decode_max, 4);
         assert_eq!(b.mixed_prefill_max, 5800);
+        assert_eq!(b.prefill_yield_every, 16);
+        assert_eq!(b.prefill_yield_max, 5800);
     }
 
     #[test]

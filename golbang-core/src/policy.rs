@@ -67,7 +67,7 @@ pub struct WaitingJobView<'a> {
 /// `prefill_max` bounds how many prefill tokens one slot may consume per
 /// iteration, so a very long prompt is split across several iterations.
 /// `mixed_prefill_max` bounds **total** prefill tokens in an iteration that
-/// already has decode tokens. `0` = decode-only.
+/// already has decode tokens. `0` = decode-only (do not mix in one kernel).
 ///
 /// [`Default`] is the P3 unit-test placeholder (32 / 16 / 0). Production must
 /// call [`IterationBudget::for_context`] so the chunk size matches llama.cpp
@@ -81,12 +81,22 @@ pub struct WaitingJobView<'a> {
 /// when they are equal the mix is one kernel. `mixed_prefill_max = 0`
 /// keeps that iteration decode-only. Dual-prefill fairness is the planner
 /// splitting leftover across prefilling slots, not this per-slot cap.
+///
+/// Decode-only forever is the opposite stall: a 12k generation holds the GPU
+/// while the neighbor's suffix prefill sits at reused `progress≈0.96` /
+/// `tps=0` until `max_tokens`. `prefill_yield_every` / `prefill_yield_max`
+/// insert dedicated **prefill-only** iterations (still never mixed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IterationBudget {
     pub prefill_max: usize,
     pub decode_max: usize,
     /// Total prefill tokens allowed alongside decode. `0` = decode-only.
     pub mixed_prefill_max: usize,
+    /// Decode-only iterations between a dedicated prefill-only yield when
+    /// both phases are active. `0` = never yield (legacy starve).
+    pub prefill_yield_every: usize,
+    /// Tokens in a dedicated prefill-only yield. `0` = use `prefill_max`.
+    pub prefill_yield_max: usize,
 }
 
 impl Default for IterationBudget {
@@ -95,6 +105,8 @@ impl Default for IterationBudget {
             prefill_max: 32,
             decode_max: 16,
             mixed_prefill_max: 0,
+            prefill_yield_every: 0,
+            prefill_yield_max: 0,
         }
     }
 }
@@ -107,15 +119,38 @@ impl IterationBudget {
     /// - `n_parallel > 1`: cap one slot at `n_ubatch`. The planner splits that
     ///   leftover across prefilling slots. Decode-only when any slot is
     ///   generating (`mixed_prefill_max = 0`) — gfx906 cannot mix a large
-    ///   prefill chunk into the same `llama_decode` as decode.
+    ///   prefill chunk into the same `llama_decode` as decode. Dedicated
+    ///   prefill-only yields still run so a suffix is not stuck behind a
+    ///   long generation.
     pub fn for_context(n_batch: usize, n_ubatch: usize, n_parallel: usize) -> Self {
         let n_ubatch = n_ubatch.max(1);
         let n_batch = n_batch.max(n_ubatch);
         let n_parallel = n_parallel.max(1);
+        let shared = n_parallel > 1;
         Self {
-            prefill_max: if n_parallel == 1 { n_batch } else { n_ubatch },
+            prefill_max: if shared { n_ubatch } else { n_batch },
             decode_max: n_parallel,
             mixed_prefill_max: 0,
+            prefill_yield_every: if shared { 16 } else { 0 },
+            prefill_yield_max: if shared { 256.min(n_ubatch) } else { 0 },
+        }
+    }
+
+    /// Remaining suffix at or below this is finished immediately (decode
+    /// pauses for one or two ubatches) instead of interleaving 256-token
+    /// yields. Two ubatches covers the usual tool-round suffix (~0.2k–4k).
+    pub fn prefill_finish_threshold(&self) -> usize {
+        self.prefill_max.saturating_mul(2)
+    }
+
+    /// Per-slot cap for a dedicated prefill-only yield.
+    pub fn yield_chunk(&self, remaining: usize) -> usize {
+        if remaining <= self.prefill_finish_threshold() {
+            self.prefill_max
+        } else if self.prefill_yield_max > 0 {
+            self.prefill_yield_max
+        } else {
+            self.prefill_max
         }
     }
 }
@@ -528,6 +563,8 @@ mod tests {
                 prefill_max: 5800,
                 decode_max: 1,
                 mixed_prefill_max: 0,
+                prefill_yield_every: 0,
+                prefill_yield_max: 0,
             }
         );
     }
@@ -541,6 +578,8 @@ mod tests {
                 prefill_max: 1024,
                 decode_max: 2,
                 mixed_prefill_max: 0,
+                prefill_yield_every: 16,
+                prefill_yield_max: 256,
             }
         );
     }
@@ -552,5 +591,16 @@ mod tests {
         assert_eq!(b.prefill_max, 2048);
         assert_eq!(b.decode_max, 2);
         assert_eq!(b.mixed_prefill_max, 0);
+        assert_eq!(b.prefill_yield_every, 16);
+        assert_eq!(b.prefill_yield_max, 256);
+    }
+
+    #[test]
+    fn yield_chunk_finishes_a_short_suffix_in_one_ubatch() {
+        let b = IterationBudget::for_context(2048, 2048, 2);
+        assert_eq!(b.prefill_finish_threshold(), 4096);
+        assert_eq!(b.yield_chunk(2335), 2048);
+        assert_eq!(b.yield_chunk(4096), 2048);
+        assert_eq!(b.yield_chunk(50_000), 256);
     }
 }
