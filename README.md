@@ -245,15 +245,36 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 
 ## 빌드
 
-필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2, 핀된 llama.cpp 트리와 gfx906 `.so`.
+**CUDA와 HIP은 각각 빌드한다 — 통합 빌드는 하지 않는다.**
+`GOLBANG_GPU` env가 llama.cpp 트리·SHA pin·링크 라이브러리를 결정하고,
+`CARGO_TARGET_DIR`으로 타겟 디렉토리를 분리한다. 하나의 바이너리가 두 GPU를
+모두 지원하는 단일(통합) 빌드/`--gpu` 런타임 플래그는 **없다** (2026-08-29 결정,
+위키 `cuda-hip-separate-builds`).
+
+| GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
+|-----|-----|---------------|----------------|---------|
+| HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-upgrade` | `3ac5658c7` |
+| CUDA (RTX 3060) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda` | `749f688fc` |
+
+서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
+`target-hip/release/golbang-server`, RTX 3060 서비스는
+`target-cuda/release/golbang-server` (유닛은 `deploy/`).
+
+필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2 (HIP) / CUDA toolkit (CUDA),
+핀된 llama.cpp 트리와 그 SHA의 `.so`.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-export GOLBANG_LLAMA_DIR=/home/agurrrrr/code/local-llm/llama.cpp-upgrade
 export GOLBANG_TEST_MODEL=/home/agurrrrr/models/Qwen3-0.6B-Q4_K_M.gguf
 
-cargo build -p golbang-server --release
-cargo test  -p golbang-sys -- --nocapture   # P0: Hello 1회 decode
+# HIP (MI50) 빌드
+CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo build -p golbang-server --release
+
+# CUDA (RTX 3060) 빌드
+CARGO_TARGET_DIR=target-cuda GOLBANG_GPU=cuda cargo build -p golbang-server --release
+
+# 테스트 (GOLBANG_GPU로 백엔드 선택, 기본 hip)
+CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo test -p golbang-sys -- --nocapture
 ```
 
 `cargo test --workspace`는 `GOLBANG_TEST_MODEL`이 있을 때
