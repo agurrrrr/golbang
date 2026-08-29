@@ -323,12 +323,17 @@ pub struct Slot {
     pub prefix_cache: crate::prefix_cache::SlotPrefixCache,
     /// Prefill-end snapshot. DSV4 cannot `seq_rm` a long generated suffix
     /// (`n_rs_seq` is tiny), so the next bind restores this then trims 1 token.
-    pub(crate) prefix_ckpt: Option<SeqCheckpoint>,
+    /// P8-A semantic anchor chain: prefill-end and ubatch-boundary snapshots,
+    /// ascending by `n_tokens`. Same `n_tokens` replaces; a longer new anchor
+    /// appends. `settle_prefix_kv` binds from the longest anchor with
+    /// `n_tokens <= reuse_len + 1`. The chain lives only while the slot lives
+    /// (watermark survival is #91).
+    pub(crate) prefix_ckpts: Vec<SeqCheckpoint>,
     /// When this empty slot last retained prefix KV. `None` if nothing is held.
     pub(crate) retained_at: Option<Instant>,
 }
 
-/// Host copy of one sequence at a known length (see [`Slot::prefix_ckpt`]).
+/// Host copy of one sequence at a known length (see [`Slot::prefix_ckpts`]).
 /// `pub` so the global `PrefixStore` can hold checkpoint values too.
 #[derive(Clone, Debug)]
 pub struct SeqCheckpoint {
@@ -343,7 +348,7 @@ impl Slot {
             phase: SlotPhase::Empty,
             job: None,
             prefix_cache: Default::default(),
-            prefix_ckpt: None,
+            prefix_ckpts: Vec::new(),
             retained_at: None,
         }
     }
