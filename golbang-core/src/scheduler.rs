@@ -18,8 +18,8 @@ use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
 use crate::policy::{EmptySlotView, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
-use crate::prefix_cache::common_prefix_len;
-use crate::slot::{ActiveJob, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
+use crate::prefix_cache::{PrefixStore, common_prefix_len};
+use crate::slot::{ActiveJob, SeqCheckpoint, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 use crate::speculative::accept_drafts;
 use crate::tokenizer::Token;
 
@@ -193,6 +193,9 @@ async fn run_loop(
     }
 
     let mut slots: Vec<Slot> = (0..n).map(|i| Slot::new(SlotId(i as u32))).collect();
+    let prefix_store = Arc::new(std::sync::Mutex::new(
+        PrefixStore::with_cap(PrefixStore::DEFAULT_MAX_BYTES),
+    ));
     let n_batch = engine.n_batch().max(1) as usize;
     let n_ubatch = engine.n_ubatch().max(1) as usize;
     let builder = BatchBuilder::new(n_batch);
@@ -262,6 +265,7 @@ async fn run_loop(
             spec_n_max,
             iter,
             &metrics,
+            &prefix_store,
         );
         recompute_slot_caps(&mut slots, pool, single_max, spec_n_max);
 
@@ -320,6 +324,7 @@ async fn run_loop(
 
         let engine_d = engine.clone();
         let metrics_d = metrics.clone();
+        let prefix_store_d = prefix_store.clone();
         let n_slots = slots.len();
         tracing::debug!(
             iter,
@@ -349,7 +354,7 @@ async fn run_loop(
                 Ok(s) => s,
                 Err(e) => return (slots, Err(e)),
             };
-            apply_plan(&mut slots, &plan, &engine_d);
+            apply_plan(&mut slots, &plan, &engine_d, &prefix_store_d);
             maybe_log_prefill_progress(&mut slots);
             sample_and_emit(&mut slots, &plan, &samples, &engine_d, &metrics_d);
             fill_drafts_sync(&mut slots, &engine_d);
@@ -426,6 +431,7 @@ fn join_waiting(
     spec_n_max: u32,
     iter: u64,
     metrics: &SchedulerMetrics,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
 ) {
     let empty: Vec<SlotId> = slots
         .iter()
@@ -540,7 +546,7 @@ fn join_waiting(
                 waiting.push_front(job);
                 continue;
             };
-            bind_slot(slot, job, engine, cap)
+            bind_slot(slot, job, engine, cap, prefix_store)
         };
         if !bound {
             tracing::warn!(
@@ -575,12 +581,12 @@ fn join_waiting(
     }
 }
 
-fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bool {
+fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32, prefix_store: &Arc<std::sync::Mutex<PrefixStore>>) -> bool {
     let seq = slot.id.0 as i32;
     engine.spec_reset_seq(seq);
 
     if !job.images.is_empty() {
-        return bind_vision_slot(slot, job, engine, ctx_cap);
+        return bind_vision_slot(slot, job, engine, ctx_cap, prefix_store);
     }
 
     let tokens = match job.prompt_tokens.take() {
@@ -622,7 +628,7 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bo
     let ckpt_n = slot.prefix_ckpt.as_ref().map(|c| c.n_tokens).unwrap_or(0);
     let hint_n = gpu_n.max(ckpt_n);
     let mut reuse_len = slot.prefix_cache.reuse_for_bind(&tokens, hint_n);
-    reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n);
+    reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n, prefix_store);
     let req = job.request_id;
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
@@ -651,7 +657,7 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32) -> bo
     true
 }
 
-fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
+fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32, prefix_store: &Arc<std::sync::Mutex<PrefixStore>>) -> bool {
     if !engine.vision_enabled() {
         let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
         return false;
@@ -687,7 +693,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) ->
         .map(|prev| prev.reuse_for_bind(&tok.seq, hint_n))
         .unwrap_or(0);
     let mut reuse_pos = tok.seq.pos_next(reuse_tok);
-    reuse_pos = settle_prefix_kv(slot, engine, reuse_pos as usize, gpu_n) as u32;
+    reuse_pos = settle_prefix_kv(slot, engine, reuse_pos as usize, gpu_n, prefix_store) as u32;
     if reuse_pos == 0 {
         reuse_tok = 0;
     } else if reuse_pos != tok.seq.pos_next(reuse_tok) {
@@ -810,7 +816,12 @@ fn sample_from_existing_logits(slot: &mut Slot, engine: &Engine) -> crate::error
     Ok(())
 }
 
-fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engine) {
+fn apply_plan(
+    slots: &mut [Slot],
+    plan: &crate::batch::BatchPlan,
+    engine: &Engine,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+) {
     for (id, take) in &plan.prefill_consumed {
         if let Some(slot) = slots.iter_mut().find(|s| s.id == *id) {
             let mut need_ckpt = false;
@@ -834,6 +845,29 @@ fn apply_plan(slots: &mut [Slot], plan: &crate::batch::BatchPlan, engine: &Engin
             }
             if need_ckpt {
                 capture_prefix_checkpoint(slot, engine);
+                // P8-B: promote the shared head to the host store at ubatch
+                // boundaries during the first long prefill.
+                let n_ubatch = engine.n_ubatch().max(1) as u32;
+                if let Some(job) = slot.job.as_ref() {
+                    if job.n_past > 0 && job.n_past % n_ubatch == 0 {
+                        if let Some(data) = engine.seq_state_get(slot.id.0 as i32) {
+                            if !data.is_empty() {
+                                let n_tokens = job.n_past;
+                                let tokens = slot.prefix_cache.tokens.to_vec();
+                                let ckpt = SeqCheckpoint { n_tokens, data };
+                                let bytes = ckpt.data.len();
+                                let mut store = prefix_store.lock().unwrap();
+                                store.put(tokens, ckpt);
+                                tracing::info!(
+                                    slot = slot.id.0,
+                                    n_tokens,
+                                    bytes,
+                                    "host prefix snapshot promoted"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1712,7 +1746,18 @@ fn capture_prefix_checkpoint(slot: &mut Slot, engine: &Engine) {
 }
 
 /// Trim or restore so GPU KV covers exactly `reuse_len` cells (or 0 = clear).
-fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u32) -> usize {
+///
+/// P8-B: when the slot's own checkpoint is unusable (`n_tokens` too long for
+/// `reuse_len`), fall back to the global host `PrefixStore` — find the longest
+/// snapshot that still matches the prompt, restore it, and keep only `kept`
+/// cells so the suffix prefill starts where the shared head ends.
+fn settle_prefix_kv(
+    slot: &mut Slot,
+    engine: &Engine,
+    reuse_len: usize,
+    gpu_n: u32,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+) -> usize {
     let seq = slot.id.0 as i32;
     if reuse_len == 0 {
         engine.clear_seq(seq);
@@ -1738,6 +1783,27 @@ fn settle_prefix_kv(slot: &mut Slot, engine: &Engine, reuse_len: usize, gpu_n: u
     // Restore is useful if it lands at reuse_len or one token past (DSV4
     // `<think>` vs `</think>`). n_rs_seq=1 can drop that extra token.
     if ckpt.n_tokens == 0 || ckpt.n_tokens > reuse_len as u32 + 1 {
+        // Slot checkpoint is too long. Try the global host snapshot store.
+        let tokens = slot.prefix_cache.tokens.to_vec();
+        let host = prefix_store.lock().unwrap().find_best(&tokens, reuse_len);
+        if let Some(host_ckpt) = host {
+            tracing::info!(slot = slot.id.0, reuse_len, host_n = host_ckpt.n_tokens, gpu_n, gpu_after, "host snapshot restore reuse_len=...");
+            engine.clear_seq(seq);
+            slot.prefix_cache.reset();
+            slot.prefix_ckpt = None;
+            if engine.seq_state_set(seq, &host_ckpt.data) {
+                if engine.rm_seq_from(seq, host_ckpt.n_tokens as i32) {
+                    let kept = reuse_len.min(host_ckpt.n_tokens as usize);
+                    if trim_seq_to(engine, seq, kept) {
+                        tracing::info!(slot = slot.id.0, reuse_len = kept, host_n = host_ckpt.n_tokens, gpu_after = engine.n_past_seq(seq), "host snapshot restored");
+                        return kept;
+                    }
+                }
+            }
+            tracing::warn!(slot = slot.id.0, reuse_len, host_n = host_ckpt.n_tokens, "host snapshot restore failed; full prefill");
+            engine.clear_seq(seq);
+            return 0;
+        }
         tracing::warn!(
             slot = slot.id.0,
             reuse_len,

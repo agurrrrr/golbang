@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use crate::slot::SeqCheckpoint;
 use crate::tokenizer::Token;
 
 /// Longest common prefix length between two token slices.
@@ -287,14 +288,127 @@ impl SlotPrefixCache {
 }
 
 /// Optional global prefix store (disabled by default — see module doc).
+///
+/// P8-B: a cross-slot host snapshot map. Each entry is a `SeqCheckpoint`
+/// captured at a known token length (`n_tokens`), keyed by the prompt prefix
+/// tokens `[0..n_tokens)`. A bind whose LCP matches an entry length restores
+/// that snapshot instead of re-prefilling the shared head.
+///
+/// Entries are few (one tool/system head + a handful of system prompts), so
+/// lookup is a linear scan — no trie/radix tree.
 #[derive(Clone, Debug, Default)]
 pub struct PrefixStore {
-    pub entries: HashMap<Vec<Token>, usize>,
+    pub entries: HashMap<Vec<Token>, SeqCheckpoint>,
+    /// Total bytes of all entry `data` (tracked for the RAM cap).
+    pub total_bytes: usize,
+    /// Soft RAM cap (bytes). When `total_bytes` exceeds it, evict least-recently
+    /// used entries. 0 = unlimited.
+    pub max_bytes: usize,
+    /// Monotonic "now" tick for LRU ordering (advances on every insert/use).
+    last_used_tick: u64,
+    /// Per-entry tick of last use (keyed by the same prefix slice).
+    last_used: HashMap<Vec<Token>, u64>,
 }
 
 impl PrefixStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Recommended RAM cap for the shared tool/system head (~0.8 GiB for
+    /// Qwen3.8 FA at 12545 tokens). 2 GiB leaves room for a few system prompts.
+    pub const DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+    pub fn with_cap(max_bytes: usize) -> Self {
+        let mut s = Self::new();
+        s.max_bytes = max_bytes;
+        s
+    }
+
+    /// Insert or refresh a snapshot for prefix `[0..n_tokens)`.
+    pub fn put(&mut self, prefix: Vec<Token>, ckpt: SeqCheckpoint) {
+        self.last_used_tick = self.last_used_tick.saturating_add(1);
+        if let Some(old) = self.entries.insert(prefix.clone(), ckpt) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.data.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(self.entry_bytes(&prefix));
+        self.last_used.insert(prefix, self.last_used_tick);
+        self.evict_if_over_cap();
+    }
+
+    /// Find the longest usable snapshot for `prompt`.
+    ///
+    /// An entry is usable when its LCP with `prompt` equals `n_tokens` (the
+    /// whole snapshot prefix still matches) and `n_tokens <= reuse_len + 1`
+    /// (the GPU can restore it and trim one logits token). Among usable
+    /// entries, returns the longest. Linear scan.
+    pub fn find_best(&mut self, prompt: &[Token], reuse_len: usize) -> Option<SeqCheckpoint> {
+        let mut best: Option<(u32, Vec<Token>)> = None;
+        for (prefix, ckpt) in &self.entries {
+            if ckpt.n_tokens == 0 || ckpt.n_tokens > reuse_len as u32 + 1 {
+                continue;
+            }
+            if common_prefix_len(prefix, prompt) != ckpt.n_tokens as usize {
+                continue;
+            }
+            match best {
+                Some((n, _)) if n >= ckpt.n_tokens => {}
+                _ => best = Some((ckpt.n_tokens, prefix.clone())),
+            }
+        }
+        best.map(|(_, prefix)| {
+            self.touch(&prefix);
+            self.entries[&prefix].clone()
+        })
+    }
+
+    /// Mark an entry recently used (advances LRU without changing data).
+    fn touch(&mut self, prefix: &[Token]) {
+        self.last_used_tick = self.last_used_tick.saturating_add(1);
+        if let Some(t) = self.last_used.get_mut(prefix) {
+            *t = self.last_used_tick;
+        }
+    }
+
+    fn entry_bytes(&self, prefix: &[Token]) -> usize {
+        self.entries
+            .get(prefix)
+            .map(|c| c.data.len())
+            .unwrap_or(0)
+    }
+
+    /// Evict least-recently-used entries until `total_bytes <= max_bytes`.
+    fn evict_if_over_cap(&mut self) {
+        if self.max_bytes == 0 || self.total_bytes <= self.max_bytes {
+            return;
+        }
+        loop {
+            if self.entries.is_empty() || self.total_bytes <= self.max_bytes {
+                return;
+            }
+            // Find the least recently used key.
+            let victim = self
+                .last_used
+                .iter()
+                .min_by_key(|&(_, &t)| t)
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else {
+                return;
+            };
+            if let Some(ckpt) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(ckpt.data.len());
+            }
+            self.last_used.remove(&victim);
+        }
+    }
+
+    /// Number of resident entries (for tests / metrics).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -513,5 +627,72 @@ mod tests {
         c.vision = Some(VisionSeq::from_chunks([VisionChunk::Text(t(&[1]))]));
         c.reset();
         assert!(c.vision.is_none());
+    }
+
+    fn ckpt(n_tokens: u32, bytes: u8) -> crate::slot::SeqCheckpoint {
+        crate::slot::SeqCheckpoint {
+            n_tokens,
+            data: vec![bytes; n_tokens as usize],
+        }
+    }
+
+    #[test]
+    fn prefix_store_find_best_hit() {
+        let mut store = PrefixStore::new();
+        store.put(t(&[1, 2, 3, 4]), ckpt(4, 0xAA));
+        // Prompt shares the whole 4-token snapshot; reuse_len=4 fits n_tokens<=5.
+        let hit = store.find_best(&t(&[1, 2, 3, 4, 5, 6]), 4);
+        assert!(hit.is_some());
+        let hit = hit.unwrap();
+        assert_eq!(hit.n_tokens, 4);
+        assert_eq!(hit.data, vec![0xAA; 4]);
+    }
+
+    #[test]
+    fn prefix_store_find_best_returns_longest() {
+        let mut store = PrefixStore::new();
+        store.put(t(&[1, 2]), ckpt(2, 0x11));
+        store.put(t(&[1, 2, 3, 4]), ckpt(4, 0x22));
+        let hit = store.find_best(&t(&[1, 2, 3, 4, 5, 6]), 5);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().n_tokens, 4, "must return the longest usable snapshot");
+    }
+
+    #[test]
+    fn prefix_store_find_best_miss() {
+        let mut store = PrefixStore::new();
+        store.put(t(&[9, 8, 7]), ckpt(3, 0x33));
+        // No shared prefix -> None.
+        assert!(store.find_best(&t(&[1, 2, 3]), 3).is_none());
+    }
+
+    #[test]
+    fn prefix_store_find_best_rejects_too_long() {
+        let mut store = PrefixStore::new();
+        store.put(t(&[1, 2, 3, 4, 5, 6, 7, 8]), ckpt(8, 0x44));
+        // n_tokens=8 > reuse_len+1=4 -> unusable even on exact prefix match.
+        assert!(store.find_best(&t(&[1, 2, 3, 4, 5, 6, 7, 8]), 3).is_none());
+    }
+
+    #[test]
+    fn prefix_store_key_collision_overwrites() {
+        let mut store = PrefixStore::new();
+        store.put(t(&[1, 2, 3]), ckpt(3, 0x55));
+        store.put(t(&[1, 2, 3]), ckpt(3, 0x66));
+        assert_eq!(store.len(), 1);
+        let hit = store.find_best(&t(&[1, 2, 3, 4]), 3).unwrap();
+        assert_eq!(hit.data, vec![0x66; 3], "same key must be replaced");
+        assert_eq!(store.total_bytes, 3);
+    }
+
+    #[test]
+    fn prefix_store_evicts_over_cap() {
+        let mut store = PrefixStore::with_cap(10); // tiny cap
+        store.put(t(&[1, 2]), ckpt(2, 0x11)); // 2 bytes
+        store.put(t(&[1, 2, 3, 4]), ckpt(4, 0x22)); // 4 bytes -> total 6
+        store.put(t(&[1, 2, 3, 4, 5, 6]), ckpt(6, 0x33)); // 6 bytes -> total 12 > 10
+        assert!(store.total_bytes <= 10, "must evict down to cap");
+        // The 2-byte entry (least recently used) should be gone.
+        assert!(store.find_best(&t(&[1, 2, 9]), 2).is_none());
     }
 }

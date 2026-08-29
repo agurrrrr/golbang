@@ -329,7 +329,9 @@ pub struct Slot {
 }
 
 /// Host copy of one sequence at a known length (see [`Slot::prefix_ckpt`]).
-pub(crate) struct SeqCheckpoint {
+/// `pub` so the global `PrefixStore` can hold checkpoint values too.
+#[derive(Clone, Debug)]
+pub struct SeqCheckpoint {
     pub n_tokens: u32,
     pub data: Vec<u8>,
 }
