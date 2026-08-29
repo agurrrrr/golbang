@@ -190,7 +190,9 @@ P5는 Stop/Length/Cancel 뒤에도 그 KV를 지우지 않는다.
 - MTP가 켜지면 `n_rs_seq`를 `--spec-draft-n-max`까지 올린다.
   거부된 draft를 150 MiB state 복사 없이 `seq_rm`하기 위해서다.
 
-`PrefixStore`(슬롯 간 `llama_memory_seq_cp`)는 타입만 있고 **꺼져 있다**.
+`PrefixStore`는 슬롯 간 `llama_memory_seq_cp`가 아니라 호스트 `seq_state` 덤프
+맵이다. 빈 슬롯 bind가 새 프롬프트로 최장 일치 접두(도구/시스템 head, 생산
+실측 약 12545·ubatch 경계 12288)를 복원하고 접미만 프리필한다.
 비전 슬롯은 bind 때 `clear_seq`한다. 이미지 턴은 prefix hit가 없다.
 
 ## 채팅 표면

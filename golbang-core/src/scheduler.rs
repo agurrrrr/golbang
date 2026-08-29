@@ -18,7 +18,7 @@ use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
 use crate::policy::{EmptySlotView, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
-use crate::prefix_cache::{PrefixStore, common_prefix_len};
+use crate::prefix_cache::{PrefixStore, common_prefix_len, host_search_len, snapshot_key};
 use crate::slot::{ActiveJob, SeqCheckpoint, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 use crate::speculative::accept_drafts;
 use crate::tokenizer::Token;
@@ -193,9 +193,9 @@ async fn run_loop(
     }
 
     let mut slots: Vec<Slot> = (0..n).map(|i| Slot::new(SlotId(i as u32))).collect();
-    let prefix_store = Arc::new(std::sync::Mutex::new(
-        PrefixStore::with_cap(PrefixStore::DEFAULT_MAX_BYTES),
-    ));
+    let prefix_store = Arc::new(std::sync::Mutex::new(PrefixStore::with_cap(
+        PrefixStore::DEFAULT_MAX_BYTES,
+    )));
     let n_batch = engine.n_batch().max(1) as usize;
     let n_ubatch = engine.n_ubatch().max(1) as usize;
     let builder = BatchBuilder::new(n_batch);
@@ -581,7 +581,13 @@ fn join_waiting(
     }
 }
 
-fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32, prefix_store: &Arc<std::sync::Mutex<PrefixStore>>) -> bool {
+fn bind_slot(
+    slot: &mut Slot,
+    mut job: Job,
+    engine: &Engine,
+    ctx_cap: u32,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+) -> bool {
     let seq = slot.id.0 as i32;
     engine.spec_reset_seq(seq);
 
@@ -628,7 +634,7 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32, prefi
     let ckpt_n = latest_ckpt_n(slot);
     let hint_n = gpu_n.max(ckpt_n);
     let mut reuse_len = slot.prefix_cache.reuse_for_bind(&tokens, hint_n);
-    reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n, prefix_store);
+    reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n, prefix_store, &tokens);
     let req = job.request_id;
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
@@ -657,7 +663,13 @@ fn bind_slot(slot: &mut Slot, mut job: Job, engine: &Engine, ctx_cap: u32, prefi
     true
 }
 
-fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32, prefix_store: &Arc<std::sync::Mutex<PrefixStore>>) -> bool {
+fn bind_vision_slot(
+    slot: &mut Slot,
+    job: Job,
+    engine: &Engine,
+    ctx_cap: u32,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+) -> bool {
     if !engine.vision_enabled() {
         let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
         return false;
@@ -693,7 +705,14 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32, pr
         .map(|prev| prev.reuse_for_bind(&tok.seq, hint_n))
         .unwrap_or(0);
     let mut reuse_pos = tok.seq.pos_next(reuse_tok);
-    reuse_pos = settle_prefix_kv(slot, engine, reuse_pos as usize, gpu_n, prefix_store) as u32;
+    reuse_pos = settle_prefix_kv(
+        slot,
+        engine,
+        reuse_pos as usize,
+        gpu_n,
+        prefix_store,
+        &tok.seq.tokens,
+    ) as u32;
     if reuse_pos == 0 {
         reuse_tok = 0;
     } else if reuse_pos != tok.seq.pos_next(reuse_tok) {
@@ -824,7 +843,8 @@ fn apply_plan(
 ) {
     for (id, take) in &plan.prefill_consumed {
         if let Some(slot) = slots.iter_mut().find(|s| s.id == *id) {
-            let mut need_ckpt = false;
+            let mut need_chain = false;
+            let mut promote_key: Option<Vec<Token>> = None;
             let n_ubatch = engine.n_ubatch().max(1) as u32;
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
@@ -834,44 +854,68 @@ fn apply_plan(
                     emit_prompt_progress(job);
                     job.last_progress_n = job.prefill_cursor() as u32;
                 }
+                let n_past = job.n_past;
+                let stride_stub = is_host_stub_boundary(n_past, n_ubatch);
                 if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
                     job.last_progress_n = 0;
                     job.last_progress_at = Instant::now();
                     if job.generation_started_at.is_none() {
                         job.generation_started_at = Some(Instant::now());
-                        need_ckpt = true;
+                        need_chain = true;
                     }
-                }
-                // P8-A: capture an anchor at every ubatch boundary too, so a
-                // mid-prefill cancel can resume from the closest snapshot.
-                if !job.prefill_done() && job.n_past > 0 && job.n_past % n_ubatch == 0 {
-                    need_ckpt = true;
+                    if stride_stub {
+                        promote_key = snapshot_key(&job.prompt_tokens, n_past);
+                    }
+                } else if stride_stub {
+                    // One stub in the chain: the last 8k–16k stride boundary.
+                    // Other stride dumps go to the host store only.
+                    need_chain = is_last_host_stub(n_past);
+                    promote_key = snapshot_key(&job.prompt_tokens, n_past);
                 }
             }
-            if need_ckpt {
-                capture_prefix_checkpoint(slot, engine);
-                // P8-B: promote the shared head to the host store at ubatch
-                // boundaries during the first long prefill.
-                if let Some(job) = slot.job.as_ref() {
-                    if job.n_past > 0 && job.n_past % n_ubatch == 0 {
-                        if let Some(data) = engine.seq_state_get(slot.id.0 as i32) {
-                            if !data.is_empty() {
-                                let n_tokens = job.n_past;
-                                let tokens = slot.prefix_cache.tokens.to_vec();
-                                let ckpt = SeqCheckpoint { n_tokens, data };
-                                let bytes = ckpt.data.len();
-                                let mut store = prefix_store.lock().unwrap();
-                                store.put(tokens, ckpt);
-                                tracing::info!(
-                                    slot = slot.id.0,
-                                    n_tokens,
-                                    bytes,
-                                    "host prefix snapshot promoted"
-                                );
+            if need_chain || promote_key.is_some() {
+                let n_tokens = slot.job.as_ref().map(|j| j.n_past).unwrap_or(0);
+                match engine.seq_state_get(slot.id.0 as i32) {
+                    Some(data) if !data.is_empty() => match (need_chain, promote_key) {
+                        (true, Some(key)) => {
+                            if is_store_stub_len(n_tokens) {
+                                slot.prefix_ckpts.retain(|c| {
+                                    !is_store_stub_len(c.n_tokens) || c.n_tokens == n_tokens
+                                });
                             }
+                            push_prefix_ckpt(slot, n_tokens, data.clone());
+                            let bytes = data.len();
+                            prefix_store
+                                .lock()
+                                .unwrap()
+                                .put(key, SeqCheckpoint { n_tokens, data });
+                            tracing::info!(
+                                slot = slot.id.0,
+                                n_tokens,
+                                bytes,
+                                "host prefix snapshot promoted"
+                            );
                         }
-                    }
+                        (true, None) => {
+                            push_prefix_ckpt(slot, n_tokens, data);
+                        }
+                        (false, Some(key)) => {
+                            let bytes = data.len();
+                            prefix_store
+                                .lock()
+                                .unwrap()
+                                .put(key, SeqCheckpoint { n_tokens, data });
+                            tracing::info!(
+                                slot = slot.id.0,
+                                n_tokens,
+                                bytes,
+                                "host prefix snapshot promoted"
+                            );
+                        }
+                        (false, None) => {}
+                    },
+                    _ => tracing::debug!(slot = slot.id.0, "prefix checkpoint skipped"),
                 }
             }
         }
@@ -1717,7 +1761,13 @@ fn release_retained_under_pressure(slots: &mut [Slot], engine: &Engine, pool: u3
         slot.prefix_cache.reset();
         clear_prefix_chain(slot);
         slot.retained_at = None;
-        tracing::info!(slot = id.0, retained_cells = n, total_used, pool, "retained prefix kv released");
+        tracing::info!(
+            slot = id.0,
+            retained_cells = n,
+            total_used,
+            pool,
+            "retained prefix kv released"
+        );
     }
 }
 
@@ -1733,10 +1783,33 @@ fn keeps_prefix_kv(reason: FinishReason) -> bool {
 
 /// P8-A chain bounds: per-slot anchor count and total host bytes.
 /// DSV4 PARTIAL ≈ 18 MiB/anchor, so 2 GiB rarely binds; the cap guards Qwen FA
-/// length-proportional dumps. On overflow keep the newest and the shortest
-/// (tool-head candidate), dropping the middle.
+/// length-proportional dumps. On overflow keep the newest prefill-end and any
+/// 8k–16k store stub (tool-head candidate). Do not drop those just to meet
+/// the byte cap.
 const CHAIN_MAX_ANCHORS: usize = 8;
 const CHAIN_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Store-stub window: last ubatch-aligned dumps still likely inside the
+/// shared tool/system head (production ~12545, ubatch boundary 12288).
+const STORE_STUB_MIN: u32 = 8_192;
+const STORE_STUB_MAX: u32 = 16_384;
+const STORE_STUB_STRIDE: u32 = 2_048;
+
+fn is_store_stub_len(n_tokens: u32) -> bool {
+    (STORE_STUB_MIN..=STORE_STUB_MAX).contains(&n_tokens)
+}
+
+fn is_host_stub_boundary(n_tokens: u32, n_ubatch: u32) -> bool {
+    let n_ubatch = n_ubatch.max(1);
+    n_tokens > 0
+        && is_store_stub_len(n_tokens)
+        && n_tokens.is_multiple_of(n_ubatch)
+        && n_tokens.is_multiple_of(STORE_STUB_STRIDE)
+}
+
+fn is_last_host_stub(n_tokens: u32) -> bool {
+    is_store_stub_len(n_tokens) && n_tokens + STORE_STUB_STRIDE > STORE_STUB_MAX
+}
 
 /// Push a fresh snapshot onto the slot's anchor chain (ascending by `n_tokens`).
 /// Same `n_tokens` replaces; a longer one appends. Enforces chain bounds.
@@ -1744,47 +1817,17 @@ fn push_prefix_ckpt(slot: &mut Slot, n_tokens: u32, data: Vec<u8>) {
     let bytes = data.len();
     let ckpt = crate::slot::SeqCheckpoint { n_tokens, data };
     // Same `n_tokens` → replace in place (newer dump wins).
-    if let Some(existing) = slot.prefix_ckpts.iter_mut().find(|c| c.n_tokens == n_tokens) {
+    if let Some(existing) = slot
+        .prefix_ckpts
+        .iter_mut()
+        .find(|c| c.n_tokens == n_tokens)
+    {
         *existing = ckpt;
     } else {
         slot.prefix_ckpts.push(ckpt);
         slot.prefix_ckpts.sort_by_key(|c| c.n_tokens);
     }
-    // Bounds: drop middle anchors, keep newest and shortest (tool-head candidate).
-    while slot.prefix_ckpts.len() > CHAIN_MAX_ANCHORS
-        || slot.prefix_ckpts.iter().map(|c| c.data.len()).sum::<usize>() > CHAIN_MAX_BYTES
-    {
-        let newest = slot
-            .prefix_ckpts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, c)| c.n_tokens)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let shortest = slot
-            .prefix_ckpts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, c)| c.n_tokens)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        // Remove the first non-kept anchor (lowest index) to keep newest+shortest.
-        let drop = slot
-            .prefix_ckpts
-            .iter()
-            .enumerate()
-            .find(|(i, _)| *i != newest && *i != shortest)
-            .map(|(i, _)| i);
-        let drop = drop.unwrap_or(if newest == shortest { 0 } else { 0 });
-        let removed = slot.prefix_ckpts.remove(drop);
-        tracing::info!(
-            slot = slot.id.0,
-            dropped_n = removed.n_tokens,
-            chain_n = slot.prefix_ckpts.len(),
-            bytes = slot.prefix_ckpts.iter().map(|c| c.data.len()).sum::<usize>(),
-            "prefix chain trimmed"
-        );
-    }
+    trim_prefix_chain(slot, CHAIN_MAX_ANCHORS, CHAIN_MAX_BYTES);
     tracing::info!(
         slot = slot.id.0,
         n_tokens,
@@ -1792,6 +1835,65 @@ fn push_prefix_ckpt(slot: &mut Slot, n_tokens: u32, data: Vec<u8>) {
         chain_n = slot.prefix_ckpts.len(),
         "prefix checkpoint saved"
     );
+}
+
+/// Drop unprotected middles. Newest and 8k–16k stubs stay even if the byte
+/// cap is still exceeded (a single Qwen FA 70k dump is ~4 GiB).
+fn trim_prefix_chain(slot: &mut Slot, max_anchors: usize, max_bytes: usize) {
+    loop {
+        let n = slot.prefix_ckpts.len();
+        if n == 0 {
+            return;
+        }
+        let bytes: usize = slot.prefix_ckpts.iter().map(|c| c.data.len()).sum();
+        if n <= max_anchors && bytes <= max_bytes {
+            return;
+        }
+        let newest_n = slot
+            .prefix_ckpts
+            .iter()
+            .map(|c| c.n_tokens)
+            .max()
+            .unwrap_or(0);
+        let drop = slot
+            .prefix_ckpts
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.n_tokens != newest_n && !is_store_stub_len(c.n_tokens))
+            .map(|(i, _)| i);
+        let Some(drop) = drop else {
+            return;
+        };
+        let removed = slot.prefix_ckpts.remove(drop);
+        tracing::info!(
+            slot = slot.id.0,
+            dropped_n = removed.n_tokens,
+            chain_n = slot.prefix_ckpts.len(),
+            bytes = slot
+                .prefix_ckpts
+                .iter()
+                .map(|c| c.data.len())
+                .sum::<usize>(),
+            "prefix chain trimmed"
+        );
+    }
+}
+
+/// After bind, drop anchors the new prompt cannot restore. Stops
+/// `latest_ckpt_n` / affinity_bar from reporting a previous session's length.
+fn prune_chain_beyond_reuse(slot: &mut Slot, reuse_len: usize) {
+    let max_n = reuse_len as u32 + 1;
+    let before = slot.prefix_ckpts.len();
+    slot.prefix_ckpts.retain(|c| c.n_tokens <= max_n);
+    if slot.prefix_ckpts.len() != before {
+        tracing::info!(
+            slot = slot.id.0,
+            reuse_len,
+            chain_n = slot.prefix_ckpts.len(),
+            latest_ckpt_n = latest_ckpt_n(slot),
+            "prefix chain pruned past reuse_len"
+        );
+    }
 }
 
 fn capture_prefix_checkpoint(slot: &mut Slot, engine: &Engine) {
@@ -1843,23 +1945,33 @@ fn clear_prefix_chain(slot: &mut Slot) {
 /// earlier semantic boundary instead of full-prefilling. Never discard a
 /// shorter anchor just because the newest one is too long.
 ///
-/// P8-B: when no chain anchor fits, fall back to the global host `PrefixStore`
-/// — find the longest snapshot that still matches the prompt, restore it, and
-/// keep only `kept` cells so the suffix prefill starts where the shared head ends.
+/// P8-B: when local reuse is 0 (empty slot) or no chain anchor fits, look up
+/// the global host `PrefixStore` with the **new** prompt. `reuse_len == 0`
+/// still searches `prompt.len() - 1` so a 12k tool head can restore.
+///
+/// After bind, drop `n_tokens > reuse_len + 1` so `latest_ckpt_n` cannot lift
+/// affinity_bar to a previous session's length.
 fn settle_prefix_kv(
     slot: &mut Slot,
     engine: &Engine,
     reuse_len: usize,
     gpu_n: u32,
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+    prompt: &[Token],
 ) -> usize {
     let seq = slot.id.0 as i32;
     if reuse_len == 0 {
         engine.clear_seq(seq);
-        clear_prefix_chain(slot);
+        if let Some(kept) =
+            restore_host_snapshot(slot, engine, reuse_len, gpu_n, prefix_store, prompt)
+        {
+            return kept;
+        }
+        prune_chain_beyond_reuse(slot, 0);
         return 0;
     }
     if trim_seq_to(engine, seq, reuse_len) {
+        prune_chain_beyond_reuse(slot, reuse_len);
         return reuse_len;
     }
     let gpu_after = engine.n_past_seq(seq);
@@ -1875,6 +1987,7 @@ fn settle_prefix_kv(
             tracing::warn!(slot = slot.id.0, ckpt_n, "prefix chain restore failed");
             engine.clear_seq(seq);
             slot.prefix_cache.reset();
+            prune_chain_beyond_reuse(slot, 0);
             return 0;
         }
         // PARTIAL_ONLY skips ISWA non-SWA base. seq_rm(ckpt_n, -1) is past SWA
@@ -1895,9 +2008,14 @@ fn settle_prefix_kv(
                 gpu_n,
                 gpu_after = engine.n_past_seq(seq),
                 chain_n = slot.prefix_ckpts.len(),
-                bytes = slot.prefix_ckpts.iter().map(|c| c.data.len()).sum::<usize>(),
+                bytes = slot
+                    .prefix_ckpts
+                    .iter()
+                    .map(|c| c.data.len())
+                    .sum::<usize>(),
                 "prefix restored from checkpoint"
             );
+            prune_chain_beyond_reuse(slot, kept);
             return kept;
         }
         tracing::warn!(
@@ -1909,28 +2027,13 @@ fn settle_prefix_kv(
         );
         engine.clear_seq(seq);
         slot.prefix_cache.reset();
+        prune_chain_beyond_reuse(slot, 0);
         return 0;
     }
 
-    // No chain anchor fits. Try the global host snapshot store (P8-B).
-    let tokens = slot.prefix_cache.tokens.to_vec();
-    let host = prefix_store.lock().unwrap().find_best(&tokens, reuse_len);
-    if let Some(host_ckpt) = host {
-        tracing::info!(slot = slot.id.0, reuse_len, host_n = host_ckpt.n_tokens, gpu_n, gpu_after, "host snapshot restore reuse_len=...");
-        engine.clear_seq(seq);
-        slot.prefix_cache.reset();
-        if engine.seq_state_set(seq, &host_ckpt.data) {
-            if engine.rm_seq_from(seq, host_ckpt.n_tokens as i32) {
-                let kept = reuse_len.min(host_ckpt.n_tokens as usize);
-                if trim_seq_to(engine, seq, kept) {
-                    tracing::info!(slot = slot.id.0, reuse_len = kept, host_n = host_ckpt.n_tokens, gpu_after = engine.n_past_seq(seq), "host snapshot restored");
-                    return kept;
-                }
-            }
-        }
-        tracing::warn!(slot = slot.id.0, reuse_len, host_n = host_ckpt.n_tokens, "host snapshot restore failed; full prefill");
-        engine.clear_seq(seq);
-        return 0;
+    if let Some(kept) = restore_host_snapshot(slot, engine, reuse_len, gpu_n, prefix_store, prompt)
+    {
+        return kept;
     }
     tracing::warn!(
         slot = slot.id.0,
@@ -1942,8 +2045,79 @@ fn settle_prefix_kv(
     );
     engine.clear_seq(seq);
     slot.prefix_cache.reset();
-    clear_prefix_chain(slot);
+    prune_chain_beyond_reuse(slot, 0);
     0
+}
+
+/// Restore the longest `PrefixStore` dump that matches `prompt`. Uses the new
+/// job tokens, not `slot.prefix_cache`. Returns `None` on miss or GPU failure.
+fn restore_host_snapshot(
+    slot: &mut Slot,
+    engine: &Engine,
+    reuse_len: usize,
+    gpu_n: u32,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+    prompt: &[Token],
+) -> Option<usize> {
+    let seq = slot.id.0 as i32;
+    let search_len = host_search_len(prompt.len(), reuse_len);
+    if search_len == 0 {
+        return None;
+    }
+    let host = prefix_store
+        .lock()
+        .unwrap()
+        .find_best_for_bind(prompt, reuse_len);
+    let host_ckpt = host?;
+    tracing::info!(
+        slot = slot.id.0,
+        reuse_len,
+        search_len,
+        host_n = host_ckpt.n_tokens,
+        gpu_n,
+        gpu_after = engine.n_past_seq(seq),
+        "host snapshot restore"
+    );
+    engine.clear_seq(seq);
+    if !engine.seq_state_set(seq, &host_ckpt.data) {
+        tracing::warn!(
+            slot = slot.id.0,
+            reuse_len,
+            host_n = host_ckpt.n_tokens,
+            "host snapshot restore failed; full prefill"
+        );
+        engine.clear_seq(seq);
+        prune_chain_beyond_reuse(slot, 0);
+        return None;
+    }
+    if !engine.rm_seq_from(seq, host_ckpt.n_tokens as i32) {
+        tracing::warn!(
+            slot = slot.id.0,
+            host_n = host_ckpt.n_tokens,
+            "host snapshot leftover sweep failed"
+        );
+    }
+    let kept = search_len.min(host_ckpt.n_tokens as usize);
+    if trim_seq_to(engine, seq, kept) {
+        tracing::info!(
+            slot = slot.id.0,
+            reuse_len = kept,
+            host_n = host_ckpt.n_tokens,
+            gpu_after = engine.n_past_seq(seq),
+            "host snapshot restored"
+        );
+        prune_chain_beyond_reuse(slot, kept);
+        return Some(kept);
+    }
+    tracing::warn!(
+        slot = slot.id.0,
+        reuse_len,
+        host_n = host_ckpt.n_tokens,
+        "host snapshot restore still longer than LCP; full prefill"
+    );
+    engine.clear_seq(seq);
+    prune_chain_beyond_reuse(slot, 0);
+    None
 }
 
 fn trim_seq_to(engine: &Engine, seq: i32, n: usize) -> bool {
@@ -2175,31 +2349,83 @@ mod tests {
     }
 
     #[test]
-    fn chain_overflow_keeps_newest_and_shortest() {
+    fn chain_overflow_keeps_12288_and_prefill_end() {
         let mut slot = Slot::new(SlotId(0));
-        // Push 10 distinct anchors (CHAIN_MAX_ANCHORS = 8) → 2 must be dropped.
-        for n in 1..=10u32 {
-            push_prefix_ckpt(&mut slot, n * 10, vec![0u8; n as usize]);
+        // Simulate a 37k prefill that used to snapshot every 2048-token ubatch.
+        for n in (2048..=36_864).step_by(2048) {
+            push_prefix_ckpt(&mut slot, n as u32, vec![0u8; 8]);
         }
+        push_prefix_ckpt(&mut slot, 37_233, vec![0u8; 8]);
         assert!(slot.prefix_ckpts.len() <= CHAIN_MAX_ANCHORS);
-        // Newest (100) and shortest (10) must survive.
-        assert!(slot.prefix_ckpts.iter().any(|c| c.n_tokens == 100));
-        assert!(slot.prefix_ckpts.iter().any(|c| c.n_tokens == 10));
-        // Chain stays ascending.
+        assert!(
+            slot.prefix_ckpts.iter().any(|c| c.n_tokens == 12_288),
+            "tool-head ubatch 12288 must survive overflow: {:?}",
+            slot.prefix_ckpts
+                .iter()
+                .map(|c| c.n_tokens)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            slot.prefix_ckpts.iter().any(|c| c.n_tokens == 37_233),
+            "prefill-end must survive overflow"
+        );
         let ns: Vec<u32> = slot.prefix_ckpts.iter().map(|c| c.n_tokens).collect();
         assert!(ns.windows(2).all(|w| w[0] < w[1]));
-        // latest_ckpt_n still reports the newest.
-        assert_eq!(latest_ckpt_n(&slot), 100);
+        assert_eq!(latest_ckpt_n(&slot), 37_233);
     }
 
     #[test]
-    fn chain_byte_cap_keeps_newest_and_shortest() {
-        // CHAIN_MAX_BYTES = 2 GiB is impractical to fill; instead verify that
-        // a single oversized anchor is accepted and bounds never panic.
+    fn chain_byte_cap_keeps_protected_when_over() {
         let mut slot = Slot::new(SlotId(0));
-        push_prefix_ckpt(&mut slot, 100, vec![0u8; 1024]);
-        assert_eq!(slot.prefix_ckpts.len(), 1);
-        assert_eq!(latest_ckpt_n(&slot), 100);
+        slot.prefix_ckpts = vec![
+            crate::slot::SeqCheckpoint {
+                n_tokens: 12_288,
+                data: vec![0u8; 50],
+            },
+            crate::slot::SeqCheckpoint {
+                n_tokens: 40_000,
+                data: vec![0u8; 50],
+            },
+        ];
+        // Only the stub and the newest remain, and together they exceed the
+        // tiny cap. They must not be dropped.
+        trim_prefix_chain(&mut slot, 8, 10);
+        assert_eq!(slot.prefix_ckpts.len(), 2);
+        assert!(slot.prefix_ckpts.iter().any(|c| c.n_tokens == 12_288));
+        assert!(slot.prefix_ckpts.iter().any(|c| c.n_tokens == 40_000));
+        assert_eq!(latest_ckpt_n(&slot), 40_000);
+    }
+
+    #[test]
+    fn prune_chain_drops_too_long_after_bind() {
+        let mut slot = chain_slot(&[12_288, 16_384, 37_000]);
+        prune_chain_beyond_reuse(&mut slot, 12_288);
+        let ns: Vec<u32> = slot.prefix_ckpts.iter().map(|c| c.n_tokens).collect();
+        assert_eq!(ns, vec![12_288]);
+        assert_eq!(latest_ckpt_n(&slot), 12_288);
+    }
+
+    #[test]
+    fn host_stub_boundary_is_stride_in_window() {
+        assert!(is_host_stub_boundary(12_288, 2048));
+        assert!(is_host_stub_boundary(8_192, 2048));
+        assert!(is_host_stub_boundary(16_384, 2048));
+        assert!(!is_host_stub_boundary(2_048, 2048));
+        assert!(!is_host_stub_boundary(18_432, 2048));
+        assert!(!is_host_stub_boundary(12_545, 2048));
+        assert!(is_last_host_stub(16_384));
+        assert!(!is_last_host_stub(12_288));
+        // CUDA n_ubatch=512 still hits the 2048 stride.
+        assert!(is_host_stub_boundary(12_288, 512));
+        assert!(!is_host_stub_boundary(8_704, 512));
+    }
+
+    #[test]
+    fn snapshot_key_from_job_prompt_matches_n_tokens() {
+        let prompt: Vec<Token> = (0..20_000).map(|i| i as Token).collect();
+        let key = snapshot_key(&prompt, 12_288).unwrap();
+        assert_eq!(key.len(), 12_288);
+        assert_eq!(&key[..], &prompt[..12_288]);
     }
 
     #[tokio::test]

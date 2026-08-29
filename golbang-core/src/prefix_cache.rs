@@ -8,8 +8,9 @@
 //! P5: Stop/Length/Cancel/Timeout leave that KV resident. `remember` stores
 //! prompt + generated token IDs so the next bind's LCP can include the
 //! previous assistant turn, or a mid-prefill prefix after a client drop.
-//! A global cross-slot store is still NOT implemented — `PrefixStore` stays
-//! inactive; no `llama_memory_seq_cp` between slots.
+//! P8-B: `PrefixStore` holds host `seq_state` dumps of the shared tool/system
+//! head. Empty-slot bind restores the longest matching dump (`seq_state_set`).
+//! There is still no `llama_memory_seq_cp` between slots.
 //!
 //! Vision (Qwen3.8 `--mmproj`): `VisionSeq` is llama-server `server_tokens`
 //! for one slot. Image cells compare FNV chunk ids, not vocab tokens. M-RoPE
@@ -28,6 +29,32 @@ pub fn common_prefix_len(a: &[Token], b: &[Token]) -> usize {
         i += 1;
     }
     i
+}
+
+/// Prefix tokens `[0..n_tokens)` used as a [`PrefixStore`] key.
+///
+/// `None` when `n_tokens` is 0 or longer than `prompt` — a store entry must
+/// be an exact head of the prompt that produced the dump.
+pub fn snapshot_key(prompt: &[Token], n_tokens: u32) -> Option<Vec<Token>> {
+    let n = n_tokens as usize;
+    if n == 0 || n > prompt.len() {
+        None
+    } else {
+        Some(prompt[..n].to_vec())
+    }
+}
+
+/// Search length for a bind-time store lookup.
+///
+/// `reuse_len == 0` is an empty slot (no local LCP). Search up to
+/// `prompt.len() - 1` so a 12k tool-head dump can still hit, while leaving
+/// one logits token.
+pub fn host_search_len(prompt_len: usize, reuse_len: usize) -> usize {
+    if reuse_len == 0 {
+        prompt_len.saturating_sub(1)
+    } else {
+        reuse_len
+    }
 }
 
 /// One mtmd chunk after `mtmd_tokenize`. Image/audio ids are FNV hashes
@@ -287,27 +314,41 @@ impl SlotPrefixCache {
     }
 }
 
-/// Optional global prefix store (disabled by default — see module doc).
+/// Cross-slot host snapshot map (P8-B).
 ///
-/// P8-B: a cross-slot host snapshot map. Each entry is a `SeqCheckpoint`
-/// captured at a known token length (`n_tokens`), keyed by the prompt prefix
-/// tokens `[0..n_tokens)`. A bind whose LCP matches an entry length restores
-/// that snapshot instead of re-prefilling the shared head.
+/// Each entry is a `SeqCheckpoint` captured at a known token length
+/// (`n_tokens`), keyed by the prompt prefix tokens `[0..n_tokens)`. A bind
+/// whose prompt matches an entry restores that dump instead of re-prefilling
+/// the shared tool/system head. Lookup is a linear scan — no trie.
 ///
-/// Entries are few (one tool/system head + a handful of system prompts), so
-/// lookup is a linear scan — no trie/radix tree.
-#[derive(Clone, Debug, Default)]
+/// Caps: a single-digit entry limit plus a RAM ceiling. Eviction drops the
+/// longest dump first so a 30k+ snapshot cannot push out the short tool head.
+#[derive(Clone, Debug)]
 pub struct PrefixStore {
     pub entries: HashMap<Vec<Token>, SeqCheckpoint>,
     /// Total bytes of all entry `data` (tracked for the RAM cap).
     pub total_bytes: usize,
-    /// Soft RAM cap (bytes). When `total_bytes` exceeds it, evict least-recently
-    /// used entries. 0 = unlimited.
+    /// Soft RAM cap (bytes). 0 = unlimited.
     pub max_bytes: usize,
-    /// Monotonic "now" tick for LRU ordering (advances on every insert/use).
+    /// Soft entry-count cap. 0 = unlimited. Default is a single digit.
+    pub max_entries: usize,
+    /// Monotonic "now" tick (advances on every insert/use).
     last_used_tick: u64,
     /// Per-entry tick of last use (keyed by the same prefix slice).
     last_used: HashMap<Vec<Token>, u64>,
+}
+
+impl Default for PrefixStore {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            max_bytes: 0,
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+            last_used_tick: 0,
+            last_used: HashMap::new(),
+        }
+    }
 }
 
 impl PrefixStore {
@@ -319,14 +360,33 @@ impl PrefixStore {
     /// Qwen3.8 FA at 12545 tokens). 2 GiB leaves room for a few system prompts.
     pub const DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
+    /// One tool head plus a handful of system prompts — never a ubatch trail.
+    pub const DEFAULT_MAX_ENTRIES: usize = 8;
+
     pub fn with_cap(max_bytes: usize) -> Self {
         let mut s = Self::new();
         s.max_bytes = max_bytes;
         s
     }
 
+    pub fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
+        let mut s = Self::new();
+        s.max_bytes = max_bytes;
+        s.max_entries = max_entries;
+        s
+    }
+
     /// Insert or refresh a snapshot for prefix `[0..n_tokens)`.
+    ///
+    /// Skips empty keys and key/`n_tokens` mismatches: those cannot hit
+    /// `find_best` (`LCP == n_tokens`) and would only thrash the cap.
     pub fn put(&mut self, prefix: Vec<Token>, ckpt: SeqCheckpoint) {
+        if prefix.is_empty() || ckpt.n_tokens == 0 {
+            return;
+        }
+        if prefix.len() != ckpt.n_tokens as usize {
+            return;
+        }
         self.last_used_tick = self.last_used_tick.saturating_add(1);
         if let Some(old) = self.entries.insert(prefix.clone(), ckpt) {
             self.total_bytes = self.total_bytes.saturating_sub(old.data.len());
@@ -362,7 +422,17 @@ impl PrefixStore {
         })
     }
 
-    /// Mark an entry recently used (advances LRU without changing data).
+    /// Bind-time lookup. `reuse_len == 0` still searches the new prompt
+    /// (`prompt.len() - 1`) so an empty slot can restore the shared head.
+    pub fn find_best_for_bind(
+        &mut self,
+        prompt: &[Token],
+        reuse_len: usize,
+    ) -> Option<SeqCheckpoint> {
+        self.find_best(prompt, host_search_len(prompt.len(), reuse_len))
+    }
+
+    /// Mark an entry recently used (advances the tick without changing data).
     fn touch(&mut self, prefix: &[Token]) {
         self.last_used_tick = self.last_used_tick.saturating_add(1);
         if let Some(t) = self.last_used.get_mut(prefix) {
@@ -371,27 +441,19 @@ impl PrefixStore {
     }
 
     fn entry_bytes(&self, prefix: &[Token]) -> usize {
-        self.entries
-            .get(prefix)
-            .map(|c| c.data.len())
-            .unwrap_or(0)
+        self.entries.get(prefix).map(|c| c.data.len()).unwrap_or(0)
     }
 
-    /// Evict least-recently-used entries until `total_bytes <= max_bytes`.
+    fn over_cap(&self) -> bool {
+        (self.max_bytes > 0 && self.total_bytes > self.max_bytes)
+            || (self.max_entries > 0 && self.entries.len() > self.max_entries)
+    }
+
+    /// Drop the longest dump until the caps hold. A short tool-head prefix
+    /// is not chosen as victim while a longer dump exists.
     fn evict_if_over_cap(&mut self) {
-        if self.max_bytes == 0 || self.total_bytes <= self.max_bytes {
-            return;
-        }
-        loop {
-            if self.entries.is_empty() || self.total_bytes <= self.max_bytes {
-                return;
-            }
-            // Find the least recently used key.
-            let victim = self
-                .last_used
-                .iter()
-                .min_by_key(|&(_, &t)| t)
-                .map(|(k, _)| k.clone());
+        while self.over_cap() && !self.entries.is_empty() {
+            let victim = self.pick_longest_victim();
             let Some(victim) = victim else {
                 return;
             };
@@ -400,6 +462,20 @@ impl PrefixStore {
             }
             self.last_used.remove(&victim);
         }
+    }
+
+    fn pick_longest_victim(&self) -> Option<Vec<Token>> {
+        self.entries
+            .iter()
+            .max_by(|a, b| {
+                a.1.n_tokens.cmp(&b.1.n_tokens).then_with(|| {
+                    let ta = self.last_used.get(a.0).copied().unwrap_or(0);
+                    let tb = self.last_used.get(b.0).copied().unwrap_or(0);
+                    // Same length: older tick is the victim.
+                    tb.cmp(&ta)
+                })
+            })
+            .map(|(k, _)| k.clone())
     }
 
     /// Number of resident entries (for tests / metrics).
@@ -655,7 +731,11 @@ mod tests {
         store.put(t(&[1, 2, 3, 4]), ckpt(4, 0x22));
         let hit = store.find_best(&t(&[1, 2, 3, 4, 5, 6]), 5);
         assert!(hit.is_some());
-        assert_eq!(hit.unwrap().n_tokens, 4, "must return the longest usable snapshot");
+        assert_eq!(
+            hit.unwrap().n_tokens,
+            4,
+            "must return the longest usable snapshot"
+        );
     }
 
     #[test]
@@ -686,13 +766,67 @@ mod tests {
     }
 
     #[test]
-    fn prefix_store_evicts_over_cap() {
+    fn prefix_store_evicts_longest_not_short_head() {
         let mut store = PrefixStore::with_cap(10); // tiny cap
         store.put(t(&[1, 2]), ckpt(2, 0x11)); // 2 bytes
         store.put(t(&[1, 2, 3, 4]), ckpt(4, 0x22)); // 4 bytes -> total 6
         store.put(t(&[1, 2, 3, 4, 5, 6]), ckpt(6, 0x33)); // 6 bytes -> total 12 > 10
         assert!(store.total_bytes <= 10, "must evict down to cap");
-        // The 2-byte entry (least recently used) should be gone.
-        assert!(store.find_best(&t(&[1, 2, 9]), 2).is_none());
+        // Long dump is the victim; the short prefix must still hit.
+        assert!(
+            store.find_best(&t(&[1, 2, 9]), 2).is_some(),
+            "short prefix must not be pushed out by a longer dump"
+        );
+        assert!(
+            store.entries.values().all(|c| c.n_tokens < 6),
+            "the 6-token dump must be the victim"
+        );
+    }
+
+    #[test]
+    fn prefix_store_entry_cap_is_single_digit() {
+        let mut store = PrefixStore::with_limits(0, 3);
+        for n in 1..=5u32 {
+            let prefix: Vec<Token> = (0..n).map(|i| i as Token).collect();
+            store.put(prefix, ckpt(n, n as u8));
+        }
+        assert!(store.len() <= 3);
+        // Longest dumps dropped; shortest remain.
+        assert!(store.entries.values().all(|c| c.n_tokens <= 3));
+        assert!(store.find_best(&t(&[0, 1, 9]), 2).is_some());
+    }
+
+    #[test]
+    fn snapshot_key_len_eq_n_tokens() {
+        let prompt: Vec<Token> = (0..20_000).map(|i| i as Token).collect();
+        let key = snapshot_key(&prompt, 12_288).unwrap();
+        assert_eq!(key.len(), 12_288);
+        assert_eq!(key, prompt[..12_288]);
+        assert!(snapshot_key(&prompt, 0).is_none());
+        assert!(snapshot_key(&prompt, 20_001).is_none());
+        assert_eq!(snapshot_key(&prompt, 20_000).unwrap().len(), 20_000);
+    }
+
+    #[test]
+    fn empty_slot_store_hit_reuses_head() {
+        let mut store = PrefixStore::new();
+        let head: Vec<Token> = (0..12_288).map(|i| (i % 7) as Token).collect();
+        store.put(head.clone(), ckpt(12_288, 0xAB));
+        let mut prompt = head.clone();
+        prompt.extend((0..1_000).map(|i| (100 + i % 3) as Token));
+        // Empty slot: local reuse_len is 0; lookup still uses the new prompt.
+        let hit = store
+            .find_best_for_bind(&prompt, 0)
+            .expect("store must hit");
+        assert_eq!(hit.n_tokens, 12_288, "reused == tool-head ubatch boundary");
+        assert_eq!(hit.data, vec![0xAB; 12_288]);
+    }
+
+    #[test]
+    fn prefix_store_skips_empty_or_mismatched_key() {
+        let mut store = PrefixStore::new();
+        store.put(Vec::new(), ckpt(4, 0x11));
+        store.put(t(&[1, 2]), ckpt(4, 0x22));
+        assert!(store.is_empty());
     }
 }
