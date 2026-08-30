@@ -296,8 +296,11 @@ impl SlotPrefixCache {
     /// Bind-time reuse. Returns how many leading prompt tokens keep their KV.
     ///
     /// Always leaves at least one prompt token to prefill so the last cell has
-    /// logits (llama-server `TAG_PROMPT_LOGITS`). Returns 0 when the GPU must
-    /// start from position 0 (`clear_seq`).
+    /// logits (llama-server `TAG_PROMPT_LOGITS`). `gpu_n_past` is the
+    /// restorable cover: live GPU occupancy, or after a watermark
+    /// `gpu_n.max(ckpt_n)`. LCP above that cover is clamped so session
+    /// identity stays and a shorter host dump can still restore. Returns 0
+    /// only when nothing is restorable (`clear_seq`).
     pub fn reuse_for_bind(&mut self, prompt: &[Token], gpu_n_past: u32) -> usize {
         if prompt.is_empty() {
             self.reset();
@@ -305,7 +308,8 @@ impl SlotPrefixCache {
         }
         let mut n = common_prefix_len(&self.tokens, prompt);
         n = n.min(prompt.len() - 1);
-        if n == 0 || gpu_n_past < n as u32 {
+        n = n.min(gpu_n_past as usize);
+        if n == 0 {
             self.reset();
             return 0;
         }
@@ -459,11 +463,12 @@ impl PrefixStore {
             || (self.max_entries > 0 && self.entries.len() > self.max_entries)
     }
 
-    /// Drop the longest dump until the caps hold. A short tool-head prefix
-    /// is not chosen as victim while a longer dump exists.
+    /// Drop the longest dump until the store's own caps hold. Includes 8k–16k
+    /// stubs: production `put` only inserts those, so skipping them would
+    /// make `max_entries` / `max_bytes` a no-op.
     fn evict_if_over_cap(&mut self) {
         while self.over_cap() && !self.entries.is_empty() {
-            let victim = self.pick_longest_victim();
+            let victim = self.pick_longest_victim(false);
             let Some(victim) = victim else {
                 return;
             };
@@ -474,13 +479,12 @@ impl PrefixStore {
         }
     }
 
-    fn pick_longest_victim(&self) -> Option<Vec<Token>> {
-        // Never evict a store stub (8k–16k tool head): it is the shortest
-        // shared tool anchor and must survive the global host-RAM cap
-        // (HiCache L2, 4th stage). Pick the longest non-stub dump instead.
+    /// Longest dump, then oldest tick at the same length.
+    /// `skip_stubs` keeps 8k–16k tool heads (global host-RAM cap only).
+    fn pick_longest_victim(&self, skip_stubs: bool) -> Option<Vec<Token>> {
         self.entries
             .iter()
-            .filter(|(_, ckpt)| !Self::is_store_stub_len(ckpt.n_tokens))
+            .filter(|(_, ckpt)| !skip_stubs || !Self::is_store_stub_len(ckpt.n_tokens))
             .max_by(|a, b| {
                 a.1.n_tokens.cmp(&b.1.n_tokens).then_with(|| {
                     let ta = self.last_used.get(a.0).copied().unwrap_or(0);
@@ -492,16 +496,15 @@ impl PrefixStore {
             .map(|(k, _)| k.clone())
     }
 
-    /// Global host-RAM enforcement (HiCache L2, 4th stage).
+    /// Drop the longest non-stub dump until `total_bytes + chain_bytes <= cap`.
     ///
-    /// `chain_bytes` is the sum of all slot `prefix_ckpts` dumps (managed by
-    /// the scheduler, not visible here). Drop the longest `PrefixStore` dump
-    /// until `total_bytes + chain_bytes <= cap`. A short tool-head prefix is
-    /// never chosen while a longer dump exists (`pick_longest_victim`). The
-    /// caller decides whether slot chains still need trimming.
+    /// Stubs stay: the global cap may remain over once only tool heads are
+    /// left. The store's own 8-entry / 2 GiB caps still drop stubs via
+    /// `evict_if_over_cap`. The caller decides whether slot chains still
+    /// need trimming.
     pub fn evict_global_over_cap(&mut self, chain_bytes: usize, cap: usize) {
         while cap > 0 && self.total_bytes + chain_bytes > cap {
-            let victim = self.pick_longest_victim();
+            let victim = self.pick_longest_victim(true);
             let Some(victim) = victim else {
                 break;
             };
@@ -603,11 +606,27 @@ mod tests {
     }
 
     #[test]
-    fn reuse_for_bind_rejects_when_gpu_shorter_than_lcp() {
+    fn reuse_for_bind_clamps_lcp_to_hint() {
         let mut c = SlotPrefixCache::new();
         c.remember(&t(&[1, 2, 3, 4]), &[], 4);
-        assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3, 4, 5]), 2), 0);
-        assert!(c.tokens.is_empty());
+        // Cover (GPU occupancy or ckpt_n) is 2, LCP is 4: reuse the
+        // restorable prefix and keep session identity.
+        assert_eq!(c.reuse_for_bind(&t(&[1, 2, 3, 4, 5]), 2), 2);
+        assert_eq!(c.tokens, t(&[1, 2, 3, 4]));
+        assert_eq!(c.prefix_len, 2);
+    }
+
+    #[test]
+    fn reuse_for_bind_clamps_when_lcp_exceeds_ckpt_hint() {
+        let mut c = SlotPrefixCache::new();
+        let prompt: Vec<Token> = (0..70).map(|i| i as Token).collect();
+        c.remember(&prompt[..60], &prompt[60..], 70);
+        let mut next = prompt.clone();
+        next.push(99);
+        // Watermark: GPU empty, hint_n = ckpt_n = 60, next-turn LCP = 70.
+        assert_eq!(c.reuse_for_bind(&next, 60), 60);
+        assert_eq!(c.tokens.len(), 70, "session identity kept");
+        assert_eq!(c.prefix_len, 60);
     }
 
     #[test]
@@ -862,5 +881,44 @@ mod tests {
         store.put(Vec::new(), ckpt(4, 0x11));
         store.put(t(&[1, 2]), ckpt(4, 0x22));
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn prefix_store_entry_cap_evicts_stubs() {
+        // Production put() only inserts 8k–16k stubs. The store's own
+        // max_entries must still shrink once only stubs remain.
+        let mut store = PrefixStore::new();
+        let mut keys = Vec::new();
+        for i in 0..10u32 {
+            let prefix: Vec<Token> = std::iter::repeat(i as Token).take(12_288).collect();
+            keys.push(prefix.clone());
+            store.put(prefix, ckpt(12_288, i as u8));
+        }
+        assert_eq!(
+            store.len(),
+            PrefixStore::DEFAULT_MAX_ENTRIES,
+            "stub-only put must still honour max_entries"
+        );
+        assert!(
+            !store.entries.contains_key(&keys[0]) && !store.entries.contains_key(&keys[1]),
+            "oldest stubs must be the victims"
+        );
+        assert!(store.entries.contains_key(&keys[9]), "newest stub kept");
+    }
+
+    #[test]
+    fn prefix_store_global_cap_keeps_stubs() {
+        let mut store = PrefixStore::new();
+        for i in 0..3u32 {
+            let prefix: Vec<Token> = std::iter::repeat(i as Token).take(12_288).collect();
+            store.put(prefix, ckpt(12_288, i as u8));
+        }
+        assert_eq!(store.len(), 3);
+        store.evict_global_over_cap(0, 1);
+        assert_eq!(
+            store.len(),
+            3,
+            "global host-RAM cap must not drop store stubs"
+        );
     }
 }

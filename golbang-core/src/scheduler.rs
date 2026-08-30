@@ -2339,7 +2339,11 @@ mod tests {
             n_tokens: 20_000,
             data: vec![0xAA; 20_000],
         }];
-        assert_eq!(slot_kv_used(&slot), 12_000, "host dump is not GPU occupancy");
+        assert_eq!(
+            slot_kv_used(&slot),
+            12_000,
+            "host dump is not GPU occupancy"
+        );
     }
 
     /// #8565 regression: a retained slot (job None) must NOT shrink a live
@@ -2578,6 +2582,7 @@ mod tests {
         n_past: std::collections::HashMap<i32, u32>,
         state: std::collections::HashMap<i32, Vec<u8>>,
         n_ubatch: u32,
+        seq_state_set_count: usize,
     }
 
     impl FakeSeqKv {
@@ -2587,8 +2592,13 @@ mod tests {
                     n_past: std::collections::HashMap::new(),
                     state: std::collections::HashMap::new(),
                     n_ubatch: 2048,
+                    seq_state_set_count: 0,
                 }),
             }
+        }
+
+        fn seq_state_set_count(&self) -> usize {
+            self.inner.lock().unwrap().seq_state_set_count
         }
 
         fn with_n_ubatch(n_ubatch: u32) -> Self {
@@ -2629,6 +2639,7 @@ mod tests {
                 return false;
             }
             let mut g = self.inner.lock().unwrap();
+            g.seq_state_set_count = g.seq_state_set_count.saturating_add(1);
             g.state.insert(seq, data.to_vec());
             // Tests size dumps as `n_tokens` bytes so n_past matches the
             // restored checkpoint (production dumps are opaque).
@@ -2790,7 +2801,58 @@ mod tests {
             job.prompt_offset
         );
         assert_eq!(kv.n_past_seq(0), 60_000, "GPU restored from chain anchor");
+        assert!(
+            kv.seq_state_set_count() >= 1,
+            "same-session restore must seq_state_set the chain dump"
+        );
         assert_eq!(slots[0].prefix_ckpts.len(), 1, "60k anchor still resident");
+    }
+
+    #[test]
+    fn same_session_bind_restores_chain_when_lcp_exceeds_ckpt() {
+        // remember() stored prompt+generated (70k). Prefill-end dump is 60k.
+        // After watermark, the next tool-round prompt LCP is 70k > hint_n.
+        // Must restore 60k, not reset and full-prefill.
+        let tokens: Vec<Token> = (0..70_000).map(|i| (i % 7) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache
+            .remember(&tokens[..60_000], &tokens[60_000..], 70_000);
+        slot.prefix_ckpts = vec![ckpt_n(60_000, 0xAA)];
+        slot.retained_at = Some(std::time::Instant::now());
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 70_000]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let mut slots = vec![slot];
+        release_retained_under_pressure(&mut slots, &kv, 60_000, &store);
+        assert_eq!(kv.n_past_seq(0), 0, "watermark cleared GPU");
+        assert_eq!(slots[0].prefix_cache.tokens.len(), 70_000);
+
+        let mut prompt = tokens.clone();
+        prompt.extend((0..500).map(|i| (100 + i % 3) as Token));
+        let bound = bind_slot(&mut slots[0], job_with_tokens(prompt), &kv, 100_000, &store);
+        assert!(bound, "same-session bind after watermark must succeed");
+        let job = slots[0].job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 60_000,
+            "reused from 60k chain dump, not full prefill"
+        );
+        assert_eq!(kv.n_past_seq(0), 60_000, "GPU restored from chain dump");
+        assert!(
+            kv.seq_state_set_count() >= 1,
+            "restore must go through seq_state_set"
+        );
+        assert_eq!(
+            kv.seq_state_get(0),
+            Some(vec![0xAA; 60_000]),
+            "restored dump is the 60k chain anchor"
+        );
+        assert_eq!(
+            slots[0].prefix_ckpts.len(),
+            1,
+            "60k dump must survive prune"
+        );
+        assert_eq!(slots[0].prefix_cache.tokens.len(), 70_000);
     }
 
     #[test]
@@ -2813,14 +2875,26 @@ mod tests {
         let (head, _) = tool_head_and_prompt();
         let mut other_prompt = head.clone();
         other_prompt.extend((0..500).map(|i| (200 + i % 5) as Token));
-        store.lock().unwrap().put(head.clone(), ckpt_n(12_288, 0xAB));
+        store
+            .lock()
+            .unwrap()
+            .put(head.clone(), ckpt_n(12_288, 0xAB));
 
-        let bound = bind_slot(&mut slots[0], job_with_tokens(other_prompt), &kv, 40_000, &store);
+        let bound = bind_slot(
+            &mut slots[0],
+            job_with_tokens(other_prompt),
+            &kv,
+            40_000,
+            &store,
+        );
         assert!(bound, "other-session bind must succeed");
         let job = slots[0].job.as_ref().expect("slot occupied");
         assert_eq!(job.prompt_offset, 12_288, "shared head reused");
         assert!(
-            slots[0].prefix_ckpts.iter().all(|c| c.n_tokens <= 12_288 + 1),
+            slots[0]
+                .prefix_ckpts
+                .iter()
+                .all(|c| c.n_tokens <= 12_288 + 1),
             "60k anchor pruned past reuse_len"
         );
     }
