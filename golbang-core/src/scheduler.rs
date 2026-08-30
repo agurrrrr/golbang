@@ -354,7 +354,7 @@ async fn run_loop(
                 Ok(s) => s,
                 Err(e) => return (slots, Err(e)),
             };
-            apply_plan(&mut slots, &plan, &engine_d, &prefix_store_d);
+            apply_plan(&mut slots, &plan, engine_d.as_ref(), &prefix_store_d);
             maybe_log_prefill_progress(&mut slots);
             sample_and_emit(&mut slots, &plan, &samples, &engine_d, &metrics_d);
             fill_drafts_sync(&mut slots, &engine_d);
@@ -581,10 +581,65 @@ fn join_waiting(
     }
 }
 
+/// Sequence KV ops that bind / restore / promote need.
+///
+/// [`Engine`] is the production impl. Tests inject an in-memory fake so
+/// `bind_slot` → `settle_prefix_kv` → `restore_host_snapshot` (and
+/// `apply_plan` promotion) run without loading a GGUF.
+trait SeqKv {
+    fn spec_reset_seq(&self, seq: i32);
+    fn n_past_seq(&self, seq: i32) -> u32;
+    fn clear_seq(&self, seq: i32);
+    fn seq_state_set(&self, seq: i32, data: &[u8]) -> bool;
+    fn rm_seq_from(&self, seq: i32, p0: i32) -> bool;
+    fn seq_state_get(&self, seq: i32) -> Option<Vec<u8>>;
+    fn n_ubatch(&self) -> u32;
+    fn encode(&self, text: &str) -> crate::error::Result<Vec<Token>>;
+    fn tokenize_special(&self, text: &str) -> crate::error::Result<Vec<Token>>;
+    fn bind_vision(&self, slot: &mut Slot, job: Job, ctx_cap: u32) -> bool {
+        let _ = (slot, ctx_cap);
+        let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
+        false
+    }
+}
+
+impl SeqKv for Engine {
+    fn spec_reset_seq(&self, seq: i32) {
+        Engine::spec_reset_seq(self, seq);
+    }
+    fn n_past_seq(&self, seq: i32) -> u32 {
+        Engine::n_past_seq(self, seq)
+    }
+    fn clear_seq(&self, seq: i32) {
+        Engine::clear_seq(self, seq);
+    }
+    fn seq_state_set(&self, seq: i32, data: &[u8]) -> bool {
+        Engine::seq_state_set(self, seq, data)
+    }
+    fn rm_seq_from(&self, seq: i32, p0: i32) -> bool {
+        Engine::rm_seq_from(self, seq, p0)
+    }
+    fn seq_state_get(&self, seq: i32) -> Option<Vec<u8>> {
+        Engine::seq_state_get(self, seq)
+    }
+    fn n_ubatch(&self) -> u32 {
+        Engine::n_ubatch(self)
+    }
+    fn encode(&self, text: &str) -> crate::error::Result<Vec<Token>> {
+        Engine::encode(self, text)
+    }
+    fn tokenize_special(&self, text: &str) -> crate::error::Result<Vec<Token>> {
+        Engine::tokenize_special(self, text)
+    }
+    fn bind_vision(&self, slot: &mut Slot, job: Job, ctx_cap: u32) -> bool {
+        bind_vision_slot(slot, job, self, ctx_cap)
+    }
+}
+
 fn bind_slot(
     slot: &mut Slot,
     mut job: Job,
-    engine: &Engine,
+    engine: &impl SeqKv,
     ctx_cap: u32,
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
 ) -> bool {
@@ -592,7 +647,7 @@ fn bind_slot(
     engine.spec_reset_seq(seq);
 
     if !job.images.is_empty() {
-        return bind_vision_slot(slot, job, engine, ctx_cap);
+        return engine.bind_vision(slot, job, ctx_cap);
     }
 
     let tokens = match job.prompt_tokens.take() {
@@ -663,12 +718,7 @@ fn bind_slot(
     true
 }
 
-fn bind_vision_slot(
-    slot: &mut Slot,
-    job: Job,
-    engine: &Engine,
-    ctx_cap: u32,
-) -> bool {
+fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) -> bool {
     if !engine.vision_enabled() {
         let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
         return false;
@@ -784,7 +834,7 @@ fn bind_vision_slot(
     true
 }
 
-fn arm_think_budget(slot: &mut Slot, engine: &Engine) {
+fn arm_think_budget(slot: &mut Slot, engine: &impl SeqKv) {
     let Some(job) = slot.job.as_mut() else {
         return;
     };
@@ -832,7 +882,7 @@ fn sample_from_existing_logits(slot: &mut Slot, engine: &Engine) -> crate::error
 fn apply_plan(
     slots: &mut [Slot],
     plan: &crate::batch::BatchPlan,
-    engine: &Engine,
+    engine: &impl SeqKv,
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
 ) {
     for (id, take) in &plan.prefill_consumed {
@@ -1952,7 +2002,7 @@ fn clear_prefix_chain(slot: &mut Slot) {
 /// affinity_bar to a previous session's length.
 fn settle_prefix_kv(
     slot: &mut Slot,
-    engine: &Engine,
+    engine: &impl SeqKv,
     reuse_len: usize,
     gpu_n: u32,
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
@@ -2052,7 +2102,7 @@ fn settle_prefix_kv(
 /// job tokens, not `slot.prefix_cache`. Returns `None` on miss or GPU failure.
 fn restore_host_snapshot(
     slot: &mut Slot,
-    engine: &Engine,
+    engine: &impl SeqKv,
     reuse_len: usize,
     gpu_n: u32,
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
@@ -2119,7 +2169,7 @@ fn restore_host_snapshot(
     None
 }
 
-fn trim_seq_to(engine: &Engine, seq: i32, n: usize) -> bool {
+fn trim_seq_to(engine: &impl SeqKv, seq: i32, n: usize) -> bool {
     let gpu = engine.n_past_seq(seq);
     if gpu < n as u32 {
         return false;
@@ -2425,6 +2475,219 @@ mod tests {
         let key = snapshot_key(&prompt, 12_288).unwrap();
         assert_eq!(key.len(), 12_288);
         assert_eq!(&key[..], &prompt[..12_288]);
+    }
+
+    // ── P8 bind-path harness (issue #94): no GGUF / Engine ────────────────
+    //
+    // `empty_slot_store_hit_reuses_head` only calls `find_best_for_bind`.
+    // The original #93 bug (lookup/promote via empty `prefix_cache.tokens`)
+    // would still pass that unit test. These go through bind_slot →
+    // settle_prefix_kv → restore_host_snapshot and apply_plan.
+
+    struct FakeSeqKv {
+        inner: std::sync::Mutex<FakeKvState>,
+    }
+
+    struct FakeKvState {
+        n_past: std::collections::HashMap<i32, u32>,
+        state: std::collections::HashMap<i32, Vec<u8>>,
+        n_ubatch: u32,
+    }
+
+    impl FakeSeqKv {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Mutex::new(FakeKvState {
+                    n_past: std::collections::HashMap::new(),
+                    state: std::collections::HashMap::new(),
+                    n_ubatch: 2048,
+                }),
+            }
+        }
+
+        fn with_n_ubatch(n_ubatch: u32) -> Self {
+            let kv = Self::new();
+            kv.inner.lock().unwrap().n_ubatch = n_ubatch;
+            kv
+        }
+
+        fn seed_state(&self, seq: i32, data: Vec<u8>) {
+            let n = data.len() as u32;
+            let mut g = self.inner.lock().unwrap();
+            g.n_past.insert(seq, n);
+            g.state.insert(seq, data);
+        }
+    }
+
+    impl SeqKv for FakeSeqKv {
+        fn spec_reset_seq(&self, _seq: i32) {}
+
+        fn n_past_seq(&self, seq: i32) -> u32 {
+            self.inner
+                .lock()
+                .unwrap()
+                .n_past
+                .get(&seq)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn clear_seq(&self, seq: i32) {
+            let mut g = self.inner.lock().unwrap();
+            g.n_past.insert(seq, 0);
+            g.state.remove(&seq);
+        }
+
+        fn seq_state_set(&self, seq: i32, data: &[u8]) -> bool {
+            if data.is_empty() {
+                return false;
+            }
+            let mut g = self.inner.lock().unwrap();
+            g.state.insert(seq, data.to_vec());
+            // Tests size dumps as `n_tokens` bytes so n_past matches the
+            // restored checkpoint (production dumps are opaque).
+            g.n_past.insert(seq, data.len() as u32);
+            true
+        }
+
+        fn rm_seq_from(&self, seq: i32, p0: i32) -> bool {
+            let mut g = self.inner.lock().unwrap();
+            let cur = g.n_past.get(&seq).copied().unwrap_or(0);
+            if p0 < 0 {
+                g.n_past.insert(seq, 0);
+            } else if (p0 as u32) <= cur {
+                g.n_past.insert(seq, p0 as u32);
+            }
+            true
+        }
+
+        fn seq_state_get(&self, seq: i32) -> Option<Vec<u8>> {
+            self.inner.lock().unwrap().state.get(&seq).cloned()
+        }
+
+        fn n_ubatch(&self) -> u32 {
+            self.inner.lock().unwrap().n_ubatch
+        }
+
+        fn encode(&self, _text: &str) -> crate::error::Result<Vec<Token>> {
+            Err(Error::Tokenize(
+                "FakeSeqKv: tests must set job.prompt_tokens".into(),
+            ))
+        }
+
+        fn tokenize_special(&self, _text: &str) -> crate::error::Result<Vec<Token>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn tool_head_and_prompt() -> (Vec<Token>, Vec<Token>) {
+        let head: Vec<Token> = (0..12_288).map(|i| (i % 7) as Token).collect();
+        let mut prompt = head.clone();
+        prompt.extend((0..1_000).map(|i| (100 + i % 3) as Token));
+        (head, prompt)
+    }
+
+    fn ckpt_n(n: u32, fill: u8) -> SeqCheckpoint {
+        SeqCheckpoint {
+            n_tokens: n,
+            data: vec![fill; n as usize],
+        }
+    }
+
+    fn job_with_tokens(tokens: Vec<Token>) -> Job {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut job = Job::new(
+            "unused".into(),
+            GenerateParams::default(),
+            CancellationToken::new(),
+            tx,
+        );
+        job.prompt_tokens = Some(tokens);
+        job
+    }
+
+    #[test]
+    fn empty_slot_bind_store_hit_reuses_head() {
+        // Arrange: empty slot, empty prefix_cache.tokens (the #93 lookup
+        // used this, so a store hit was impossible). Store has the 12288
+        // tool-head dump; the new job prompt starts with that head.
+        let mut slot = Slot::new(SlotId(0));
+        assert!(slot.prefix_cache.tokens.is_empty());
+        let (head, prompt) = tool_head_and_prompt();
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        store.lock().unwrap().put(head, ckpt_n(12_288, 0xAB));
+        let kv = FakeSeqKv::new();
+        let n_prompt = prompt.len() as u32;
+
+        // Act: full text bind path (not find_best_for_bind alone).
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+
+        // Assert: restore_host_snapshot kept the tool-head length.
+        assert!(bound, "empty-slot bind with store hit must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 12_288,
+            "reused == 12288 (tool-head ubatch boundary)"
+        );
+        assert_eq!(job.n_past, 12_288);
+        assert_eq!(job.n_prompt, n_prompt);
+        assert_eq!(kv.n_past_seq(0), 12_288);
+        // Bind must not have written the prompt into prefix_cache; occupy
+        // leaves it empty until remember() at finish.
+        assert!(
+            slot.prefix_cache.tokens.is_empty(),
+            "prefix_cache.tokens stays empty during the job; store lookup used the new prompt"
+        );
+    }
+
+    #[test]
+    fn empty_slot_bind_store_miss_reuses_zero() {
+        let mut slot = Slot::new(SlotId(0));
+        let (_head, prompt) = tool_head_and_prompt();
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let kv = FakeSeqKv::new();
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+        assert!(bound);
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(job.prompt_offset, 0, "no store hit → full prefill");
+        assert_eq!(job.n_past, 0);
+    }
+
+    #[test]
+    fn apply_plan_promote_key_matches_job_prompt_n_tokens() {
+        // First prefill: occupy does not copy the prompt into
+        // prefix_cache.tokens. Promotion must key by job.prompt_tokens[..n].
+        let mut slot = Slot::new(SlotId(0));
+        let prompt: Vec<Token> = (0..20_000).map(|i| (i % 7) as Token).collect();
+        slot.occupy(ActiveJob::for_test(prompt.clone()));
+        assert!(
+            slot.prefix_cache.tokens.is_empty(),
+            "first prefill: prefix_cache.tokens is empty (the #93 promote bug)"
+        );
+
+        let kv = FakeSeqKv::with_n_ubatch(2048);
+        kv.seed_state(0, vec![0xCD; 12_288]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let plan = crate::batch::BatchPlan {
+            prefill_consumed: vec![(SlotId(0), 12_288)],
+            ..Default::default()
+        };
+
+        apply_plan(std::slice::from_mut(&mut slot), &plan, &kv, &store);
+
+        let g = store.lock().unwrap();
+        assert_eq!(g.len(), 1, "12288 stub must be promoted");
+        let (key, ckpt) = g.entries.iter().next().expect("promoted entry");
+        assert_eq!(key.len(), 12_288, "promote key length == n_tokens");
+        assert_eq!(
+            key.as_slice(),
+            &prompt[..12_288],
+            "promote key is job.prompt_tokens[..n_tokens], not prefix_cache.tokens"
+        );
+        assert_eq!(ckpt.n_tokens, 12_288);
+        assert_eq!(ckpt.data, vec![0xCD; 12_288]);
+        // If apply_plan keyed by prefix_cache.tokens (empty), snapshot_key
+        // would return None and the store would stay empty.
     }
 
     #[tokio::test]
