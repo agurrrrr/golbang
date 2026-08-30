@@ -363,6 +363,16 @@ impl PrefixStore {
     /// One tool head plus a handful of system prompts — never a ubatch trail.
     pub const DEFAULT_MAX_ENTRIES: usize = 8;
 
+    /// Store-stub window (mirrors `scheduler::STORE_STUB_*`): dumps inside the
+    /// shared tool/system head are the shortest tool anchors and are kept last
+    /// under the global host-RAM cap (HiCache L2, 4th stage).
+    pub const STORE_STUB_MIN: u32 = 8_192;
+    pub const STORE_STUB_MAX: u32 = 16_384;
+
+    fn is_store_stub_len(n_tokens: u32) -> bool {
+        (Self::STORE_STUB_MIN..=Self::STORE_STUB_MAX).contains(&n_tokens)
+    }
+
     pub fn with_cap(max_bytes: usize) -> Self {
         let mut s = Self::new();
         s.max_bytes = max_bytes;
@@ -465,8 +475,12 @@ impl PrefixStore {
     }
 
     fn pick_longest_victim(&self) -> Option<Vec<Token>> {
+        // Never evict a store stub (8k–16k tool head): it is the shortest
+        // shared tool anchor and must survive the global host-RAM cap
+        // (HiCache L2, 4th stage). Pick the longest non-stub dump instead.
         self.entries
             .iter()
+            .filter(|(_, ckpt)| !Self::is_store_stub_len(ckpt.n_tokens))
             .max_by(|a, b| {
                 a.1.n_tokens.cmp(&b.1.n_tokens).then_with(|| {
                     let ta = self.last_used.get(a.0).copied().unwrap_or(0);
@@ -476,6 +490,26 @@ impl PrefixStore {
                 })
             })
             .map(|(k, _)| k.clone())
+    }
+
+    /// Global host-RAM enforcement (HiCache L2, 4th stage).
+    ///
+    /// `chain_bytes` is the sum of all slot `prefix_ckpts` dumps (managed by
+    /// the scheduler, not visible here). Drop the longest `PrefixStore` dump
+    /// until `total_bytes + chain_bytes <= cap`. A short tool-head prefix is
+    /// never chosen while a longer dump exists (`pick_longest_victim`). The
+    /// caller decides whether slot chains still need trimming.
+    pub fn evict_global_over_cap(&mut self, chain_bytes: usize, cap: usize) {
+        while cap > 0 && self.total_bytes + chain_bytes > cap {
+            let victim = self.pick_longest_victim();
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(ckpt) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(ckpt.data.len());
+            }
+            self.last_used.remove(&victim);
+        }
     }
 
     /// Number of resident entries (for tests / metrics).

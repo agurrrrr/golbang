@@ -253,7 +253,7 @@ async fn run_loop(
 
         // Free idle prefix before join so a waiting job sees the extra room
         // in this iteration instead of failing ContextFull and retrying.
-        release_retained_under_pressure(&mut slots, &engine, pool);
+        release_retained_under_pressure(&mut slots, &*engine, pool, &prefix_store);
 
         join_waiting(
             &mut slots,
@@ -379,7 +379,7 @@ async fn run_loop(
             }
         }
         evict_finished(&mut slots, &engine, iter, &metrics);
-        release_retained_under_pressure(&mut slots, &engine, pool);
+        release_retained_under_pressure(&mut slots, &*engine, pool, &prefix_store);
         recompute_slot_caps(&mut slots, pool, single_max, spec_n_max);
     }
 }
@@ -579,6 +579,9 @@ fn join_waiting(
             recompute_slot_caps(slots, pool, single_max, spec_n_max);
         }
     }
+    // HiCache L2 (4th stage): a vision bind may have captured a new chain
+    // dump (`capture_prefix_checkpoint`); enforce the global host-RAM cap.
+    enforce_host_ram_cap(slots, prefix_store, HOST_RAM_CAP);
 }
 
 /// Sequence KV ops that bind / restore / promote need.
@@ -977,6 +980,9 @@ fn apply_plan(
             }
         }
     }
+    // HiCache L2 (4th stage): keep host RAM (PrefixStore + slot chains) under
+    // the global cap after new dumps are promoted.
+    enforce_host_ram_cap(slots, prefix_store, HOST_RAM_CAP);
 }
 
 /// P3 §4.3: bucket a millisecond latency into a coarse histogram.
@@ -1708,16 +1714,19 @@ fn maybe_log_decode_progress(slot: u32, job: &mut ActiveJob) {
 /// Used for pressure accounting (`release_retained_under_pressure`) where the
 /// real occupancy matters. Cap assignment must NOT include retained slots —
 /// see [`slot_kv_used_for_cap`].
+///
+/// P8-C: an empty slot counts only GPU-resident KV — `prefix_len` (+vision
+/// `n_pos`). The host `prefix_ckpts` chain is RAM, not GPU cells, so it must
+/// not lift `slot_kv_used` after a watermark release or the pressure loop
+/// would wrongly re-evict other idle GPU slots (#8565 defence).
 fn slot_kv_used(slot: &Slot) -> u32 {
     if let Some(job) = slot.job.as_ref() {
         return job.n_past.max(job.n_prompt);
     }
-    let cached = match slot.prefix_cache.vision.as_ref() {
+    match slot.prefix_cache.vision.as_ref() {
         Some(vs) => vs.n_pos(),
         None => slot.prefix_cache.prefix_len as u32,
-    };
-    let ckpt = latest_ckpt_n(slot);
-    cached.max(ckpt)
+    }
 }
 
 /// KV cells a slot counts against the shared pool when assigning ctx caps.
@@ -1790,7 +1799,12 @@ fn retained_release_due(total_used: u32, pool: u32) -> bool {
     pool > 0 && f64::from(total_used) > RETAINED_WATERMARK * f64::from(pool)
 }
 
-fn release_retained_under_pressure(slots: &mut [Slot], engine: &Engine, pool: u32) {
+fn release_retained_under_pressure(
+    slots: &mut [Slot],
+    engine: &impl SeqKv,
+    pool: u32,
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+) {
     let total_used: u32 = slots.iter().map(slot_kv_used).sum();
     if !retained_release_due(total_used, pool) {
         return;
@@ -1801,18 +1815,35 @@ fn release_retained_under_pressure(slots: &mut [Slot], engine: &Engine, pool: u3
         }
         let id = slot.id;
         let n = slot_kv_used(slot);
+        // P8-C (HiCache L2): clear only the GPU KV (L1). The host anchors
+        // (`prefix_ckpts` chain + global `PrefixStore`) and the same-session
+        // `prefix_cache.tokens` stay so the next bind restores instead of
+        // full-prefilling. `prefix_len` is zeroed so the host dump no longer
+        // counts as GPU occupancy in `slot_kv_used` (#8565 defence intact).
         engine.clear_seq(id.0 as i32);
-        slot.prefix_cache.reset();
-        clear_prefix_chain(slot);
+        slot.prefix_cache.prefix_len = 0;
+        if slot.prefix_cache.vision.is_some() {
+            slot.prefix_cache.vision = None;
+        }
         slot.retained_at = None;
         tracing::info!(
             slot = id.0,
             retained_cells = n,
             total_used,
             pool,
-            "retained prefix kv released"
+            chain_n = slot.prefix_ckpts.len(),
+            bytes = slot
+                .prefix_ckpts
+                .iter()
+                .map(|c| c.data.len())
+                .sum::<usize>(),
+            prefix_n = slot.prefix_cache.tokens.len(),
+            "retained prefix kv released; host anchors kept"
         );
     }
+    // HiCache L2 (4th stage): releasing GPU KV never drops host anchors, but
+    // the global host-RAM cap is still enforced on the retained chains.
+    enforce_host_ram_cap(slots, prefix_store, HOST_RAM_CAP);
 }
 
 fn keeps_prefix_kv(reason: FinishReason) -> bool {
@@ -1832,6 +1863,11 @@ fn keeps_prefix_kv(reason: FinishReason) -> bool {
 /// the byte cap.
 const CHAIN_MAX_ANCHORS: usize = 8;
 const CHAIN_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Global host-RAM cap (HiCache L2, 4th stage): `PrefixStore.total_bytes`
+/// plus all slot `prefix_ckpts` dumps must stay under this many bytes.
+/// Kept at 2 GiB to match `CHAIN_MAX_BYTES` / `PrefixStore::DEFAULT_MAX_BYTES`.
+const HOST_RAM_CAP: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Store-stub window: last ubatch-aligned dumps still likely inside the
 /// shared tool/system head (production ~12545, ubatch boundary 12288).
@@ -1925,6 +1961,54 @@ fn trim_prefix_chain(slot: &mut Slot, max_anchors: usize, max_bytes: usize) {
                 .sum::<usize>(),
             "prefix chain trimmed"
         );
+    }
+}
+
+/// Sum of all slot `prefix_ckpts` dump bytes (host RAM owned by the chains).
+fn host_chain_bytes(slots: &[Slot]) -> usize {
+    slots
+        .iter()
+        .map(|s| s.prefix_ckpts.iter().map(|c| c.data.len()).sum::<usize>())
+        .sum()
+}
+
+/// Enforce the global host-RAM cap (HiCache L2, 4th stage).
+///
+/// `PrefixStore.total_bytes` + all slot `prefix_ckpts` bytes must stay under
+/// `HOST_RAM_CAP`. Drop the longest `PrefixStore` dump first
+/// (`evict_global_over_cap` / `pick_longest_victim`), then the shortest
+/// unprotected middle of each slot chain (`trim_prefix_chain`). The shortest
+/// tool head (8k–16k store stub) and each slot's newest anchor are kept last.
+fn enforce_host_ram_cap(
+    slots: &mut [Slot],
+    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
+    cap: usize,
+) {
+    let mut store = prefix_store.lock().unwrap();
+    loop {
+        let chain_bytes = host_chain_bytes(slots);
+        if store.total_bytes + chain_bytes <= cap {
+            break;
+        }
+        // Stage 1: drop the longest PrefixStore dump.
+        let before = store.total_bytes;
+        store.evict_global_over_cap(chain_bytes, cap);
+        if store.total_bytes < before {
+            continue;
+        }
+        // Stage 2: trim each slot chain's unprotected middle (keeps newest +
+        // store stubs). `max_bytes = 0` forces the middle-only eviction rule.
+        let mut dropped = false;
+        for slot in slots.iter_mut() {
+            let before_n = slot.prefix_ckpts.len();
+            trim_prefix_chain(slot, CHAIN_MAX_ANCHORS, 0);
+            dropped |= slot.prefix_ckpts.len() < before_n;
+        }
+        if !dropped {
+            // Only newest + store stubs remain everywhere; nothing left to
+            // evict without dropping a protected anchor.
+            break;
+        }
     }
 }
 
@@ -2245,15 +2329,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_slot_kv_used_counts_prefix_cache() {
+    fn empty_slot_kv_used_counts_gpu_prefix_only() {
         let mut slot = Slot::new(SlotId(0));
         slot.prefix_cache.prefix_len = 12_000;
         assert_eq!(slot_kv_used(&slot), 12_000);
+        // P8-C: host `prefix_ckpts` is RAM, not GPU cells — a 20k dump must
+        // not lift empty-slot occupancy (else pressure wrongly re-evicts).
         slot.prefix_ckpts = vec![crate::slot::SeqCheckpoint {
             n_tokens: 20_000,
-            data: Vec::new(),
+            data: vec![0xAA; 20_000],
         }];
-        assert_eq!(slot_kv_used(&slot), 20_000);
+        assert_eq!(slot_kv_used(&slot), 12_000, "host dump is not GPU occupancy");
     }
 
     /// #8565 regression: a retained slot (job None) must NOT shrink a live
@@ -2638,6 +2724,188 @@ mod tests {
             slot.prefix_cache.tokens.is_empty(),
             "prefix_cache.tokens stays empty during the job; store lookup used the new prompt"
         );
+    }
+
+    // ── P8-C (issue #91): watermark clears GPU KV, keeps host anchors ──────
+
+    #[test]
+    fn watermark_release_clears_gpu_keeps_host_anchors() {
+        // P8-C: under pressure, release only GPU KV (L1). Host anchors
+        // (`prefix_ckpts` chain) and same-session `prefix_cache.tokens` stay
+        // so the next bind restores instead of full-prefilling.
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.tokens = vec![1, 2, 3, 4, 5]; // session identity
+        slot.prefix_cache.prefix_len = 60_000;
+        slot.prefix_ckpts = vec![ckpt_n(60_000, 0xAA), ckpt_n(12_288, 0xBB)];
+        slot.retained_at = Some(std::time::Instant::now());
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 60_000]);
+
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let mut slots = vec![slot];
+        // tiny pool: 60k (via prefix_len) crosses the watermark
+        release_retained_under_pressure(&mut slots, &kv, 60_000, &store);
+
+        let s = &slots[0];
+        assert_eq!(kv.n_past_seq(0), 0, "GPU KV cleared");
+        assert_eq!(s.prefix_ckpts.len(), 2, "host chain kept");
+        assert_eq!(
+            s.prefix_ckpts.iter().map(|c| c.data.len()).sum::<usize>(),
+            60_000 + 12_288,
+            "chain bytes kept"
+        );
+        assert_eq!(s.prefix_cache.tokens.len(), 5, "session tokens kept");
+        assert_eq!(s.prefix_cache.prefix_len, 0, "prefix_len zeroed");
+        assert!(s.retained_at.is_none());
+        assert_eq!(slot_kv_used(s), 0, "host dump is not GPU occupancy");
+    }
+
+    #[test]
+    fn same_session_bind_restores_chain_after_watermark() {
+        // Watermark release, then the same session returns → LCP>0 via
+        // `tokens`, GPU empty → best_chain_anchor + seq_state_set restores.
+        let shared: Vec<Token> = (0..60_000).map(|i| (i % 7) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.tokens = shared.clone();
+        slot.prefix_cache.prefix_len = 60_000;
+        slot.prefix_ckpts = vec![ckpt_n(60_000, 0xAA)];
+        slot.retained_at = Some(std::time::Instant::now());
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 60_000]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let mut slots = vec![slot];
+        release_retained_under_pressure(&mut slots, &kv, 60_000, &store);
+        assert_eq!(kv.n_past_seq(0), 0, "watermark cleared GPU");
+
+        // same session: shared 60k + small suffix
+        let mut prompt = shared.clone();
+        prompt.extend((0..1_000).map(|i| (100 + i % 3) as Token));
+        let bound = bind_slot(&mut slots[0], job_with_tokens(prompt), &kv, 100_000, &store);
+        assert!(bound, "same-session bind after watermark must succeed");
+        let job = slots[0].job.as_ref().expect("slot occupied");
+        assert!(
+            job.prompt_offset > 0 && job.prompt_offset == 60_000,
+            "reused from chain anchor, got {}",
+            job.prompt_offset
+        );
+        assert_eq!(kv.n_past_seq(0), 60_000, "GPU restored from chain anchor");
+        assert_eq!(slots[0].prefix_ckpts.len(), 1, "60k anchor still resident");
+    }
+
+    #[test]
+    fn other_session_bind_keeps_shared_head_prunes_long_anchor() {
+        // Watermark release leaves a 60k host chain. A different session
+        // binds → only the shared 12288 head LCP; the 60k anchor is pruned.
+        let shared: Vec<Token> = (0..60_000).map(|i| (i % 7) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.tokens = shared.clone();
+        slot.prefix_cache.prefix_len = 60_000;
+        slot.prefix_ckpts = vec![ckpt_n(60_000, 0xAA)];
+        slot.retained_at = Some(std::time::Instant::now());
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 60_000]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let mut slots = vec![slot];
+        release_retained_under_pressure(&mut slots, &kv, 60_000, &store);
+
+        // different session: shared tool head (12288) + different suffix
+        let (head, _) = tool_head_and_prompt();
+        let mut other_prompt = head.clone();
+        other_prompt.extend((0..500).map(|i| (200 + i % 5) as Token));
+        store.lock().unwrap().put(head.clone(), ckpt_n(12_288, 0xAB));
+
+        let bound = bind_slot(&mut slots[0], job_with_tokens(other_prompt), &kv, 40_000, &store);
+        assert!(bound, "other-session bind must succeed");
+        let job = slots[0].job.as_ref().expect("slot occupied");
+        assert_eq!(job.prompt_offset, 12_288, "shared head reused");
+        assert!(
+            slots[0].prefix_ckpts.iter().all(|c| c.n_tokens <= 12_288 + 1),
+            "60k anchor pruned past reuse_len"
+        );
+    }
+
+    #[test]
+    fn pressure_release_clears_gpu_keeps_host_for_both_sessions() {
+        // #8565 regression: two long idle sessions cross the pool watermark.
+        // GPU must still be cleared (slot shortage avoided); host anchors and
+        // session tokens stay for both.
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let shared: Vec<Token> = (0..70_000).map(|j| (j % 7 + i as Token) as Token).collect();
+            slot.prefix_cache.tokens = shared;
+            slot.prefix_cache.prefix_len = 70_000;
+            slot.prefix_ckpts = vec![ckpt_n(70_000, 0xAA)];
+            slot.retained_at = Some(std::time::Instant::now());
+        }
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 70_000]);
+        kv.seed_state(1, vec![0xCE; 70_000]);
+
+        let pool = 140_032;
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        release_retained_under_pressure(&mut slots, &kv, pool, &store);
+
+        assert_eq!(kv.n_past_seq(0), 0, "GPU cleared to avoid #8565");
+        assert_eq!(kv.n_past_seq(1), 0);
+        for s in &slots {
+            assert_eq!(s.prefix_ckpts.len(), 1, "host anchor kept");
+            assert_eq!(s.prefix_cache.tokens.len(), 70_000, "session tokens kept");
+            assert_eq!(slot_kv_used(s), 0, "host dump not GPU occupancy");
+        }
+    }
+
+    // ── P8-C 4th stage: global host-RAM LRU ───────────────────────────────
+
+    /// Global host-RAM cap test: when `PrefixStore.total_bytes` + all slot
+    /// chain bytes cross the cap, drop the longest `PrefixStore` dump first,
+    /// then each slot chain's unprotected middle. The shortest tool head
+    /// (store stub, 8k–16k) and each slot's newest anchor survive.
+    #[test]
+    fn host_ram_cap_evicts_long_store_middle_keeps_shortest_head_and_newest() {
+        // Slot 0 chain: newest 60k + mid 30k + store stub 12288.
+        let mut slot0 = Slot::new(SlotId(0));
+        push_prefix_ckpt(&mut slot0, 60_000, vec![0u8; 60_000]);
+        push_prefix_ckpt(&mut slot0, 30_000, vec![0u8; 30_000]);
+        push_prefix_ckpt(&mut slot0, 12_288, vec![0u8; 12_288]);
+        // Slot 1 chain: newest 40k + mid 20k.
+        let mut slot1 = Slot::new(SlotId(1));
+        push_prefix_ckpt(&mut slot1, 40_000, vec![0u8; 40_000]);
+        push_prefix_ckpt(&mut slot1, 20_000, vec![0u8; 20_000]);
+
+        // Global store: a long 50k dump + a short 12288 tool-head stub.
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        {
+            let mut g = store.lock().unwrap();
+            g.put(vec![1i32; 50_000], ckpt_n(50_000, 0xAB));
+            g.put(vec![2i32; 12_288], ckpt_n(12_288, 0xAC));
+        }
+
+        // Total = store(50k+12288) + chain0(60k+30k+12288) + chain1(40k+20k)
+        //        = 62_288 + 102_288 + 60_000 = 224_576. Cap at 100k forces
+        //        both stages.
+        let mut slots = vec![slot0, slot1];
+        enforce_host_ram_cap(&mut slots, &store, 100_000);
+
+        // Stage 1: longest PrefixStore dump (50k) evicted; short 12288 stub
+        // stays because a longer dump existed.
+        let g = store.lock().unwrap();
+        assert_eq!(g.len(), 1, "long store dump evicted");
+        let (key, ckpt) = g.entries.iter().next().expect("stub kept");
+        assert_eq!(key.len(), 12_288, "short tool-head stub kept");
+        assert_eq!(ckpt.n_tokens, 12_288);
+
+        // Stage 2: each slot chain drops mid anchors, keeps newest + stub.
+        let s0 = &slots[0];
+        let s0_kept: Vec<u32> = s0.prefix_ckpts.iter().map(|c| c.n_tokens).collect();
+        assert!(s0_kept.contains(&60_000), "newest 60k kept");
+        assert!(s0_kept.contains(&12_288), "store stub 12288 kept");
+        assert!(!s0_kept.contains(&30_000), "mid 30k dropped");
+
+        let s1 = &slots[1];
+        let s1_kept: Vec<u32> = s1.prefix_ckpts.iter().map(|c| c.n_tokens).collect();
+        assert!(s1_kept.contains(&40_000), "newest 40k kept");
+        assert!(!s1_kept.contains(&20_000), "mid 20k dropped");
     }
 
     #[test]
