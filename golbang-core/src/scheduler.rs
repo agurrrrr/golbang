@@ -592,7 +592,7 @@ fn bind_slot(
     engine.spec_reset_seq(seq);
 
     if !job.images.is_empty() {
-        return bind_vision_slot(slot, job, engine, ctx_cap, prefix_store);
+        return bind_vision_slot(slot, job, engine, ctx_cap);
     }
 
     let tokens = match job.prompt_tokens.take() {
@@ -668,7 +668,6 @@ fn bind_vision_slot(
     job: Job,
     engine: &Engine,
     ctx_cap: u32,
-    prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
 ) -> bool {
     if !engine.vision_enabled() {
         let _ = job.events.send(SlotEvent::Failed(Error::VisionDisabled));
@@ -698,26 +697,21 @@ fn bind_vision_slot(
     let gpu_n = engine.n_past_seq(seq);
     let ckpt_n = latest_ckpt_n(slot);
     let hint_n = gpu_n.max(ckpt_n);
-    let mut reuse_tok = slot
+    let reuse_tok = slot
         .prefix_cache
         .vision
         .as_ref()
         .map(|prev| prev.reuse_for_bind(&tok.seq, hint_n))
         .unwrap_or(0);
-    let mut reuse_pos = tok.seq.pos_next(reuse_tok);
-    reuse_pos = settle_prefix_kv(
-        slot,
-        engine,
-        reuse_pos as usize,
-        gpu_n,
-        prefix_store,
-        &tok.seq.tokens,
-    ) as u32;
-    if reuse_pos == 0 {
-        reuse_tok = 0;
-    } else if reuse_pos != tok.seq.pos_next(reuse_tok) {
-        reuse_tok = tok.seq.size_up_to_pos(reuse_pos);
+    // Vision: no host-store prefix hit (README: image turns have none).
+    // `tok.seq.tokens` embeds image markers, so a PrefixStore lookup would be
+    // wrong. Only local vision prefix reuse; otherwise start from a clean seq.
+    if reuse_tok == 0 {
+        engine.clear_seq(seq);
+        slot.prefix_cache.reset();
+        clear_prefix_chain(slot);
     }
+    let reuse_pos = tok.seq.pos_next(reuse_tok);
 
     let eval_t0 = Instant::now();
     let n_past = match engine.vision_eval_from(seq, &tok, reuse_tok, reuse_pos) {
@@ -1839,6 +1833,11 @@ fn push_prefix_ckpt(slot: &mut Slot, n_tokens: u32, data: Vec<u8>) {
 
 /// Drop unprotected middles. Newest and 8k–16k stubs stay even if the byte
 /// cap is still exceeded (a single Qwen FA 70k dump is ~4 GiB).
+///
+/// Eviction direction is intentional: the chain keeps the newest + store-stub
+/// anchors and drops the shortest unprotected middle, whereas `PrefixStore`
+/// drops the *longest* dump (`pick_longest_victim`) so a short tool-head
+/// prefix is never evicted while a longer dump exists.
 fn trim_prefix_chain(slot: &mut Slot, max_anchors: usize, max_bytes: usize) {
     loop {
         let n = slot.prefix_ckpts.len();
