@@ -98,9 +98,10 @@ golbang-sys
 ```
 
 핀은 `golbang-sys/build.rs`의 `EXPECTED_SHA`가 진실이다.
-지금 **`3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`**
-(`/home/agurrrrr/code/local-llm/llama.cpp-upgrade`, `llama.h` 1629줄).
-형제 트리(`llama.cpp`, `.new`, `-furnace`, `-prefetch`)는 HEAD가 다르다. 섞지 않는다.
+지금 **`367ebbc20c2b20db411d5acf72b88d26a7c13d70`**
+(`/home/agurrrrr/code/local-llm/llama.cpp-glm5next`, `llama.h` 1638줄).
+롤백 핀은 `3ac5658c7` / `llama.cpp-upgrade` (남겨둔다).
+형제 트리(`llama.cpp`, `-cuda`, `-dflash2`)는 HEAD가 다르다. 섞지 않는다.
 
 ## 요청이 도는 길
 
@@ -255,7 +256,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 
 | GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
 |-----|-----|---------------|----------------|---------|
-| HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-upgrade` | `3ac5658c7` |
+| HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
 | CUDA (RTX 3060) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda` | `749f688fc` |
 
 서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
@@ -379,6 +380,8 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,
 `LD_LIBRARY_PATH=…/llama.cpp-upgrade/build/bin`.
+실행 중 유닛은 롤백 핀(`llama.cpp-upgrade`)을 유지한다; 새 빌드 기본 트리는
+`llama.cpp-glm5next`이며 G3에서 GLM 전용 유닛이 생긴다.
 
 ## 로드맵
 

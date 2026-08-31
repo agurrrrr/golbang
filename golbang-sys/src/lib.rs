@@ -2,7 +2,7 @@
 //!
 //! Safe wrappers live in `golbang-core` (P1). This crate only exposes the C ABI
 //! generated from the SHA-pinned llama.cpp tree selected by `GOLBANG_GPU`
-//! (`hip` → `llama.cpp-upgrade` / `cuda` → `llama.cpp-cuda`).
+//! (`hip` → `llama.cpp-glm5next` / `cuda` → `llama.cpp-cuda`).
 //!
 //! Current names: [`llama_model_load_from_file`], [`llama_init_from_model`],
 //! [`llama_model_free`]. The older `llama_load_model_from_file` /
@@ -24,6 +24,24 @@ unsafe extern "C" {
     pub fn golbang_llama_get_embeddings_nextn_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
     pub fn golbang_llama_set_nextn_layer_offset(ctx: *mut llama_context, offset: i32);
     pub fn golbang_llama_get_ctx_other(ctx: *mut llama_context) -> *mut llama_context;
+}
+
+/// `mtmd_helper_bitmap_init_from_buf` grew an `mtmd_helper_init_opt` argument
+/// (video support) in newer mtmd-helper.h. The cfg mirrors the pinned header
+/// (set by this crate's build.rs) so dependents compile against either pin
+/// through this wrapper instead of the raw binding.
+pub unsafe fn mtmd_helper_bitmap_init_from_buf_compat(
+    ctx: *mut mtmd_context,
+    buf: *const u8,
+    len: usize,
+    placeholder: bool,
+) -> mtmd_helper_bitmap_wrapper {
+    #[cfg(mtmd_helper_init_opt)]
+    return unsafe {
+        mtmd_helper_bitmap_init_from_buf(ctx, buf, len, placeholder, mtmd_helper_init_opt_default())
+    };
+    #[cfg(not(mtmd_helper_init_opt))]
+    return unsafe { mtmd_helper_bitmap_init_from_buf(ctx, buf, len, placeholder) };
 }
 
 /// llama.cpp commit bindgen and the linked `.so` were verified against.
@@ -58,7 +76,7 @@ mod api_names {
         let expected = if gpu.trim().eq_ignore_ascii_case("cuda") {
             "749f688fcaa4c472ec034b08cb8a907c45cfaa02"
         } else {
-            "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee"
+            "367ebbc20c2b20db411d5acf72b88d26a7c13d70"
         };
         assert_eq!(LLAMA_CPP_SHA, expected);
     }

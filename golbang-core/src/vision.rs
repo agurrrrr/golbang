@@ -119,8 +119,15 @@ impl Vision {
                 self.free_bitmaps(&bitmaps);
                 return Err(Error::Vision(format!("image {i} is empty")));
             }
+            // Signature varies across pins (`mtmd_helper_init_opt` arg);
+            // the sys-crate wrapper mirrors the pinned header.
             let wrap = unsafe {
-                mtmd_helper_bitmap_init_from_buf(self.ctx, bytes.as_ptr(), bytes.len(), false)
+                mtmd_helper_bitmap_init_from_buf_compat(
+                    self.ctx,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    false,
+                )
             };
             if wrap.bitmap.is_null() {
                 self.free_bitmaps(&bitmaps);

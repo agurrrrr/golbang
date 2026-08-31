@@ -50,16 +50,17 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 구현 착수 전에 아래 **고정 값**을 다시 확인하고, 값이 바뀌었으면 이 표를 고친 뒤 진행한다.
 
-| 항목 | 고정 값 (2026-08-15 업그레이드) |
+| 항목 | 고정 값 (2026-09-01 G2, glm5next) |
 |------|---------------------------|
-| 트리 | `/home/agurrrrr/code/local-llm/llama.cpp-upgrade` |
-| `git rev-parse HEAD` | `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee` (`3ac5658c7`) |
-| 기반 | `origin/master` `9d57ce456` + DPP + MMQ I=64 + GCN repack |
-| bindgen 입력 | **이 SHA의** `include/llama.h` (1629줄). 라이브 최신 헤더 금지 |
+| 트리 | `/home/agurrrrr/code/local-llm/llama.cpp-glm5next` |
+| `git rev-parse HEAD` | `367ebbc20c2b20db411d5acf72b88d26a7c13d70` (`367ebbc20`) |
+| 기반 | `origin/master` `f8dbcd618` + glm5next PR #27754 (unsloth `glm5next/upstream`) + DPP + MMQ I=64 + GCN repack |
+| bindgen 입력 | **이 SHA의** `include/llama.h` (1638줄). 라이브 최신 헤더 금지 |
 | 현행 로드 API | `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free` |
 | DEPRECATED | `llama_load_model_from_file` / `llama_new_context_with_model` / `llama_free_model` |
 
-이전 (A) 핀 (2026-08-13): `/home/agurrrrr/code/local-llm/llama.cpp` @ `5b474eb69`, `llama.h` 1611줄, `.so` 2026-08-06 19:01. 생산 유닛이 그 트리를 쓰는 동안 HEAD를 움직이지 말 것.
+이전 핀 (2026-08-15): `/home/agurrrrr/code/local-llm/llama.cpp-upgrade` @ `3ac5658c7`, `llama.h` 1629줄. **롤백 경로로 트리·`.so`를 유지한다** (생산 유닛이 그 트리를 쓰는 동안 HEAD를 움직이지 말 것).
+그 이전 (A) 핀 (2026-08-13): `/home/agurrrrr/code/local-llm/llama.cpp` @ `5b474eb69`, `llama.h` 1611줄, `.so` 2026-08-06 19:01.
 
 > **라벨 구분 (2026-08-13 리뷰 반영):** "커밋 시각"(git 기록)과 ".so 빌드 시각"(.so mtime)은 **서로 다른 값**이다.
 > ADR/README에는 간결히 "빌드 2026-08-06 19:01"로 쓰되, P0 표에서는 위처럼 두 시각을 명시적으로 구분해 둔다.
@@ -68,14 +69,14 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 | 경로 | HEAD |
 |------|------|
-| `llama.cpp-upgrade` | `3ac5658c7` ← **이 트리만 사용** |
-| `llama.cpp` | `5b474eb69` (생산 유닛 rollback) |
-| `llama.cpp.new` | `e700bfb37` |
-| `llama.cpp-furnace` | `5013b9f91` |
-| `llama.cpp-prefetch` | `6e3d2ef73` |
+| `llama.cpp-glm5next` | `367ebbc20` ← **HIP 트리만 사용** |
+| `llama.cpp-upgrade` | `3ac5658c7` (롤백 경로) |
+| `llama.cpp-cuda` | `749f688fc` (CUDA 트리) |
+| `llama.cpp-dflash2` | `a3c3265e0` |
+| `llama.cpp` | `5b474eb69` |
 
-- [x] 구현 당일 `rev-parse HEAD`와 `.so` mtime이 위 표와 같은지 재확인. (2026-08-15: HEAD `3ac5658c7` on `llama.cpp-upgrade`. 이전 확인 2026-08-13: HEAD `5b474eb69`.)
-- [x] bindgen 입력을 **그 SHA의 `llama.h`**로 고정 (`build.rs`가 `git show 3ac5658c7:include/llama.h` 로 OUT_DIR에 추출, 1629줄 검증). 라이브 트리 헤더와 옛 `.so`를 섞지 말 것.
+- [x] 구현 당일 `rev-parse HEAD`와 `.so` mtime이 위 표와 같은지 재확인. (2026-09-01: HEAD `367ebbc20` on `llama.cpp-glm5next`, `.so` 2026-08-31 22:24 빌드. 이전 확인 2026-08-15: HEAD `3ac5658c7` on `llama.cpp-upgrade`.)
+- [x] bindgen 입력을 **그 SHA의 `llama.h`**로 고정 (`build.rs`가 `git show 367ebbc20:include/llama.h` 로 OUT_DIR에 추출, 1638줄 검증). 라이브 트리 헤더와 옛 `.so`를 섞지 말 것.
 - [x] **심볼/SHA가 바뀌면 (A)를 버리고 (B) 재빌드(P3)로 전환한다.** ADR의 submodule+cmake 서술은 (B)용이며, P0 기본 경로가 아니다. HEAD 불일치 시 `build.rs`가 실패한다.
 
 ### 4.1 링크 전략 결정 (택 1, 먼저 결정할 것)
@@ -92,7 +93,7 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
 
 ### 4.2 build.rs 작성
 
-- [x] llama.cpp 소스/빌드 경로를 환경변수(`GOLBANG_LLAMA_DIR`)로 주입받되, 기본값은 `/home/agurrrrr/code/local-llm/llama.cpp-upgrade`.
+- [x] llama.cpp 소스/빌드 경로를 환경변수(`GOLBANG_LLAMA_DIR`)로 주입받되, 기본값은 `GOLBANG_GPU`별 트리 (2026-09-01: hip → `llama.cpp-glm5next`, cuda → `llama.cpp-cuda`).
 - [x] `bindgen::Builder`로 **4.0에서 고정한 그 `llama.h`** 파싱 → `OUT_DIR/bindings.rs` 생성.
   - allowlist: `llama_*` 함수와 필요한 타입만 (불필요한 심볼 폭증 방지).
 - [x] 링크 지시 출력:
@@ -111,7 +112,7 @@ CPU 폴백이 아니다. `cargo test -p golbang-sys`가 이를 통과한다. **�
   - 토크나이즈: `llama_tokenize`, `llama_vocab_*`
   - 추론: `llama_decode`, `llama_get_logits`, batch 유틸(`llama_batch_init` 등)
 
-> ⚠️ **API 이름 고정 (2026-08-15 재확인):** 로컬 `llama.h`(SHA `3ac5658c7`, 1629줄) 기준
+> ⚠️ **API 이름 고정 (2026-08-15 재확인, 2026-09-01 `367ebbc20`에서도 동일):** HIP 핀 `llama.h` 기준
 > `llama_load_model_from_file` / `llama_new_context_with_model` / `llama_free_model`은 **DEPRECATED**이고
 > 현재 이름은 **`llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`** 이다.
 > bindgen allowlist도 현행 이름으로 맞출 것. 추측으로 쓰지 않는다.

@@ -2,8 +2,9 @@
 //!
 //! Backend is selected via `GOLBANG_GPU` env (`hip` default, `cuda` optional).
 //!
-//! - `hip`  → `llama.cpp-upgrade` worktree (`origin/master` + DPP / MMQ I=64 /
-//!   GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
+//! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
+//!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
+//!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
 //! - `cuda` → `llama.cpp-cuda` worktree, CUDA-symbol `.so` byte check,
 //!   CUDA runtime (`cudart`/`cublas`) link.
 //!
@@ -15,12 +16,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// wiki `llama-cpp-upgrade-notes` — 2026-08-15 rebuild
-const EXPECTED_SHA_HIP: &str = "3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee";
+/// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
+/// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
+const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
 const EXPECTED_SHA_CUDA: &str = "749f688fcaa4c472ec034b08cb8a907c45cfaa02";
-const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-upgrade";
+const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
 const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda";
-const EXPECTED_LLAMA_H_LINES: usize = 1629;
+const EXPECTED_LLAMA_H_LINES: usize = 1638;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
     ("include/llama.h", "llama.h"),
@@ -45,9 +47,7 @@ fn main() {
     let gpu = gpu.trim().to_lowercase();
     match gpu.as_str() {
         "hip" | "cuda" => {}
-        other => panic!(
-            "GOLBANG_GPU must be 'hip' or 'cuda', got '{other}'"
-        ),
+        other => panic!("GOLBANG_GPU must be 'hip' or 'cuda', got '{other}'"),
     }
 
     let (expected_sha, default_dir) = match gpu.as_str() {
@@ -56,9 +56,8 @@ fn main() {
         _ => unreachable!(),
     };
 
-    let llama_dir = PathBuf::from(
-        env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| default_dir.to_string()),
-    );
+    let llama_dir =
+        PathBuf::from(env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| default_dir.to_string()));
     if !llama_dir.is_dir() {
         panic!(
             "GOLBANG_LLAMA_DIR does not exist: {}. Set it to the llama.cpp tree at {expected_sha} (GOLBANG_GPU={gpu}).",
@@ -72,7 +71,7 @@ fn main() {
             "llama.cpp HEAD is {head}, expected {expected_sha} (GOLBANG_GPU={gpu}). \
              Pin is that SHA + its {gpu} .so under the matching tree. \
              Do not mix a live header with a different .so. \
-             Sibling trees (llama.cpp / .new / -furnace / -prefetch) are different HEADs."
+             Sibling trees (llama.cpp / -cuda / -dflash2 / -upgrade rollback) are different HEADs."
         );
     }
 
@@ -107,14 +106,24 @@ fn main() {
             let bytes = fs::read(&cuda_so).unwrap_or_else(|e| {
                 panic!("failed to read {}: {e}", cuda_so.display());
             });
-            if !bytes.windows(b"__cudaRegisterFatBinary".len()).any(|w| w == b"__cudaRegisterFatBinary") {
+            if !bytes
+                .windows(b"__cudaRegisterFatBinary".len())
+                .any(|w| w == b"__cudaRegisterFatBinary")
+            {
                 panic!(
                     "{} does not contain CUDA runtime symbols. SHA/.so drift — rebuild llama.cpp-cuda.",
                     cuda_so.display()
                 );
             }
             backend_so = cuda_so;
-            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-cuda", "mtmd"];
+            link_libs = &[
+                "llama",
+                "ggml",
+                "ggml-base",
+                "ggml-cpu",
+                "ggml-cuda",
+                "mtmd",
+            ];
             link_search_extra = &["/opt/cuda/targets/x86_64-linux/lib"];
         }
         _ => unreachable!(),
@@ -172,6 +181,16 @@ fn main() {
             "extracted mtmd headers missing from {}",
             header_dir.display()
         );
+    }
+
+    // `mtmd_helper_bitmap_init_from_{buf,file}` grew an `mtmd_helper_init_opt`
+    // argument (video support) in newer mtmd-helper.h. cfg follows the pinned
+    // header, so the same crate source compiles against both pins.
+    println!("cargo::rustc-check-cfg=cfg(mtmd_helper_init_opt)");
+    let mtmd_helper_h_text =
+        fs::read_to_string(&mtmd_helper_h).expect("read extracted mtmd-helper.h");
+    if mtmd_helper_h_text.contains("mtmd_helper_init_opt") {
+        println!("cargo:rustc-cfg=mtmd_helper_init_opt");
     }
 
     let bindings = bindgen::Builder::default()
