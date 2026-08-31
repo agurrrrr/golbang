@@ -4,6 +4,7 @@
 //! apply `tokenizer.chat_template` with minijinja (same idea as llama-server).
 
 use minijinja::{context, Environment, UndefinedBehavior, Value};
+use minijinja::value::Kwargs;
 use tracing::warn;
 
 use crate::tools::ToolCall;
@@ -115,6 +116,22 @@ fn apply_jinja(
                 minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
             })?;
             Ok(Value::from_serialize(v))
+        },
+    );
+
+    // GLM-5.3 chat template calls `v | tojson(ensure_ascii=False)` (chat:13/163)
+    // when tools are attached. The builtin `tojson` rejects unknown kwargs, so
+    // the render fails and the request silently falls back to ChatML, which the
+    // model cannot follow. serde_json never escapes non-ASCII (equivalent to
+    // `ensure_ascii=False`), so consume the flag and delegate to the builtin.
+    env.add_filter(
+        "tojson",
+        |value: Value,
+         indent: Option<Value>,
+         kwargs: Kwargs|
+         -> Result<Value, minijinja::Error> {
+            let _ensure_ascii: Option<Value> = kwargs.get("ensure_ascii")?;
+            minijinja::filters::tojson(&value, indent, kwargs)
         },
     );
 
@@ -833,6 +850,69 @@ mod tests {
             default.prompt.contains("old thoughts"),
             "absent clear_thinking must keep previous thinking:\n{}",
             default.prompt
+        );
+    }
+
+    /// GLM-5.3 serializes every tool with `tojson(ensure_ascii=False)`
+    /// (chat:13). The builtin `tojson` rejects the kwarg, so any tools-bearing
+    /// request failed the render, fell back to ChatML, and the model ended its
+    /// turn with a literal `<|im_end|>` (shepherd sheep tasks: n_tools=56).
+    /// The custom `tojson` filter must keep tools requests on the GLM template.
+    #[test]
+    fn glm53_jinja_tools_render_without_chatml_fallback() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_history",
+                "description": "Query project task history",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project_name": {"type": "string"},
+                        "키워드": {"type": "string", "description": "한글 설명"}
+                    },
+                    "required": ["project_name"]
+                }
+            }
+        })];
+        let applied = apply_chat_template_with(
+            &[msg("user", "이전 작업 조회해봐")],
+            &ChatApplyOpts {
+                tools,
+                ..glm53_opts()
+            },
+        );
+        assert!(
+            applied.used_jinja,
+            "tools request must not fall back to ChatML:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<tools>"),
+            "missing tools header:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("get_history"),
+            "missing tool schema:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<tool_call>"),
+            "missing tool-call instruction:\n{}",
+            applied.prompt
+        );
+        // serde_json never escapes non-ASCII: the Korean schema text must
+        // survive verbatim (ensure_ascii=False semantics).
+        assert!(
+            applied.prompt.contains("한글 설명"),
+            "non-ASCII tool schema text must render unescaped:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.ends_with("<|assistant|><think>"),
+            "bad gen prefix:\n{}",
+            applied.prompt
         );
     }
 }

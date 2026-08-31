@@ -16,7 +16,7 @@ use crate::batch::{
 use crate::ctx_cap::{cap_for_join, effective_cap, resolve_single_max, slot_cap};
 use crate::engine::Engine;
 use crate::error::Error;
-use crate::generate::{FinishReason, GenerateParams, GeneratedToken};
+use crate::generate::{FinishReason, GenerateParams, GeneratedToken, stop_cut_len};
 use crate::policy::{EmptySlotView, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
 use crate::prefix_cache::{PrefixStore, common_prefix_len, host_search_len, snapshot_key};
 use crate::slot::{ActiveJob, SeqCheckpoint, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
@@ -1316,12 +1316,9 @@ fn push_token(slot: &mut Slot, engine: &Engine, token: Token) -> bool {
         job.finish = Some(FinishReason::Length);
     } else if !job.stop.is_empty() {
         job.acc.push_str(&piece);
-        if job
-            .stop
-            .iter()
-            .any(|s| !s.is_empty() && job.acc.contains(s))
-        {
+        if let Some(keep) = stop_cut_len(&job.stop, &job.acc, piece.len()) {
             job.finish = Some(FinishReason::Stop);
+            piece.truncate(keep);
         }
     }
     if job.n_past + 1 > job.ctx_cap && job.finish.is_none() {

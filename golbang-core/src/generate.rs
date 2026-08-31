@@ -175,11 +175,8 @@ impl<'m> Generate<'m> {
 
         if !self.stop.is_empty() {
             self.acc.push_str(&piece);
-            if self
-                .stop
-                .iter()
-                .any(|s| !s.is_empty() && self.acc.contains(s))
-            {
+            if let Some(keep) = stop_cut_len(&self.stop, &self.acc, piece.len()) {
+                piece.truncate(keep);
                 self.finish_with(FinishReason::Stop);
                 return Ok(Some(GeneratedToken { token, piece }));
             }
@@ -193,6 +190,22 @@ impl<'m> Generate<'m> {
         self.finished = true;
         self.finish = Some(reason);
     }
+}
+
+/// Stop-sequence check over the accumulated text. Returns how many bytes of
+/// the piece emitted this step survive: the first-encountered stop sequence
+/// (OpenAI rule: cut at the earliest occurrence) and anything after it are
+/// cut so e.g. a literal `<|im_end|>` cannot leak into the visible response.
+/// A stop that began inside an already-emitted piece keeps 0 (that piece was
+/// streamed before the match completed).
+pub(crate) fn stop_cut_len(stop: &[String], acc: &str, piece_len: usize) -> Option<usize> {
+    let start = stop
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| acc.rfind(s.as_str()))
+        .min()?;
+    let piece_start = acc.len().saturating_sub(piece_len);
+    Some(start.saturating_sub(piece_start))
 }
 
 impl Iterator for Generate<'_> {
@@ -253,6 +266,53 @@ impl Utf8Buf {
                 out
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single-token stop (`<|im_end|>` piece) must not be streamed: keep 0
+    /// bytes of the piece that completed the match.
+    #[test]
+    fn stop_cut_len_whole_piece_stop_keeps_nothing() {
+        let stop = vec!["<|im_end|>".to_string()];
+        let acc = "안녕하세요<|im_end|>";
+        assert_eq!(stop_cut_len(&stop, acc, "<|im_end|>".len()), Some(0));
+    }
+
+    /// Stop begins mid-piece: keep the bytes before the stop start.
+    #[test]
+    fn stop_cut_len_mid_piece_stop_keeps_prefix() {
+        let stop = vec!["<|user|>".to_string()];
+        let piece = "텍<|user|>";
+        let acc = format!("앞{piece}");
+        assert_eq!(stop_cut_len(&stop, &acc, piece.len()), Some("텍".len()));
+    }
+
+    /// Stop began in a piece that was already streamed: keep 0.
+    #[test]
+    fn stop_cut_len_stop_started_earlier_keeps_zero() {
+        let stop = vec!["END".to_string()];
+        let acc = "ENEND";
+        assert_eq!(stop_cut_len(&stop, acc, "ND".len()), Some(0));
+    }
+
+    /// No match: keep streaming (None).
+    #[test]
+    fn stop_cut_len_no_match_is_none() {
+        let stop = vec!["<|im_end|>".to_string()];
+        assert_eq!(stop_cut_len(&stop, "그냥 텍스트", 6), None);
+    }
+
+    /// Overlapping stops: the first-encountered (earliest) start wins,
+    /// matching the OpenAI "cut at the first stop sequence" rule.
+    #[test]
+    fn stop_cut_len_picks_earliest_start() {
+        let stop = vec!["AAA".to_string(), "AAB".to_string()];
+        let acc = "xxAABAAA";
+        assert_eq!(stop_cut_len(&stop, acc, acc.len()), Some(2));
     }
 }
 
