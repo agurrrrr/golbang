@@ -915,8 +915,8 @@ fn apply_plan(
                         promote_key = snapshot_key(&job.prompt_tokens, n_past);
                     }
                 } else if stride_stub {
-                    // One stub in the chain: the last 8k–16k stride boundary.
-                    // Other stride dumps go to the host store only.
+                    // One stub in the chain: the last stride in the store-stub
+                    // window. Other stride dumps go to the host store only.
                     need_chain = is_last_host_stub(n_past);
                     promote_key = snapshot_key(&job.prompt_tokens, n_past);
                 }
@@ -1859,7 +1859,7 @@ fn keeps_prefix_kv(reason: FinishReason) -> bool {
 /// P8-A chain bounds: per-slot anchor count and total host bytes.
 /// DSV4 PARTIAL ≈ 18 MiB/anchor, so 2 GiB rarely binds; the cap guards Qwen FA
 /// length-proportional dumps. On overflow keep the newest prefill-end and any
-/// 8k–16k store stub (tool-head candidate). Do not drop those just to meet
+/// store stub in the 6k–16k window (tool-head candidate). Do not drop those just to meet
 /// the byte cap.
 const CHAIN_MAX_ANCHORS: usize = 8;
 const CHAIN_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
@@ -1869,14 +1869,14 @@ const CHAIN_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// Kept at 2 GiB to match `CHAIN_MAX_BYTES` / `PrefixStore::DEFAULT_MAX_BYTES`.
 const HOST_RAM_CAP: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// Store-stub window: last ubatch-aligned dumps still likely inside the
-/// shared tool/system head (production ~12545, ubatch boundary 12288).
-const STORE_STUB_MIN: u32 = 8_192;
-const STORE_STUB_MAX: u32 = 16_384;
-const STORE_STUB_STRIDE: u32 = 2_048;
+/// Store-stub window — same bounds as [`PrefixStore`] so promotion and
+/// eviction stay aligned. MIN is 6144 (below the current ~6191 tool-JSON
+/// head) so a cross-project empty slot can restore (task #8910, LCP 6436).
+const STORE_STUB_MAX: u32 = PrefixStore::STORE_STUB_MAX;
+const STORE_STUB_STRIDE: u32 = PrefixStore::STORE_STUB_STRIDE;
 
 fn is_store_stub_len(n_tokens: u32) -> bool {
-    (STORE_STUB_MIN..=STORE_STUB_MAX).contains(&n_tokens)
+    PrefixStore::is_store_stub_len(n_tokens)
 }
 
 fn is_host_stub_boundary(n_tokens: u32, n_ubatch: u32) -> bool {
@@ -1917,7 +1917,7 @@ fn push_prefix_ckpt(slot: &mut Slot, n_tokens: u32, data: Vec<u8>) {
     );
 }
 
-/// Drop unprotected middles. Newest and 8k–16k stubs stay even if the byte
+/// Drop unprotected middles. Newest and store stubs stay even if the byte
 /// cap is still exceeded (a single Qwen FA 70k dump is ~4 GiB).
 ///
 /// Eviction direction is intentional: the chain keeps the newest + store-stub
@@ -1978,7 +1978,7 @@ fn host_chain_bytes(slots: &[Slot]) -> usize {
 /// `HOST_RAM_CAP`. Drop the longest `PrefixStore` dump first
 /// (`evict_global_over_cap` / `pick_longest_victim`), then the shortest
 /// unprotected middle of each slot chain (`trim_prefix_chain`). The shortest
-/// tool head (8k–16k store stub) and each slot's newest anchor are kept last.
+/// tool head (store stub) and each slot's newest anchor are kept last.
 fn enforce_host_ram_cap(
     slots: &mut [Slot],
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
@@ -2197,11 +2197,25 @@ fn restore_host_snapshot(
     if search_len == 0 {
         return None;
     }
-    let host = prefix_store
-        .lock()
-        .unwrap()
-        .find_best_for_bind(prompt, reuse_len);
-    let host_ckpt = host?;
+    let host_ckpt = {
+        let mut store = prefix_store.lock().unwrap();
+        match store.find_best_for_bind(prompt, reuse_len) {
+            Some(ckpt) => ckpt,
+            None => {
+                if let Some(diag) = store.miss_diag(prompt) {
+                    tracing::warn!(
+                        slot = slot.id.0,
+                        reuse_len,
+                        search_len,
+                        lcp = diag.max_lcp,
+                        store_ns = ?diag.store_ns,
+                        "host snapshot miss"
+                    );
+                }
+                return None;
+            }
+        }
+    };
     tracing::info!(
         slot = slot.id.0,
         reuse_len,
@@ -2548,14 +2562,22 @@ mod tests {
     fn host_stub_boundary_is_stride_in_window() {
         assert!(is_host_stub_boundary(12_288, 2048));
         assert!(is_host_stub_boundary(8_192, 2048));
+        assert!(is_host_stub_boundary(6_144, 2048));
         assert!(is_host_stub_boundary(16_384, 2048));
+        assert!(
+            !is_host_stub_boundary(4_096, 2048),
+            "4096 is below STORE_STUB_MIN"
+        );
         assert!(!is_host_stub_boundary(2_048, 2048));
         assert!(!is_host_stub_boundary(18_432, 2048));
         assert!(!is_host_stub_boundary(12_545, 2048));
         assert!(is_last_host_stub(16_384));
         assert!(!is_last_host_stub(12_288));
-        // CUDA n_ubatch=512 still hits the 2048 stride.
+        assert!(!is_last_host_stub(6_144));
+        // CUDA n_ubatch=512 and DeepSeek 1024 still hit the 2048 stride.
         assert!(is_host_stub_boundary(12_288, 512));
+        assert!(is_host_stub_boundary(6_144, 512));
+        assert!(is_host_stub_boundary(6_144, 1024));
         assert!(!is_host_stub_boundary(8_704, 512));
     }
 
@@ -2682,6 +2704,16 @@ mod tests {
         let mut prompt = head.clone();
         prompt.extend((0..1_000).map(|i| (100 + i % 3) as Token));
         (head, prompt)
+    }
+
+    /// Shared tool/cwd head then per-project tokens (task #8910: LCP 6436).
+    fn split_at_lcp(lcp: usize, n: usize) -> (Vec<Token>, Vec<Token>) {
+        let shared: Vec<Token> = (0..lcp).map(|i| (i % 7) as Token).collect();
+        let mut a = shared.clone();
+        a.extend((lcp..n).map(|i| 100 + (i % 3) as Token));
+        let mut b = shared;
+        b.extend((lcp..n).map(|i| 200 + (i % 5) as Token));
+        (a, b)
     }
 
     fn ckpt_n(n: u32, fill: u8) -> SeqCheckpoint {
@@ -2934,7 +2966,7 @@ mod tests {
     /// Global host-RAM cap test: when `PrefixStore.total_bytes` + all slot
     /// chain bytes cross the cap, drop the longest `PrefixStore` dump first,
     /// then each slot chain's unprotected middle. The shortest tool head
-    /// (store stub, 8k–16k) and each slot's newest anchor survive.
+    /// (store stub, 6k–16k) and each slot's newest anchor survive.
     #[test]
     fn host_ram_cap_evicts_long_store_middle_keeps_shortest_head_and_newest() {
         // Slot 0 chain: newest 60k + mid 30k + store stub 12288.
@@ -2980,6 +3012,71 @@ mod tests {
         let s1_kept: Vec<u32> = s1.prefix_ckpts.iter().map(|c| c.n_tokens).collect();
         assert!(s1_kept.contains(&40_000), "newest 40k kept");
         assert!(!s1_kept.contains(&20_000), "mid 20k dropped");
+    }
+
+    #[test]
+    fn empty_slot_bind_8192_miss_when_lcp_is_6436() {
+        // Task #8910: store has an 8192 dump of session A. Session B shares
+        // only 6436 tokens, so find_best misses and bind must full-prefill.
+        let lcp = 6_436;
+        let (sess_a, sess_b) = split_at_lcp(lcp, 11_283);
+        let mut slot = Slot::new(SlotId(0));
+        assert!(slot.prefix_cache.tokens.is_empty());
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        store
+            .lock()
+            .unwrap()
+            .put(sess_a[..8_192].to_vec(), ckpt_n(8_192, 0x81));
+        let kv = FakeSeqKv::new();
+
+        let bound = bind_slot(&mut slot, job_with_tokens(sess_b), &kv, 40_000, &store);
+        assert!(bound);
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 0,
+            "8192 dump is past LCP 6436; empty slot must full-prefill"
+        );
+        assert_eq!(job.n_past, 0);
+        assert_eq!(
+            kv.seq_state_set_count(),
+            0,
+            "miss must not seq_state_set a mismatched dump"
+        );
+        assert_eq!(kv.n_past_seq(0), 0);
+    }
+
+    #[test]
+    fn empty_slot_bind_6144_hit_when_8192_diverges() {
+        // Same two sessions as #8910. Store has both 6144 (shared) and 8192
+        // (per-project). Empty-slot bind of session B must restore 6144.
+        let lcp = 6_436;
+        let (sess_a, sess_b) = split_at_lcp(lcp, 11_283);
+        let mut slot = Slot::new(SlotId(0));
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        {
+            let mut g = store.lock().unwrap();
+            g.put(sess_a[..8_192].to_vec(), ckpt_n(8_192, 0x81));
+            g.put(sess_a[..6_144].to_vec(), ckpt_n(6_144, 0x61));
+        }
+        let kv = FakeSeqKv::new();
+        let n_prompt = sess_b.len() as u32;
+
+        let bound = bind_slot(&mut slot, job_with_tokens(sess_b), &kv, 40_000, &store);
+        assert!(bound, "empty-slot bind with 6144 store hit must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 6_144,
+            "reused == 6144 (below LCP 6436; 8192 is not usable)"
+        );
+        assert_eq!(job.n_past, 6_144);
+        assert_eq!(job.n_prompt, n_prompt);
+        assert_eq!(kv.n_past_seq(0), 6_144);
+        assert_eq!(kv.seq_state_set_count(), 1);
+        assert_eq!(kv.seq_state_get(0), Some(vec![0x61; 6_144]));
+        assert!(
+            slot.prefix_cache.tokens.is_empty(),
+            "lookup used the new prompt, not prefix_cache.tokens"
+        );
     }
 
     #[test]
@@ -3030,6 +3127,42 @@ mod tests {
         assert_eq!(ckpt.data, vec![0xCD; 12_288]);
         // If apply_plan keyed by prefix_cache.tokens (empty), snapshot_key
         // would return None and the store would stay empty.
+    }
+
+    #[test]
+    fn apply_plan_promotes_stub_window_not_below_min() {
+        let cases: &[(u32, bool)] = &[(4_096, false), (6_144, true), (8_192, true), (12_288, true)];
+        for &(n, want) in cases {
+            let mut slot = Slot::new(SlotId(0));
+            let prompt: Vec<Token> = (0..20_000).map(|i| (i % 7) as Token).collect();
+            slot.occupy(ActiveJob::for_test(prompt.clone()));
+            let kv = FakeSeqKv::with_n_ubatch(2048);
+            kv.seed_state(0, vec![0xCD; n as usize]);
+            let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+            let plan = crate::batch::BatchPlan {
+                prefill_consumed: vec![(SlotId(0), n)],
+                ..Default::default()
+            };
+            apply_plan(std::slice::from_mut(&mut slot), &plan, &kv, &store);
+            let g = store.lock().unwrap();
+            if want {
+                assert_eq!(g.len(), 1, "n={n} must promote into the store");
+                let (key, ckpt) = g.entries.iter().next().expect("promoted");
+                assert_eq!(key.len(), n as usize, "n={n} key length");
+                assert_eq!(&key[..], &prompt[..n as usize], "n={n} key is prompt head");
+                assert_eq!(ckpt.n_tokens, n);
+            } else {
+                assert_eq!(
+                    g.len(),
+                    0,
+                    "n={n} is below STORE_STUB_MIN; must not promote"
+                );
+            }
+            assert!(
+                slot.prefix_ckpts.is_empty(),
+                "n={n}: only the last stub (16384) belongs on the chain"
+            );
+        }
     }
 
     #[tokio::test]

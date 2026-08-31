@@ -324,7 +324,8 @@ pub struct Slot {
     /// Prefill-end snapshot. DSV4 cannot `seq_rm` a long generated suffix
     /// (`n_rs_seq` is tiny), so the next bind restores this then trims 1 token.
     /// P8-A semantic anchor chain: prefill-end snapshots plus at most one
-    /// 8k–16k store stub, ascending by `n_tokens`. Same `n_tokens` replaces;
+    /// store stub (last stride in the 6k–16k window), ascending by `n_tokens`.
+    /// Same `n_tokens` replaces;
     /// a longer new anchor appends. `settle_prefix_kv` binds from the longest
     /// anchor with `n_tokens <= reuse_len + 1`. Bind then drops
     /// `n_tokens > reuse_len + 1` so affinity_bar cannot report a previous

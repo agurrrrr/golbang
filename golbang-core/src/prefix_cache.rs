@@ -318,6 +318,15 @@ impl SlotPrefixCache {
     }
 }
 
+/// Bind-miss numbers for the journal. Empty store → [`PrefixStore::miss_diag`]
+/// returns `None` so a first-request miss stays silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixStoreMiss {
+    pub max_lcp: usize,
+    /// Resident dump lengths, longest first. No key tokens.
+    pub store_ns: Vec<u32>,
+}
+
 /// Cross-slot host snapshot map (P8-B).
 ///
 /// Each entry is a `SeqCheckpoint` captured at a known token length
@@ -367,13 +376,14 @@ impl PrefixStore {
     /// One tool head plus a handful of system prompts — never a ubatch trail.
     pub const DEFAULT_MAX_ENTRIES: usize = 8;
 
-    /// Store-stub window (mirrors `scheduler::STORE_STUB_*`): dumps inside the
-    /// shared tool/system head are the shortest tool anchors and are kept last
-    /// under the global host-RAM cap (HiCache L2, 4th stage).
-    pub const STORE_STUB_MIN: u32 = 8_192;
+    /// Store-stub window. Scheduler promotion/eviction must use these same
+    /// bounds. MIN sits below the current ~6191 tool-JSON head so a
+    /// cross-project empty slot (LCP 6436, task #8910) can restore.
+    pub const STORE_STUB_MIN: u32 = 6_144;
     pub const STORE_STUB_MAX: u32 = 16_384;
+    pub const STORE_STUB_STRIDE: u32 = 2_048;
 
-    fn is_store_stub_len(n_tokens: u32) -> bool {
+    pub(crate) fn is_store_stub_len(n_tokens: u32) -> bool {
         (Self::STORE_STUB_MIN..=Self::STORE_STUB_MAX).contains(&n_tokens)
     }
 
@@ -446,6 +456,23 @@ impl PrefixStore {
         self.find_best(prompt, host_search_len(prompt.len(), reuse_len))
     }
 
+    /// Numbers for a bind miss. `None` when the store is empty so a cold
+    /// start does not warn. Does not include key tokens.
+    pub fn miss_diag(&self, prompt: &[Token]) -> Option<PrefixStoreMiss> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mut store_ns: Vec<u32> = self.entries.values().map(|c| c.n_tokens).collect();
+        store_ns.sort_unstable_by(|a, b| b.cmp(a));
+        let max_lcp = self
+            .entries
+            .keys()
+            .map(|k| common_prefix_len(k, prompt))
+            .max()
+            .unwrap_or(0);
+        Some(PrefixStoreMiss { max_lcp, store_ns })
+    }
+
     /// Mark an entry recently used (advances the tick without changing data).
     fn touch(&mut self, prefix: &[Token]) {
         self.last_used_tick = self.last_used_tick.saturating_add(1);
@@ -463,7 +490,7 @@ impl PrefixStore {
             || (self.max_entries > 0 && self.entries.len() > self.max_entries)
     }
 
-    /// Drop the longest dump until the store's own caps hold. Includes 8k–16k
+    /// Drop the longest dump until the store's own caps hold. Includes 6k–16k
     /// stubs: production `put` only inserts those, so skipping them would
     /// make `max_entries` / `max_bytes` a no-op.
     fn evict_if_over_cap(&mut self) {
@@ -480,7 +507,7 @@ impl PrefixStore {
     }
 
     /// Longest dump, then oldest tick at the same length.
-    /// `skip_stubs` keeps 8k–16k tool heads (global host-RAM cap only).
+    /// `skip_stubs` keeps 6k–16k tool heads (global host-RAM cap only).
     fn pick_longest_victim(&self, skip_stubs: bool) -> Option<Vec<Token>> {
         self.entries
             .iter()
@@ -875,6 +902,97 @@ mod tests {
         assert_eq!(hit.data, vec![0xAB; 12_288]);
     }
 
+    /// Shared tool/cwd head then per-project tokens (task #8910: LCP 6436).
+    fn split_at_lcp(lcp: usize, n: usize) -> (Vec<Token>, Vec<Token>) {
+        let shared: Vec<Token> = (0..lcp).map(|i| (i % 7) as Token).collect();
+        let mut a = shared.clone();
+        a.extend((lcp..n).map(|i| 100 + (i % 3) as Token));
+        let mut b = shared;
+        b.extend((lcp..n).map(|i| 200 + (i % 5) as Token));
+        (a, b)
+    }
+
+    #[test]
+    fn prefix_store_bind_hits_6144_when_8192_diverges_at_6436() {
+        let lcp = 6_436;
+        let (sess_a, sess_b) = split_at_lcp(lcp, 9_000);
+        assert_eq!(common_prefix_len(&sess_a, &sess_b), lcp);
+
+        let mut store = PrefixStore::new();
+        store.put(sess_a[..8_192].to_vec(), ckpt(8_192, 0x81));
+        assert!(
+            store.find_best_for_bind(&sess_b, 0).is_none(),
+            "8192 dump includes per-project tokens past LCP 6436"
+        );
+
+        store.put(sess_a[..6_144].to_vec(), ckpt(6_144, 0x61));
+        let hit = store
+            .find_best_for_bind(&sess_b, 0)
+            .expect("6144 dump is below LCP 6436");
+        assert_eq!(hit.n_tokens, 6_144);
+        assert_eq!(hit.data, vec![0x61; 6_144]);
+    }
+
+    #[test]
+    fn prefix_store_miss_diag_silent_when_empty() {
+        let store = PrefixStore::new();
+        assert!(
+            store.miss_diag(&t(&[1, 2, 3])).is_none(),
+            "cold-start miss must not journal"
+        );
+    }
+
+    #[test]
+    fn prefix_store_miss_diag_reports_lcp_and_store_ns() {
+        let lcp = 6_436;
+        let (sess_a, sess_b) = split_at_lcp(lcp, 13_000);
+        let mut store = PrefixStore::new();
+        store.put(sess_a[..8_192].to_vec(), ckpt(8_192, 0x81));
+        store.put(sess_a[..12_288].to_vec(), ckpt(12_288, 0xC0));
+        let diag = store.miss_diag(&sess_b).expect("store not empty");
+        assert_eq!(diag.max_lcp, lcp, "longest LCP is the cwd split, not 8192");
+        assert_eq!(
+            diag.store_ns,
+            vec![12_288, 8_192],
+            "lengths only; longest first"
+        );
+    }
+
+    #[test]
+    fn prefix_store_entry_cap_two_sessions_keeps_6144_and_12288() {
+        // MIN=6144 → 6 stubs/session. Shared 6144 is one key; later dumps
+        // diverge. Cap 8 drops the longest (16384, then 14336). 12288 and
+        // 6144 stay, so a same-project empty slot can still restore 12k.
+        let mut store = PrefixStore::new();
+        let window: [u32; 6] = [6_144, 8_192, 10_240, 12_288, 14_336, 16_384];
+        for sess in 0..2u32 {
+            for &n in &window {
+                let prefix: Vec<Token> = (0..n)
+                    .map(|i| {
+                        if i < 6_144 {
+                            i as Token
+                        } else {
+                            (sess * 1_000 + i) as Token
+                        }
+                    })
+                    .collect();
+                store.put(prefix, ckpt(n, sess as u8));
+            }
+        }
+        assert_eq!(store.len(), PrefixStore::DEFAULT_MAX_ENTRIES);
+        let ns: Vec<u32> = {
+            let mut v: Vec<u32> = store.entries.values().map(|c| c.n_tokens).collect();
+            v.sort_unstable();
+            v
+        };
+        assert!(ns.contains(&6_144), "6144 shared head must survive");
+        assert!(
+            ns.contains(&12_288),
+            "12288 must survive the MIN=6144 window"
+        );
+        assert!(!ns.contains(&16_384), "longest dumps evicted first");
+    }
+
     #[test]
     fn prefix_store_skips_empty_or_mismatched_key() {
         let mut store = PrefixStore::new();
@@ -885,7 +1003,7 @@ mod tests {
 
     #[test]
     fn prefix_store_entry_cap_evicts_stubs() {
-        // Production put() only inserts 8k–16k stubs. The store's own
+        // Production put() only inserts 6k–16k stubs. The store's own
         // max_entries must still shrink once only stubs remain.
         let mut store = PrefixStore::new();
         let mut keys = Vec::new();
