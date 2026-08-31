@@ -154,6 +154,9 @@ fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
                 .reasoning_effort
                 .clone()
                 .or_else(|| state.chat.reasoning_effort.clone()),
+            // Chat default per the GLM-5.3 card: drop previous-turn thinking.
+            // The request field overrides; Qwen/DSV4 templates ignore the var.
+            clear_thinking: Some(req.clear_thinking.unwrap_or(true)),
             tools,
         },
     );

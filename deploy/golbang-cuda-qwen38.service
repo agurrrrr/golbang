@@ -1,7 +1,7 @@
 [Unit]
 Description=golbang OpenAI server - Qwen3.8-27B UD-IQ2_S (RTX 3060 CUDA)
 After=network.target
-Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service
+Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service
 
 [Service]
 Type=simple

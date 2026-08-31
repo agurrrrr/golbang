@@ -94,7 +94,9 @@ struct Args {
     #[arg(long, env = "GOLBANG_CHAT_TEMPLATE_FILE")]
     chat_template_file: Option<PathBuf>,
 
-    /// Default Qwen3.8 jinja `reasoning_effort`: xhigh | medium | low.
+    /// Default jinja `reasoning_effort`. Qwen3.8: xhigh | medium | low.
+    /// GLM-5.3: low | high | max (template default is max; `xhigh` is a
+    /// Qwen-only level and is rejected here).
     #[arg(long, env = "GOLBANG_REASONING_EFFORT")]
     reasoning_effort: Option<String>,
 
@@ -208,9 +210,11 @@ fn normalize_reasoning_effort(s: Option<&str>) -> Option<String> {
     match s.map(str::trim).filter(|s| !s.is_empty()) {
         None => None,
         Some(v) => match v.to_ascii_lowercase().as_str() {
-            "xhigh" | "high" => Some("xhigh".into()),
-            "medium" => Some("medium".into()),
-            "low" => Some("low".into()),
+            // Qwen3.8 levels. The template aliases high → xhigh itself, so
+            // pass through unchanged (deploy/golbang-qwen38 uses `high`).
+            "xhigh" | "high" | "medium" | "low" => Some(v.to_ascii_lowercase()),
+            // GLM-5.3 only.
+            "max" => Some("max".into()),
             other => {
                 tracing::warn!(other, "unknown --reasoning-effort; using template default");
                 None

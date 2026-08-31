@@ -1,7 +1,7 @@
 [Unit]
 Description=golbang OpenAI server - Qwen3.8-27B Uncensored Q6_K (MI50)
 After=network.target
-Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-qwen38.service
+Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-qwen38.service golbang-glm53flash.service
 
 [Service]
 Type=simple

@@ -35,7 +35,12 @@ pub struct ChatApplyOpts {
     pub bos_token: String,
     pub enable_thinking: bool,
     /// Qwen3.8 jinja: `xhigh` | `medium` | `low`. `None` → template default (`xhigh`).
+    /// GLM-5.3 jinja: `low` | `high`; anything else renders as `max`.
     pub reasoning_effort: Option<String>,
+    /// GLM-5.3 jinja `clear_thinking`. `true` drops previous-turn thinking
+    /// and pins an empty `<think></think>`; template default is `false`
+    /// (Z.ai card: set true for chat). `None` → template default.
+    pub clear_thinking: Option<bool>,
     /// OpenAI `tools` array. Empty = do not inject the template tools header.
     pub tools: Vec<serde_json::Value>,
 }
@@ -134,6 +139,14 @@ fn apply_jinja(
         None => Value::UNDEFINED,
     };
 
+    // GLM-5.3: `clear_thinking if clear_thinking is defined else false`.
+    // A present `none` would not trigger the template default, so absent
+    // means UNDEFINED here too.
+    let clear_thinking = match opts.clear_thinking {
+        Some(v) => Value::from(v),
+        None => Value::UNDEFINED,
+    };
+
     tmpl.render(context! {
         messages => msgs,
         tools => tools,
@@ -143,6 +156,7 @@ fn apply_jinja(
         thinking => opts.enable_thinking,
         enable_thinking => opts.enable_thinking,
         reasoning_effort => reasoning_effort,
+        clear_thinking => clear_thinking,
     })
     .map_err(|e| format!("render chat template: {e}"))
 }
@@ -694,4 +708,132 @@ mod tests {
             applied.prompt
         );
     }
+
+    fn glm53_opts() -> ChatApplyOpts {
+        ChatApplyOpts {
+            jinja: true,
+            template: Some(
+                include_str!("../tests/fixtures/glm53_chat_template.jinja").to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// GLM-5.3 jinja: effort defaults to `max`, generation prompt is the bare
+    /// `<|assistant|><think>` (no trailing newline). `prompt_opens_think`
+    /// must catch it so think tokens land in `reasoning_content`.
+    #[test]
+    fn glm53_jinja_default_effort_max_and_bare_think_gen_prompt() {
+        let applied = apply_chat_template_with(&[msg("user", "1+1=")], &glm53_opts());
+        assert!(applied.used_jinja, "glm53 jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied.prompt.contains("Reasoning Effort: Max"),
+            "missing default max effort:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.starts_with("[gMASK]<sop>"),
+            "missing GLM bos prefix:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.ends_with("<|assistant|><think>"),
+            "bad gen prefix:\n{}",
+            applied.prompt
+        );
+    }
+
+    #[test]
+    fn glm53_jinja_effort_low_high_pass_xhigh_falls_to_max() {
+        for (effort, want) in [
+            ("low", "Reasoning Effort: Low"),
+            ("high", "Reasoning Effort: High"),
+            ("max", "Reasoning Effort: Max"),
+            // Template maps anything outside low/high to max — xhigh must not
+            // reach this model as a distinct level.
+            ("xhigh", "Reasoning Effort: Max"),
+        ] {
+            let opts = ChatApplyOpts {
+                reasoning_effort: Some(effort.into()),
+                ..glm53_opts()
+            };
+            let applied = apply_chat_template_with(&[msg("user", "1+1=")], &opts);
+            assert!(
+                applied.used_jinja,
+                "glm53 jinja failed for {effort}:\n{}",
+                applied.prompt
+            );
+            assert!(
+                applied.prompt.contains(want),
+                "effort {effort} must render {want}:\n{}",
+                applied.prompt
+            );
+        }
+    }
+
+    fn assistant_with_think(content: &str, reasoning: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: content.into(),
+            reasoning_content: Some(reasoning.into()),
+            ..Default::default()
+        }
+    }
+
+    /// `clear_thinking=true` (Z.ai chat card): thinking from previous turns is
+    /// dropped and replaced by an empty `<think></think>`. `false` keeps it.
+    #[test]
+    fn glm53_jinja_clear_thinking_true_drops_history_think() {
+        let messages = &[
+            msg("user", "1+1="),
+            assistant_with_think("2", "old thoughts"),
+            msg("user", "그럼 2+3은?"),
+        ];
+
+        let cleared = apply_chat_template_with(
+            messages,
+            &ChatApplyOpts {
+                clear_thinking: Some(true),
+                ..glm53_opts()
+            },
+        );
+        assert!(cleared.used_jinja, "glm53 jinja failed:\n{}", cleared.prompt);
+        assert!(
+            !cleared.prompt.contains("old thoughts"),
+            "cleared prompt must drop previous thinking:\n{}",
+            cleared.prompt
+        );
+        assert!(
+            cleared.prompt.contains("<think></think>"),
+            "cleared history must pin an empty think block:\n{}",
+            cleared.prompt
+        );
+        assert!(
+            cleared.prompt.ends_with("<|assistant|><think>"),
+            "bad gen prefix:\n{}",
+            cleared.prompt
+        );
+
+        let kept = apply_chat_template_with(
+            messages,
+            &ChatApplyOpts {
+                clear_thinking: Some(false),
+                ..glm53_opts()
+            },
+        );
+        assert!(
+            kept.prompt.contains("<think>old thoughts</think>"),
+            "clear_thinking=false must keep previous thinking:\n{}",
+            kept.prompt
+        );
+
+        // Absent (template default false) behaves like false.
+        let default = apply_chat_template_with(messages, &glm53_opts());
+        assert!(
+            default.prompt.contains("old thoughts"),
+            "absent clear_thinking must keep previous thinking:\n{}",
+            default.prompt
+        );
+    }
 }
+

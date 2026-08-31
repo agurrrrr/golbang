@@ -17,9 +17,14 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Vec<serde_json::Value>,
     pub tool_choice: Option<serde_json::Value>,
-    /// Qwen3.8 jinja: `xhigh` | `high` | `medium` | `low`.
+    /// GLM-5.3: `low` | `high` | `max` (template maps the rest to `max`).
+    /// Qwen3.8: `xhigh` | `high` | `medium` | `low`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// GLM-5.3 jinja. `true` (chat default) drops previous-turn thinking;
+    /// `false` keeps it in the prompt. Qwen/DSV4 ignore it.
+    #[serde(default)]
+    pub clear_thinking: Option<bool>,
     /// Max tokens inside `<think>` before `</think>` is forced.
     /// `None` = server default. `0` / negative = unlimited.
     /// Alias matches llama-server `reasoning_budget_tokens`.
@@ -387,6 +392,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             reasoning_effort: None,
+            clear_thinking: None,
             reasoning_budget: None,
             return_progress: None,
         };
@@ -418,6 +424,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             reasoning_effort: None,
+            clear_thinking: None,
             reasoning_budget: None,
             return_progress: None,
         };
