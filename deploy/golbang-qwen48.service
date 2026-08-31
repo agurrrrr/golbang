@@ -11,7 +11,7 @@ WorkingDirectory=/home/agurrrrr/code/golbang
 Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
 Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
-Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-upgrade/build/bin
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build/bin
 Environment=RUST_LOG=info
 ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
 ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
