@@ -22,6 +22,7 @@ use crate::prefix_cache::{PrefixStore, common_prefix_len, host_search_len, snaps
 use crate::slot::{ActiveJob, SeqCheckpoint, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 use crate::speculative::accept_drafts;
 use crate::tokenizer::Token;
+use crate::tools::{DsmlNameGuard, dsml_invoke_name_eq_text};
 
 #[derive(Debug)]
 pub enum SubmitError {
@@ -343,11 +344,7 @@ async fn run_loop(
                         .iter_mut()
                         .find(|s| s.id == id)
                         .and_then(|s| s.job.as_mut())
-                        .map(|j| {
-                            j.think
-                                .forced_token()
-                                .unwrap_or_else(|| j.sampler.sample(row))
-                        })
+                        .map(|j| j.forced_token().unwrap_or_else(|| j.sampler.sample(row)))
                 })
                 .unwrap_or(0)
             }) {
@@ -706,6 +703,7 @@ fn bind_slot(
         job.images,
     ));
     arm_think_budget(slot, engine);
+    arm_dsml_guard(slot, engine);
     if let Some(active) = slot.job.as_ref() {
         emit_prompt_progress(active);
     }
@@ -801,6 +799,7 @@ fn bind_vision_slot(slot: &mut Slot, job: Job, engine: &Engine, ctx_cap: u32) ->
         job.images,
     ));
     arm_think_budget(slot, engine);
+    arm_dsml_guard(slot, engine);
     if let Some(active) = slot.job.as_mut() {
         active.started = eval_t0;
         active.generation_started_at = Some(Instant::now());
@@ -869,11 +868,39 @@ fn arm_think_budget(slot: &mut Slot, engine: &impl SeqKv) {
     }
 }
 
+fn arm_dsml_guard(slot: &mut Slot, engine: &impl SeqKv) {
+    let Some(job) = slot.job.as_mut() else {
+        return;
+    };
+    if !job.dsml_force_invoke_name {
+        return;
+    }
+    match engine.tokenize_special(dsml_invoke_name_eq_text()) {
+        Ok(toks) if !toks.is_empty() => {
+            job.dsml = DsmlNameGuard::new(toks);
+            tracing::info!(
+                slot = slot.id.0,
+                request_id = job.request_id,
+                force_n = job.dsml.force_len(),
+                "dsml invoke name= guard armed"
+            );
+        }
+        Ok(_) => tracing::warn!(
+            slot = slot.id.0,
+            "dsml name guard: empty tokenization; disabled"
+        ),
+        Err(e) => tracing::warn!(
+            slot = slot.id.0,
+            error = %e,
+            "dsml name guard: tokenize failed"
+        ),
+    }
+}
+
 fn sample_from_existing_logits(slot: &mut Slot, engine: &Engine) -> crate::error::Result<()> {
     let row = engine.last_logits()?;
     let token = match slot.job.as_mut() {
         Some(job) => job
-            .think
             .forced_token()
             .unwrap_or_else(|| job.sampler.sample(&row)),
         None => return Ok(()),
@@ -1299,14 +1326,23 @@ fn push_token(slot: &mut Slot, engine: &Engine, token: Token) -> bool {
     job.generated.push(token);
     job.pending = Some(token);
     slot.phase = SlotPhase::Decoding;
-    let was_forcing = job.think.is_forcing();
+    let was_forcing_think = job.think.is_forcing();
+    let was_forcing_dsml = job.dsml.is_forcing();
     job.think.on_emit(&piece);
-    if !was_forcing && job.think.is_forcing() {
+    job.dsml.on_emit(&piece);
+    if !was_forcing_think && job.think.is_forcing() {
         tracing::info!(
             slot = slot.id.0,
             request_id = job.request_id,
             think_n = job.think.think_tokens(),
             "reasoning budget exhausted; forcing </think>"
+        );
+    }
+    if !was_forcing_dsml && job.dsml.is_forcing() {
+        tracing::info!(
+            slot = slot.id.0,
+            request_id = job.request_id,
+            "dsml invoke: forcing name=\""
         );
     }
     maybe_log_decode_progress(slot.id.0, job);

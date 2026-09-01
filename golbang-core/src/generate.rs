@@ -38,6 +38,8 @@ pub struct GenerateParams {
     pub reasoning_budget: u32,
     /// Prompt already closed with `<think>` (Qwen3.8 / DSV4 jinja).
     pub start_in_think: bool,
+    /// Tools are in the prompt. Force DSML ` name="` after `<｜DSML｜invoke`.
+    pub dsml_force_invoke_name: bool,
 }
 
 impl Default for GenerateParams {
@@ -51,6 +53,7 @@ impl Default for GenerateParams {
             stop: Vec::new(),
             reasoning_budget: 0,
             start_in_think: false,
+            dsml_force_invoke_name: false,
         }
     }
 }

@@ -43,5 +43,8 @@ pub use slot::{Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
 pub use speculative::{SpecParams, SpecType, parse_ggml_type};
 pub use tokenizer::{Token, Tokenizer};
 pub use tokio_util::sync::CancellationToken;
-pub use tools::{ParsedTools, ToolCall, ToolCallParser, parse_tool_calls};
+pub use tools::{
+    DsmlNameGuard, ParsedTools, ToolCall, ToolCallParser, dsml_invoke_name_eq_text,
+    parse_tool_calls,
+};
 pub use vision::{MEDIA_MARKER, load_media_bytes};

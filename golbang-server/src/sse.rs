@@ -67,6 +67,7 @@ pub fn generate_params(
             0
         },
         start_in_think: extracts && prompt_opens_think(prompt),
+        dsml_force_invoke_name: req.tools_enabled(),
     }
 }
 

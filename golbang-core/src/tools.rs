@@ -7,7 +7,13 @@
 
 use serde_json::{Map, Value};
 
+use crate::tokenizer::Token;
+
 const DSML: &str = "｜DSML｜";
+/// DSV4 vocab has `｜DSML｜` as one token, then BPE-splits `invoke` as `inv`+`oke`.
+/// After that the next sampled token must be ` name="`, not `_limit` (#8967).
+const DSML_INVOKE: &str = "<｜DSML｜invoke";
+const DSML_INVOKE_NAME_EQ: &str = " name=\"";
 
 const START_MARKERS: &[&str] = &[
     "<｜DSML｜tool_calls>",
@@ -119,6 +125,13 @@ pub fn parse_tool_calls(text: &str) -> ParsedTools {
 
         let mut found = parse_block(block);
         if found.is_empty() {
+            if is_dsml_markup(block) {
+                tracing::warn!(
+                    preview = %preview_block(block),
+                    "unparsed DSML tool block dropped (not leaked to content)"
+                );
+                continue;
+            }
             content.push_str(block);
             continue;
         }
@@ -172,7 +185,7 @@ fn parse_dsml(block: &str) -> Vec<ToolCall> {
             break;
         };
         let header = &block[after_open..after_open + gt];
-        let Some(name) = attr_value(header, "name") else {
+        let Some(name) = invoke_name(header) else {
             search = after_open;
             continue;
         };
@@ -503,12 +516,151 @@ fn param_value(raw: &str, is_string: bool) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
+fn invoke_name(header: &str) -> Option<String> {
+    if let Some(name) = attr_value(header, "name") {
+        if is_glm_tool_name(&name) {
+            return Some(name);
+        }
+    }
+    // `<｜DSML｜invoke get_history>` — name as the tag body, no attribute.
+    // Reject `_limit"` fused-parameter leftovers from #8967.
+    let ident = header.trim();
+    if ident.starts_with('_') {
+        return None;
+    }
+    if is_glm_tool_name(ident) {
+        return Some(ident.to_string());
+    }
+    None
+}
+
 fn attr_value(header: &str, key: &str) -> Option<String> {
-    let pat = format!("{key}=\"");
-    let i = header.find(&pat)?;
-    let start = i + pat.len();
-    let end = header[start..].find('"')?;
-    Some(header[start..start + end].to_string())
+    let dq = format!("{key}=\"");
+    if let Some(i) = header.find(&dq) {
+        let start = i + dq.len();
+        if let Some(end) = header[start..].find('"') {
+            return Some(header[start..start + end].to_string());
+        }
+    }
+    let sq = format!("{key}='");
+    if let Some(i) = header.find(&sq) {
+        let start = i + sq.len();
+        if let Some(end) = header[start..].find('\'') {
+            return Some(header[start..start + end].to_string());
+        }
+    }
+    let bare = format!("{key}=");
+    let i = header.find(&bare)?;
+    let start = i + bare.len();
+    let rest = &header[start..];
+    if rest.starts_with('"') || rest.starts_with('\'') {
+        return None;
+    }
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn is_dsml_markup(block: &str) -> bool {
+    block.contains(DSML_INVOKE)
+        || block.contains("<｜DSML｜tool_calls>")
+        || block.contains("<｜DSML｜function_calls>")
+}
+
+fn preview_block(block: &str) -> String {
+    const N: usize = 160;
+    if block.chars().count() <= N {
+        return block.to_string();
+    }
+    block.chars().take(N).collect::<String>() + "…"
+}
+
+/// After `<｜DSML｜invoke`, force the ` name="` bytes llama.cpp's PEG requires.
+///
+/// DSV4 has no `invoke` token: the tag is `｜DSML｜` + `inv` + `oke`. The next
+/// sample is then free to pick `_limit` (task #8967), which the parser cannot
+/// turn into a tool name. Forcing ` name="` restores the documented DSML form.
+#[derive(Clone, Debug, Default)]
+pub struct DsmlNameGuard {
+    acc: String,
+    force: Vec<Token>,
+    force_at: Option<usize>,
+}
+
+impl DsmlNameGuard {
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn new(name_eq: Vec<Token>) -> Self {
+        if name_eq.is_empty() {
+            return Self::disabled();
+        }
+        Self {
+            acc: String::new(),
+            force: name_eq,
+            force_at: None,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.force.is_empty()
+    }
+
+    pub fn is_forcing(&self) -> bool {
+        self.force_at.is_some()
+    }
+
+    pub fn force_len(&self) -> usize {
+        self.force.len()
+    }
+
+    pub fn forced_token(&self) -> Option<Token> {
+        self.force_at.and_then(|i| self.force.get(i).copied())
+    }
+
+    pub fn on_emit(&mut self, piece: &str) {
+        if !self.enabled() {
+            return;
+        }
+        if let Some(i) = self.force_at {
+            self.acc.push_str(piece);
+            trim_suffix_acc(&mut self.acc, 80);
+            let next = i + 1;
+            if next >= self.force.len() {
+                self.force_at = None;
+            } else {
+                self.force_at = Some(next);
+            }
+            return;
+        }
+        self.acc.push_str(piece);
+        trim_suffix_acc(&mut self.acc, 80);
+        if self.acc.ends_with(DSML_INVOKE) {
+            self.force_at = Some(0);
+        }
+    }
+}
+
+fn trim_suffix_acc(acc: &mut String, keep: usize) {
+    if acc.len() <= keep {
+        return;
+    }
+    let mut start = acc.len() - keep;
+    while start < acc.len() && !acc.is_char_boundary(start) {
+        start += 1;
+    }
+    acc.replace_range(..start, "");
+}
+
+pub fn dsml_invoke_name_eq_text() -> &'static str {
+    DSML_INVOKE_NAME_EQ
 }
 
 fn extract_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
@@ -615,11 +767,7 @@ fn trim_tool_gaps(s: &str) -> String {
 }
 
 fn nonempty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]
@@ -725,12 +873,14 @@ golbang
         let mut p = ToolCallParser::new();
         assert_eq!(p.push("hello ").as_deref(), Some("hello "));
         assert!(p.push("<tool").is_none());
-        assert!(p
-            .push("_call>\n<tool_name>get_history</tool_name>\n")
-            .is_none());
-        assert!(p
-            .push("<parameters>{\"project_name\":\"test\"}</parameters>\n")
-            .is_none());
+        assert!(
+            p.push("_call>\n<tool_name>get_history</tool_name>\n")
+                .is_none()
+        );
+        assert!(
+            p.push("<parameters>{\"project_name\":\"test\"}</parameters>\n")
+                .is_none()
+        );
         assert!(p.push("</tool_call>").is_none());
         let done = p.finish();
         assert!(done.content.is_empty());
@@ -857,9 +1007,10 @@ golbang
         let mut p = ToolCallParser::new();
         assert_eq!(p.push("hello ").as_deref(), Some("hello "));
         assert!(p.push("<tool_call>bash").is_none());
-        assert!(p
-            .push("<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>")
-            .is_none());
+        assert!(
+            p.push("<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>")
+                .is_none()
+        );
         let done = p.finish();
         assert!(done.content.is_empty());
         assert_eq!(done.calls.len(), 1);
@@ -867,5 +1018,88 @@ golbang
         assert_eq!(done.calls[0].id, "call_1");
         let v: Value = serde_json::from_str(&done.calls[0].arguments).unwrap();
         assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn parse_dsml_single_quote_and_bare_name() {
+        let quoted = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name='read_file'>\n",
+            "<｜DSML｜parameter name='target_file' string='true'>a.ts</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let p = parse_tool_calls(quoted);
+        assert_eq!(p.calls[0].name, "read_file");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["target_file"], "a.ts");
+
+        let bare = concat!(
+            "<｜DSML｜invoke name=get_history>",
+            "<｜DSML｜parameter name=limit string=false>2</｜DSML｜parameter>",
+            "</｜DSML｜invoke>"
+        );
+        let p = parse_tool_calls(bare);
+        assert_eq!(p.calls[0].name, "get_history");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["limit"], 2);
+    }
+
+    #[test]
+    fn parse_dsml_body_name_without_attribute() {
+        let text = concat!(
+            "<｜DSML｜invoke get_history>",
+            "<｜DSML｜parameter name=\"limit\" string=\"false\">2</｜DSML｜parameter>",
+            "</｜DSML｜invoke>"
+        );
+        let p = parse_tool_calls(text);
+        assert_eq!(p.calls[0].name, "get_history");
+    }
+
+    #[test]
+    fn task8967_fused_invoke_limit_is_not_leaked() {
+        let text = concat!(
+            "이제 파일을 확인합니다.\n\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke_limit\">2</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let p = parse_tool_calls(text);
+        assert!(
+            p.calls.is_empty(),
+            "fused invoke_limit is not a tool: {:?}",
+            p.calls
+        );
+        assert_eq!(p.content, "이제 파일을 확인합니다.");
+        assert!(
+            !p.content.contains("DSML"),
+            "raw DSML must not leak: {:?}",
+            p.content
+        );
+    }
+
+    #[test]
+    fn dsml_name_guard_forces_after_invoke() {
+        let mut g = DsmlNameGuard::new(vec![11, 22]);
+        g.on_emit("hmm");
+        assert!(g.forced_token().is_none());
+        g.on_emit("<｜DSML｜tool_calls>\n<｜DSML｜inv");
+        assert!(g.forced_token().is_none());
+        g.on_emit("oke");
+        assert_eq!(g.forced_token(), Some(11));
+        g.on_emit(" name=");
+        assert_eq!(g.forced_token(), Some(22));
+        g.on_emit("\"");
+        assert!(g.forced_token().is_none());
+    }
+
+    #[test]
+    fn dsml_name_guard_skips_when_name_already_present() {
+        let mut g = DsmlNameGuard::new(vec![11]);
+        g.on_emit("<｜DSML｜invoke name=\"read_file\">");
+        assert!(
+            g.forced_token().is_none(),
+            "well-formed invoke must not force"
+        );
     }
 }

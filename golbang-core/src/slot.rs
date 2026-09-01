@@ -11,6 +11,7 @@ use crate::generate::{FinishReason, GenerateParams, GeneratedToken, Utf8Buf};
 use crate::reasoning::ThinkBudget;
 use crate::sampler::{Sampler, SamplerParams};
 use crate::tokenizer::Token;
+use crate::tools::DsmlNameGuard;
 
 /// Per-request stream from a slot back to the HTTP handler.
 #[derive(Debug)]
@@ -149,8 +150,10 @@ pub(crate) struct ActiveJob {
     pub acc: String,
     pub(crate) utf8: Utf8Buf,
     pub think: ThinkBudget,
+    pub dsml: DsmlNameGuard,
     pub reasoning_budget: u32,
     pub start_in_think: bool,
+    pub dsml_force_invoke_name: bool,
     pub cancel: CancellationToken,
     pub deadline: Option<Instant>,
     pub events: mpsc::UnboundedSender<SlotEvent>,
@@ -167,6 +170,12 @@ pub(crate) struct ActiveJob {
 }
 
 impl ActiveJob {
+    pub fn forced_token(&self) -> Option<Token> {
+        self.think
+            .forced_token()
+            .or_else(|| self.dsml.forced_token())
+    }
+
     /// llama-server `result_prompt_progress` snapshot for this request.
     pub fn prompt_progress(&self) -> SlotEvent {
         SlotEvent::PromptProgress {
@@ -232,8 +241,10 @@ impl ActiveJob {
             acc: String::new(),
             utf8: Utf8Buf::default(),
             think: ThinkBudget::disabled(),
+            dsml: DsmlNameGuard::disabled(),
             reasoning_budget: params.reasoning_budget,
             start_in_think: params.start_in_think,
+            dsml_force_invoke_name: params.dsml_force_invoke_name,
             cancel,
             deadline,
             events,
