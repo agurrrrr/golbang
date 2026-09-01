@@ -3,8 +3,8 @@
 //! `llama_chat_apply_template` is not a jinja parser. When `--jinja` is on we
 //! apply `tokenizer.chat_template` with minijinja (same idea as llama-server).
 
-use minijinja::{context, Environment, UndefinedBehavior, Value};
 use minijinja::value::Kwargs;
+use minijinja::{context, Environment, UndefinedBehavior, Value};
 use tracing::warn;
 
 use crate::tools::ToolCall;
@@ -126,10 +126,7 @@ fn apply_jinja(
     // `ensure_ascii=False`), so consume the flag and delegate to the builtin.
     env.add_filter(
         "tojson",
-        |value: Value,
-         indent: Option<Value>,
-         kwargs: Kwargs|
-         -> Result<Value, minijinja::Error> {
+        |value: Value, indent: Option<Value>, kwargs: Kwargs| -> Result<Value, minijinja::Error> {
             let _ensure_ascii: Option<Value> = kwargs.get("ensure_ascii")?;
             minijinja::filters::tojson(&value, indent, kwargs)
         },
@@ -729,9 +726,7 @@ mod tests {
     fn glm53_opts() -> ChatApplyOpts {
         ChatApplyOpts {
             jinja: true,
-            template: Some(
-                include_str!("../tests/fixtures/glm53_chat_template.jinja").to_string(),
-            ),
+            template: Some(include_str!("../tests/fixtures/glm53_chat_template.jinja").to_string()),
             ..Default::default()
         }
     }
@@ -742,7 +737,11 @@ mod tests {
     #[test]
     fn glm53_jinja_default_effort_max_and_bare_think_gen_prompt() {
         let applied = apply_chat_template_with(&[msg("user", "1+1=")], &glm53_opts());
-        assert!(applied.used_jinja, "glm53 jinja failed:\n{}", applied.prompt);
+        assert!(
+            applied.used_jinja,
+            "glm53 jinja failed:\n{}",
+            applied.prompt
+        );
         assert!(
             applied.prompt.contains("Reasoning Effort: Max"),
             "missing default max effort:\n{}",
@@ -814,7 +813,11 @@ mod tests {
                 ..glm53_opts()
             },
         );
-        assert!(cleared.used_jinja, "glm53 jinja failed:\n{}", cleared.prompt);
+        assert!(
+            cleared.used_jinja,
+            "glm53 jinja failed:\n{}",
+            cleared.prompt
+        );
         assert!(
             !cleared.prompt.contains("old thoughts"),
             "cleared prompt must drop previous thinking:\n{}",
@@ -915,5 +918,64 @@ mod tests {
             applied.prompt
         );
     }
-}
 
+    /// OpenAI `arguments` is a JSON string. GLM-5.3 jinja does
+    /// `_args.items()` (chat:163) and will ChatML-fallback if that is not a
+    /// mapping. `arguments_for_jinja` must expand it so a tool-call follow-up
+    /// stays on the GLM template (arg_key/arg_value), not ChatML.
+    #[test]
+    fn glm53_jinja_parses_openai_string_tool_arguments() {
+        let applied = apply_chat_template_with(
+            &[
+                msg("user", "이전 작업 조회해봐"),
+                assistant_tool_call("get_history", r#"{"project_name":"golbang","limit":5}"#),
+                ChatMessage {
+                    role: "tool".into(),
+                    content: "[]".into(),
+                    tool_call_id: Some("call_1".into()),
+                    ..Default::default()
+                },
+            ],
+            &glm53_opts(),
+        );
+        assert!(
+            applied.used_jinja,
+            "string arguments must not fall back to ChatML:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<tool_call>get_history"),
+            "missing GLM tool name:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied
+                .prompt
+                .contains("<arg_key>project_name</arg_key><arg_value>golbang</arg_value>"),
+            "string arguments must expand as arg_key/arg_value:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied
+                .prompt
+                .contains("<arg_key>limit</arg_key><arg_value>5</arg_value>"),
+            "numeric argument must use tojson:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<|observation|>"),
+            "missing GLM observation prefix:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.contains("<tool_response>[]</tool_response>"),
+            "missing tool response:\n{}",
+            applied.prompt
+        );
+        assert!(
+            applied.prompt.ends_with("<|assistant|><think>"),
+            "bad gen prefix:\n{}",
+            applied.prompt
+        );
+    }
+}

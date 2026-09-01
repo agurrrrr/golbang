@@ -1,6 +1,7 @@
 //! Parse model-emitted tool calls into OpenAI `tool_calls`.
 //!
 //! DSV4 jinja asks for DSML (`<｜DSML｜tool_calls>` / `invoke` / `parameter`).
+//! GLM-5.3 / GLM-4.7 jinja asks for `<tool_call>name<arg_key>…<arg_value>…`.
 //! Local agents also leak Shepherd/Hermes/Qwen XML into `content`. We convert
 //! all of those so the client sees structured `tool_calls` instead of raw tags.
 
@@ -148,6 +149,9 @@ fn parse_block(block: &str) -> Vec<ToolCall> {
         return vec![tc];
     }
     if let Some(tc) = parse_json_blob(strip_known_wrappers(block)) {
+        return vec![tc];
+    }
+    if let Some(tc) = parse_glm_arg_key(block) {
         return vec![tc];
     }
     Vec::new()
@@ -325,6 +329,85 @@ fn parameters_from_children(body: &str) -> Option<String> {
     } else {
         Some(Value::Object(map).to_string())
     }
+}
+
+/// GLM-4.6/4.7/5.3 native tool markup.
+/// Compact: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+/// Newline: `<tool_call>name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>`
+///
+/// Name must look like a tool identifier so prose that happens to contain a
+/// `<tool_call>` tag (shepherd leak parser) is not turned into a call.
+fn parse_glm_arg_key(block: &str) -> Option<ToolCall> {
+    let inner = strip_known_wrappers(block).trim();
+    if inner.is_empty() {
+        return None;
+    }
+    // Qwen `<function=` / `<tool_name>` / Hermes JSON: let those parsers win.
+    if inner.starts_with('<') || inner.starts_with('{') || inner.starts_with('[') {
+        return None;
+    }
+
+    const KEY_OPEN: &str = "<arg_key>";
+    const KEY_CLOSE: &str = "</arg_key>";
+    const VAL_OPEN: &str = "<arg_value>";
+    const VAL_CLOSE: &str = "</arg_value>";
+
+    let (name_raw, rest) = match inner.find(KEY_OPEN) {
+        Some(idx) => (&inner[..idx], &inner[idx..]),
+        None => {
+            if inner.contains(KEY_CLOSE) || inner.contains(VAL_OPEN) || inner.contains(VAL_CLOSE) {
+                return None;
+            }
+            (inner, "")
+        }
+    };
+    let name = name_raw.trim();
+    if !is_glm_tool_name(name) {
+        return None;
+    }
+
+    let mut map = Map::new();
+    let mut p = 0;
+    while let Some(rel) = rest[p..].find(KEY_OPEN) {
+        let ks = p + rel + KEY_OPEN.len();
+        let Some(ke) = rest[ks..].find(KEY_CLOSE) else {
+            break;
+        };
+        let key = rest[ks..ks + ke].trim();
+        let after_key = ks + ke + KEY_CLOSE.len();
+        let Some(vs_rel) = rest[after_key..].find(VAL_OPEN) else {
+            break;
+        };
+        let vs = after_key + vs_rel + VAL_OPEN.len();
+        let Some(ve) = rest[vs..].find(VAL_CLOSE) else {
+            break;
+        };
+        if !key.is_empty() {
+            let raw = &rest[vs..vs + ve];
+            map.insert(key.to_string(), param_value(raw, false));
+        }
+        p = vs + ve + VAL_CLOSE.len();
+    }
+
+    Some(ToolCall {
+        id: String::new(),
+        name: name.to_string(),
+        arguments: Value::Object(map).to_string(),
+    })
+}
+
+fn is_glm_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if name.len() > 128 {
+        return false;
+    }
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
 fn parse_json_blob(s: &str) -> Option<ToolCall> {
@@ -663,5 +746,126 @@ golbang
         let done = p.finish();
         assert!(done.calls.is_empty());
         assert!(done.content.is_empty());
+    }
+
+    #[test]
+    fn parse_glm53_compact_arg_key() {
+        let text = concat!(
+            "<tool_call>get_history",
+            "<arg_key>project_name</arg_key><arg_value>golbang</arg_value>",
+            "<arg_key>limit</arg_key><arg_value>5</arg_value>",
+            "</tool_call>"
+        );
+        let p = parse_tool_calls(text);
+        assert_eq!(p.calls.len(), 1, "content leaked: {:?}", p.content);
+        assert!(
+            p.content.is_empty(),
+            "glm markup must not leak: {:?}",
+            p.content
+        );
+        assert_eq!(p.calls[0].name, "get_history");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["project_name"], "golbang");
+        assert_eq!(v["limit"], 5);
+    }
+
+    #[test]
+    fn parse_glm46_newline_arg_key() {
+        let text = concat!(
+            "<tool_call>special_function\n",
+            "<arg_key>arg1</arg_key>\n<arg_value>1</arg_value>\n",
+            "</tool_call>"
+        );
+        let p = parse_tool_calls(text);
+        assert_eq!(p.calls[0].name, "special_function");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["arg1"], 1);
+    }
+
+    #[test]
+    fn parse_glm53_parallel_calls_and_json_value() {
+        let text = concat!(
+            "ok\n",
+            "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+            "<tool_call>nagar-mcp_k8s_list_pods",
+            "<arg_key>namespace</arg_key><arg_value>default</arg_value>",
+            "<arg_key>opts</arg_key><arg_value>{\"limit\":2}</arg_value>",
+            "</tool_call>"
+        );
+        let p = parse_tool_calls(text);
+        assert_eq!(p.content, "ok");
+        assert_eq!(p.calls.len(), 2);
+        assert_eq!(p.calls[0].name, "bash");
+        let a: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(a["command"], "ls");
+        assert_eq!(p.calls[1].name, "nagar-mcp_k8s_list_pods");
+        let b: Value = serde_json::from_str(&p.calls[1].arguments).unwrap();
+        assert_eq!(b["namespace"], "default");
+        assert_eq!(b["opts"]["limit"], 2);
+    }
+
+    #[test]
+    fn parse_glm53_no_arg_call() {
+        let p = parse_tool_calls("<tool_call>get_history</tool_call>");
+        assert_eq!(p.calls.len(), 1);
+        assert_eq!(p.calls[0].name, "get_history");
+        assert_eq!(p.calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn parse_glm53_korean_arg_value() {
+        let text = concat!(
+            "<tool_call>wiki_search",
+            "<arg_key>project_name</arg_key><arg_value>golbang</arg_value>",
+            "<arg_key>query</arg_key><arg_value>도구 호출</arg_value>",
+            "</tool_call>"
+        );
+        let p = parse_tool_calls(text);
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["query"], "도구 호출");
+    }
+
+    #[test]
+    fn glm_prose_mention_is_not_a_tool_call() {
+        let text = "확인하겠습니다.<tool_call>` 태그가 텍스트로 그대로 출력된 채";
+        let p = parse_tool_calls(text);
+        assert!(
+            p.calls.is_empty(),
+            "prose must not become a tool: {:?}",
+            p.calls
+        );
+        assert!(p.content.contains("확인하겠습니다."));
+    }
+
+    #[test]
+    fn glm_parser_does_not_steal_qwen_function_eq() {
+        let text = r#"<tool_call>
+<function=get_history>
+<parameter=project_name>
+golbang
+</parameter>
+</function>
+</tool_call>"#;
+        let p = parse_tool_calls(text);
+        assert_eq!(p.calls[0].name, "get_history");
+        let v: Value = serde_json::from_str(&p.calls[0].arguments).unwrap();
+        assert_eq!(v["project_name"], "golbang");
+    }
+
+    #[test]
+    fn incremental_holds_glm_arg_key_then_finishes() {
+        let mut p = ToolCallParser::new();
+        assert_eq!(p.push("hello ").as_deref(), Some("hello "));
+        assert!(p.push("<tool_call>bash").is_none());
+        assert!(p
+            .push("<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>")
+            .is_none());
+        let done = p.finish();
+        assert!(done.content.is_empty());
+        assert_eq!(done.calls.len(), 1);
+        assert_eq!(done.calls[0].name, "bash");
+        assert_eq!(done.calls[0].id, "call_1");
+        let v: Value = serde_json::from_str(&done.calls[0].arguments).unwrap();
+        assert_eq!(v["command"], "ls");
     }
 }
