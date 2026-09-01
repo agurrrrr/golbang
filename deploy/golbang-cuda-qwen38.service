@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - Qwen3.8-27B UD-IQ2_S (RTX 3060 CUDA)
+Description=golbang OpenAI server - Qwen3.8-27B GSQ-RCO IQ2_XS + MTP (RTX 3060 CUDA)
 After=network.target
 Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service
 
@@ -14,13 +14,16 @@ Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda/build/bin
 Environment=RUST_LOG=info
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-IQ2_S.gguf \
+  --model /home/agurrrrr/models/qwen3.8/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf \
   --alias qwen3.8-27b-cuda \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 80000 --n-batch 512 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 1 --queue-size 1 --single-max-ctx 80000 --kv-type-k q8_0 --kv-type-v q8_0 \
+  --n-ctx 80000 --n-batch 1024 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 80000 \
+  --kv-type-k q4_0 --kv-type-v q4_0 \
+  --spec-type draft-mtp \
   --no-mmap --jinja \
+  --reasoning-effort low \
   --api-key REDACTED_KEY1
 Restart=on-failure
 RestartSec=10
