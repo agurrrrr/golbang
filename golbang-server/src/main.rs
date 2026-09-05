@@ -23,6 +23,10 @@ struct Args {
     #[arg(long, env = "GOLBANG_MODEL")]
     model: Option<PathBuf>,
 
+    /// Separate MTP/draft GGUF (llama-server `-md`).
+    #[arg(long, env = "GOLBANG_MODEL_DRAFT")]
+    model_draft: Option<PathBuf>,
+
     #[arg(long, env = "GOLBANG_HOST", default_value = "127.0.0.1")]
     host: String,
 
@@ -303,6 +307,7 @@ async fn main() -> Result<()> {
             kv_unified: args.kv_unified,
             cache_type_k: parse_ggml_type(&args.kv_type_k).map_err(anyhow::Error::msg)?,
             cache_type_v: parse_ggml_type(&args.kv_type_v).map_err(anyhow::Error::msg)?,
+            model_draft: args.model_draft.clone(),
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;

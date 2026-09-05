@@ -257,7 +257,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 | GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
 |-----|-----|---------------|----------------|---------|
 | HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
-| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda` | `749f688fc` |
+| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-escha` (`escha-w2-dense`) | `c5d759c8a` |
 
 서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
 `target-hip/release/golbang-server`, V100 서비스는
@@ -354,6 +354,7 @@ DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-r
 | `--reasoning-effort` | 템플릿 기본 | `xhigh` \| `medium` \| `low` |
 | `--reasoning-budget` | `0` | think 토큰 상한. 0=무제한. 넘으면 `</think>` 강제 |
 | `--mmproj` | 없음 | CLIP/projector GGUF |
+| `--model-draft` | 없음 | 별도 MTP/draft GGUF (llama-server `-md`) |
 | `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod` (콤마) |
 | `--spec-draft-n-max` | `3` | MTP draft 상한 |
 | `--spec-draft-p-min` | `0.90` | MTP 최소 확률 |
@@ -377,6 +378,7 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 |------|------|------|
 | `deploy/golbang-qwen38.service` | Qwen3.8-27B UD-Q4_K_XL + mmproj + MTP, KV 140k / solo 128k | 8083 |
 | `deploy/golbang-deepseek.service` | DSV4-Flash IQ2_M, `n_cpu_moe=32` | 8080 |
+| `deploy/golbang-cuda-qwen38.service` | Escha Qwen3.8-27B W2 Q8E + MTP (V100 CUDA) | 8084 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,

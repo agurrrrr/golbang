@@ -5,8 +5,9 @@
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
 //!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
-//! - `cuda` → `llama.cpp-cuda` worktree, CUDA-symbol `.so` byte check,
-//!   CUDA runtime (`cudart`/`cublas`) link.
+//! - `cuda` → `llama.cpp-escha` worktree (`escha-w2-dense`, GGML_OP_ESCHA_MUL_MAT),
+//!   CUDA-symbol `.so` byte check, CUDA runtime (`cudart`/`cublas`) link.
+//!   Rollback tree: `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
 //!
 //! Do not point bindgen at a live header from a sibling tree. SHA or `.so`
 //! drift is a hard error — rebuild that tree, then bump this pin.
@@ -19,9 +20,9 @@ use std::process::Command;
 /// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
 /// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
-const EXPECTED_SHA_CUDA: &str = "749f688fcaa4c472ec034b08cb8a907c45cfaa02";
+const EXPECTED_SHA_CUDA: &str = "c5d759c8a9e02653e9acd2442599b4c8eccc5ba5";
 const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
-const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda";
+const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-escha";
 const EXPECTED_LLAMA_H_LINES: usize = 1638;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
@@ -71,7 +72,7 @@ fn main() {
             "llama.cpp HEAD is {head}, expected {expected_sha} (GOLBANG_GPU={gpu}). \
              Pin is that SHA + its {gpu} .so under the matching tree. \
              Do not mix a live header with a different .so. \
-             Sibling trees (llama.cpp / -cuda / -dflash2 / -upgrade rollback) are different HEADs."
+             Sibling trees (llama.cpp / -cuda / -escha / -dflash2 / -upgrade rollback) are different HEADs."
         );
     }
 
@@ -111,7 +112,7 @@ fn main() {
                 .any(|w| w == b"__cudaRegisterFatBinary")
             {
                 panic!(
-                    "{} does not contain CUDA runtime symbols. SHA/.so drift — rebuild llama.cpp-cuda.",
+                    "{} does not contain CUDA runtime symbols. SHA/.so drift — rebuild llama.cpp-escha.",
                     cuda_so.display()
                 );
             }

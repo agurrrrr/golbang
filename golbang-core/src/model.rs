@@ -62,6 +62,8 @@ pub struct LoadParams {
     pub cache_type_k: u32,
     /// KV cache element type, V side (`llama_context_params.type_v`).
     pub cache_type_v: u32,
+    /// Separate MTP/draft GGUF (llama-server `-md`). None = in-model nextn tensors.
+    pub model_draft: Option<PathBuf>,
 }
 
 impl Default for LoadParams {
@@ -84,6 +86,7 @@ impl Default for LoadParams {
             kv_unified: false,
             cache_type_k: GGML_TYPE_F16 as u32,
             cache_type_v: GGML_TYPE_F16 as u32,
+            model_draft: None,
         }
     }
 }
@@ -106,6 +109,8 @@ pub struct ModelCard {
 /// by the caller (P1: one request). `Send` so it can live on a worker thread.
 pub struct Model {
     model: *mut llama_model,
+    /// Separate `-md` draft model. Null when MTP uses the target model's nextn tensors.
+    model_dft: *mut llama_model,
     ctx: *mut llama_context,
     ctx_mtp: *mut llama_context,
     vocab: *const llama_vocab,
@@ -205,6 +210,7 @@ impl Model {
             kv_unified = params.kv_unified,
             spec = ?params.spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             mmproj = params.mmproj.as_ref().map(|p| p.display().to_string()),
+            model_draft = params.model_draft.as_ref().map(|p| p.display().to_string()),
             "loading GGUF"
         );
 
@@ -275,6 +281,7 @@ impl Model {
         let n_nextn = unsafe { llama_model_n_layer_nextn(model) };
 
         let mut ctx_mtp = ptr::null_mut();
+        let mut model_dft = ptr::null_mut();
         let mut spec = SpecRuntime::disabled(n_seq_max);
         spec.params = params.spec.clone();
         if spec.params.wants_ngram() {
@@ -286,12 +293,36 @@ impl Model {
         spec.last_draft = vec![None; n_seq_max as usize];
 
         if spec.params.wants_mtp() {
-            if n_nextn <= 0 {
+            let mtp_src = if let Some(draft_path) = params.model_draft.as_ref() {
+                match load_draft_model(draft_path, &params) {
+                    Ok(dft) => {
+                        model_dft = dft;
+                        let n_nextn_dft = unsafe { llama_model_n_layer_nextn(dft) };
+                        tracing::info!(
+                            path = %draft_path.display(),
+                            n_nextn = n_nextn_dft,
+                            n_layer = unsafe { llama_model_n_layer(dft) },
+                            "draft model loaded (llama-server -md)"
+                        );
+                        Some(dft)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load --model-draft; draft-mtp disabled");
+                        spec.params.types.retain(|t| *t != SpecType::DraftMtp);
+                        None
+                    }
+                }
+            } else if n_nextn <= 0 {
                 tracing::warn!(
                     "--spec-type draft-mtp but GGUF has n_layer_nextn=0; MTP drafts off"
                 );
                 spec.params.types.retain(|t| *t != SpecType::DraftMtp);
+                None
             } else {
+                Some(model)
+            };
+
+            if let Some(mtp_src) = mtp_src {
                 let mut mparams_ctx = unsafe { llama_context_default_params() };
                 mparams_ctx.n_ctx = n_ctx_total;
                 mparams_ctx.n_batch = n_batch;
@@ -315,21 +346,27 @@ impl Model {
                     mparams_ctx.n_threads = params.n_threads;
                     mparams_ctx.n_threads_batch = params.n_threads;
                 }
-                ctx_mtp = unsafe { llama_init_from_model(model, mparams_ctx) };
+                ctx_mtp = unsafe { llama_init_from_model(mtp_src, mparams_ctx) };
                 if ctx_mtp.is_null() {
                     tracing::warn!("failed to create MTP context; draft-mtp disabled");
                     spec.params.types.retain(|t| *t != SpecType::DraftMtp);
+                    if !model_dft.is_null() {
+                        unsafe { llama_model_free(model_dft) };
+                        model_dft = ptr::null_mut();
+                    }
                 } else {
+                    let n_nextn_mtp = unsafe { llama_model_n_layer_nextn(mtp_src) };
                     unsafe {
                         golbang_llama_set_embeddings_nextn(ctx, true, false);
                         golbang_llama_set_embeddings_nextn(ctx_mtp, true, true);
                     }
                     tracing::info!(
-                        n_nextn,
+                        n_nextn = n_nextn_mtp,
                         n_embd,
                         n_max = spec.params.n_max,
                         p_min = spec.params.p_min,
                         n_outputs_max = mtp_n_outputs_max(n_seq_max),
+                        separate_draft = !model_dft.is_null(),
                         "MTP draft context ready"
                     );
                 }
@@ -345,6 +382,9 @@ impl Model {
                             llama_free(ctx_mtp);
                         }
                         llama_free(ctx);
+                        if !model_dft.is_null() {
+                            llama_model_free(model_dft);
+                        }
                         llama_model_free(model);
                     }
                     return Err(e);
@@ -382,6 +422,7 @@ impl Model {
 
         Ok(Self {
             model,
+            model_dft,
             ctx,
             ctx_mtp,
             vocab,
@@ -1153,12 +1194,45 @@ impl Drop for Model {
                 llama_free(self.ctx);
                 self.ctx = ptr::null_mut();
             }
+            if !self.model_dft.is_null() {
+                llama_model_free(self.model_dft);
+                self.model_dft = ptr::null_mut();
+            }
             if !self.model.is_null() {
                 llama_model_free(self.model);
                 self.model = ptr::null_mut();
             }
         }
     }
+}
+
+fn load_draft_model(path: &Path, params: &LoadParams) -> Result<*mut llama_model> {
+    if !path.is_file() {
+        return Err(Error::Load {
+            path: path.to_path_buf(),
+            reason: "not a file".into(),
+        });
+    }
+    let c_path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| Error::Load {
+        path: path.to_path_buf(),
+        reason: "path contains interior NUL".into(),
+    })?;
+    let mut mparams = unsafe { llama_model_default_params() };
+    mparams.n_gpu_layers = params.n_gpu_layers;
+    mparams.load_mtp = true;
+    mparams.load_mode = if params.use_mmap {
+        LLAMA_LOAD_MODE_MMAP
+    } else {
+        LLAMA_LOAD_MODE_NONE
+    };
+    let model = unsafe { llama_model_load_from_file(c_path.as_ptr(), mparams) };
+    if model.is_null() {
+        return Err(Error::Load {
+            path: path.to_path_buf(),
+            reason: "llama_model_load_from_file returned null".into(),
+        });
+    }
+    Ok(model)
 }
 
 /// llama-server `common_base_params_to_speculative`: `n_outputs_max = n_parallel`.
@@ -1293,8 +1367,9 @@ impl CpuMoeOverrides {
 
 #[cfg(test)]
 mod tests {
-    use super::{mtp_n_outputs_max, mtp_process_items, FFN_EXPS_REGEX};
+    use super::{load_draft_model, mtp_n_outputs_max, mtp_process_items, FFN_EXPS_REGEX, LoadParams};
     use crate::batch::BatchToken;
+    use std::path::Path;
 
     #[test]
     fn mtp_outputs_match_llama_server_n_parallel() {
@@ -1325,6 +1400,14 @@ mod tests {
         assert_eq!(out[0].token, 1);
         assert_eq!(out[0].pos, 10);
         assert_eq!(out[1].seq_id, 0);
+    }
+
+    #[test]
+    fn draft_model_missing_file_errors() {
+        let err = load_draft_model(Path::new("/no/such/draft.gguf"), &LoadParams::default())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a file"), "{msg}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - Qwen3.8-27B GSQ-RCO IQ2_XS + MTP (V100 CUDA)
+Description=golbang OpenAI server - Escha Qwen3.8-27B W2 Q8E + MTP (V100 CUDA)
 After=network.target
 Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service
 
@@ -11,18 +11,21 @@ WorkingDirectory=/home/agurrrrr/code/golbang
 Environment=HOME=/home/agurrrrr
 Environment=CUDA_VISIBLE_DEVICES=0
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
-Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda/build/bin:/opt/cuda-12.8/lib64
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf \
+  --model /home/agurrrrr/models/qwen3.8/escha-w2/Escha-Qwen3.8-27B-W2-Q8E.gguf \
+  --model-draft /home/agurrrrr/models/qwen3.8/escha-w2/Escha-Qwen3.8-27B-W2-MTP-F16-headQ4.gguf \
   --alias qwen3.8-27b-cuda \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 80000 --n-batch 1024 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 1 --queue-size 1 --single-max-ctx 80000 \
-  --kv-type-k q4_0 --kv-type-v q4_0 \
+  --n-ctx 65536 --n-batch 1024 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 65536 \
+  --kv-type-k q8_0 --kv-type-v q8_0 \
   --spec-type draft-mtp \
-  --no-mmap --jinja \
+  --spec-draft-n-max 3 \
+  --spec-draft-p-min 0.0 \
+  --no-mmap --jinja --reasoning-format deepseek \
   --reasoning-effort low \
   --api-key REDACTED_KEY1
 Restart=on-failure
