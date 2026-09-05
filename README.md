@@ -257,13 +257,14 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 | GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
 |-----|-----|---------------|----------------|---------|
 | HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
-| CUDA (RTX 3060) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda` | `749f688fc` |
+| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda` | `749f688fc` |
 
 서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
-`target-hip/release/golbang-server`, RTX 3060 서비스는
+`target-hip/release/golbang-server`, V100 서비스는
 `target-cuda/release/golbang-server` (유닛은 `deploy/`).
 
-필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2 (HIP) / CUDA toolkit (CUDA),
+필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2 (HIP) / CUDA 12.8 toolkit
+(`/opt/cuda-12.8`, V100/Volta. CUDA 13은 compute_70을 지원하지 않음),
 핀된 llama.cpp 트리와 그 SHA의 `.so`.
 
 ```bash
@@ -273,7 +274,7 @@ export GOLBANG_TEST_MODEL=/home/agurrrrr/models/Qwen3-0.6B-Q4_K_M.gguf
 # HIP (MI50) 빌드
 CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo build -p golbang-server --release
 
-# CUDA (RTX 3060) 빌드
+# CUDA (V100, CUDA 12.8)
 CARGO_TARGET_DIR=target-cuda GOLBANG_GPU=cuda cargo build -p golbang-server --release
 
 # 테스트 (GOLBANG_GPU로 백엔드 선택, 기본 hip)

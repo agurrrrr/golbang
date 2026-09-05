@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - Qwen3.8-27B GSQ-RCO IQ2_XS + MTP (RTX 3060 CUDA)
+Description=golbang OpenAI server - Qwen3.8-27B GSQ-RCO IQ2_XS + MTP (V100 CUDA)
 After=network.target
 Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service
 
@@ -11,7 +11,7 @@ WorkingDirectory=/home/agurrrrr/code/golbang
 Environment=HOME=/home/agurrrrr
 Environment=CUDA_VISIBLE_DEVICES=0
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
-Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda/build/bin
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf \

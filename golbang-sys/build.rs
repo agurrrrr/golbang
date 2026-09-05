@@ -124,7 +124,8 @@ fn main() {
                 "ggml-cuda",
                 "mtmd",
             ];
-            link_search_extra = &["/opt/cuda/targets/x86_64-linux/lib"];
+            // V100 (sm_70) needs CUDA 12.8; CUDA 13 at /opt/cuda dropped compute_70.
+            link_search_extra = &["/opt/cuda-12.8/targets/x86_64-linux/lib"];
         }
         _ => unreachable!(),
     }

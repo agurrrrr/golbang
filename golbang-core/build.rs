@@ -1,7 +1,7 @@
 //! `cargo:rustc-link-arg` from golbang-sys does not apply to this crate's
 //! binaries/tests. Repeat the SHA-pinned rpath so `libllama.so` resolves.
 //! GPU-specific search path is chosen by `GOLBANG_GPU` (hip → /opt/rocm/lib,
-//! cuda → /opt/cuda/.../lib) so a CUDA build does not pull in ROCm libs.
+//! cuda → /opt/cuda-12.8/.../lib) so a CUDA build does not pull in ROCm libs.
 
 fn main() {
     let bin = std::env::var("DEP_LLAMA_BIN").unwrap_or_else(|_| {
@@ -11,7 +11,7 @@ fn main() {
     });
     let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
     let extra = match gpu.as_str() {
-        "cuda" => "/opt/cuda/targets/x86_64-linux/lib",
+        "cuda" => "/opt/cuda-12.8/targets/x86_64-linux/lib",
         _ => "/opt/rocm/lib",
     };
     println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_DIR");

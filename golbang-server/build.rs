@@ -11,7 +11,7 @@ fn main() {
     });
     let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
     let extra = match gpu.as_str() {
-        "cuda" => "/opt/cuda/targets/x86_64-linux/lib",
+        "cuda" => "/opt/cuda-12.8/targets/x86_64-linux/lib",
         _ => "/opt/rocm/lib",
     };
     println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_DIR");
