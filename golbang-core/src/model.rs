@@ -1,9 +1,12 @@
 use std::ffi::{CStr, CString};
 use std::mem;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use golbang_sys::*;
 
@@ -161,6 +164,9 @@ unsafe impl Send for Model {}
 
 impl Model {
     pub fn load(path: impl AsRef<Path>, params: LoadParams) -> Result<Self> {
+        // llama.cpp `rpc_dispatcher::start` GGML_ABORTs on connect failure.
+        // Wait before HIP/CUDA init so a late ggml-rpc-server is an error, not SIGABRT.
+        wait_rpc_endpoints(&params.rpc_servers)?;
         init_backend();
 
         let path = path.as_ref();
@@ -1343,6 +1349,78 @@ unsafe fn log_registered_backends() {
     }
 }
 
+/// llama.cpp `rpc_dispatcher::start` calls `GGML_ABORT` if TCP connect fails
+/// (`Failed to connect to host:port`). CUDA rpc-server spends ~10s in
+/// `ggml_cuda_init` before it listens, and systemd `Type=simple` races that.
+const RPC_WAIT_DEFAULT: Duration = Duration::from_secs(90);
+
+fn rpc_wait_timeout() -> Duration {
+    match std::env::var("GOLBANG_RPC_WAIT_SECS") {
+        Ok(s) if !s.trim().is_empty() => {
+            Duration::from_secs(s.parse().unwrap_or(RPC_WAIT_DEFAULT.as_secs()))
+        }
+        _ => RPC_WAIT_DEFAULT,
+    }
+}
+
+fn wait_rpc_endpoints(servers: &[String]) -> Result<()> {
+    wait_rpc_endpoints_until(servers, rpc_wait_timeout())
+}
+
+fn wait_rpc_endpoints_until(servers: &[String], timeout: Duration) -> Result<()> {
+    for endpoint in servers {
+        wait_one_rpc_endpoint(endpoint, timeout)?;
+    }
+    Ok(())
+}
+
+fn wait_one_rpc_endpoint(endpoint: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last = "not attempted".to_string();
+    let mut next_log = Instant::now();
+    while Instant::now() < deadline {
+        match endpoint.to_socket_addrs() {
+            Ok(addrs) => {
+                let addrs: Vec<_> = addrs.collect();
+                if addrs.is_empty() {
+                    last = "DNS resolved to zero addresses".into();
+                }
+                for addr in addrs {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if remain.is_zero() {
+                        break;
+                    }
+                    match TcpStream::connect_timeout(&addr, remain.min(Duration::from_secs(1))) {
+                        Ok(_) => {
+                            tracing::info!(
+                                endpoint,
+                                %addr,
+                                "RPC endpoint is accepting connections"
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => last = e.to_string(),
+                    }
+                }
+            }
+            Err(e) => last = e.to_string(),
+        }
+        if Instant::now() >= next_log {
+            tracing::warn!(
+                endpoint,
+                err = %last,
+                "waiting for ggml-rpc-server (llama.cpp aborts if we connect too early)"
+            );
+            next_log = Instant::now() + Duration::from_secs(5);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(Error::Load {
+        path: PathBuf::from(endpoint),
+        reason: format!("RPC server did not accept connections within {timeout:?}: {last}"),
+    })
+}
+
 /// llama.cpp `add_rpc_devices`: load the RPC backend if needed, then
 /// `ggml_backend_rpc_add_server` + `ggml_backend_register` per endpoint.
 fn register_rpc_servers(servers: &[String], backend_so: Option<&Path>) -> Result<()> {
@@ -1557,10 +1635,12 @@ impl CpuMoeOverrides {
 mod tests {
     use super::{
         load_draft_model, mtp_n_outputs_max, mtp_process_items, parse_rpc_servers,
-        parse_tensor_split, FFN_EXPS_REGEX, LoadParams,
+        parse_tensor_split, wait_rpc_endpoints_until, FFN_EXPS_REGEX, LoadParams,
     };
     use crate::batch::BatchToken;
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn mtp_outputs_match_llama_server_n_parallel() {
@@ -1618,6 +1698,23 @@ mod tests {
         let got = parse_rpc_servers(" 127.0.0.1:50052 , 127.0.0.1:50053 ").unwrap();
         assert_eq!(got, ["127.0.0.1:50052", "127.0.0.1:50053"]);
         assert!(parse_rpc_servers("  ,  ").is_err());
+    }
+
+    #[test]
+    fn wait_rpc_endpoint_succeeds_when_listening() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = listener.local_addr().unwrap().to_string();
+        wait_rpc_endpoints_until(&[ep], Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn wait_rpc_endpoint_times_out_when_closed() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let err = wait_rpc_endpoints_until(&[ep], Duration::from_millis(400)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("did not accept connections"), "{msg}");
     }
 
     #[test]

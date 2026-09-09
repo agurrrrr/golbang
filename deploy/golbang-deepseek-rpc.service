@@ -1,7 +1,9 @@
 [Unit]
 Description=golbang OpenAI server - DeepSeek-V4-Flash IQ2_M on MI50 + V100 via ggml-rpc
 After=network.target ggml-rpc-v100.service
-Requires=ggml-rpc-v100.service
+# BindsTo: rpc-server가 죽으면 SIGTERM으로 같이 내린다. Requires만 두면
+# 소켓이 먼저 닫히고 llama.cpp RPC_STATUS_ASSERT → GGML_ABORT → SIGABRT 코어덤프가 난다.
+BindsTo=ggml-rpc-v100.service
 Conflicts=llama-server.service golbang-deepseek.service golbang-qwen38.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service
 
 [Service]
@@ -17,6 +19,9 @@ Environment=RUST_LOG=info
 # Same SHA as production HIP (367ebbc20), sibling cmake dir build-rpc-hip (GGML_RPC=ON).
 # n-cpu-moe 28: wiki hetero-gpu-split 26-28 for 1xMI50+1xV100. Raise if VRAM OOM.
 # n-ubatch 1024: compute buffer is per device; V100 16 GiB is tight.
+# Type=simple marks rpc-server started at fork; CUDA init listens ~10s later.
+# llama.cpp GGML_ABORTs on connect failure, so wait for :50052 first.
+ExecStartPre=/bin/bash -c 'for i in {1..90}; do (echo >/dev/tcp/127.0.0.1/50052) >/dev/null 2>&1 && exit 0; sleep 1; done; echo ggml-rpc-v100 not listening on 127.0.0.1:50052 >&2; exit 1'
 ExecStart=/home/agurrrrr/code/golbang/target-hip-rpc/release/golbang-server \
   --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
@@ -29,6 +34,8 @@ ExecStart=/home/agurrrrr/code/golbang/target-hip-rpc/release/golbang-server \
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=600
+TimeoutStopSec=30
+KillMode=mixed
 StandardOutput=journal
 StandardError=journal
 MemoryMax=120G

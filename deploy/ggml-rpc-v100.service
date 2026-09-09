@@ -16,6 +16,9 @@ ExecStart=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build-rpc-cuda/bin/gg
   -H 127.0.0.1 -p 50052 -c
 Restart=on-failure
 RestartSec=5
+# llama.cpp RPC client aborts the whole process if this socket closes mid-graph.
+KillMode=mixed
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 
