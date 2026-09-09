@@ -15,8 +15,8 @@ Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 # tensor-split 18,14: 16,16 put 7216/8837 MiB on CUDA0/1 (FA vs GDN sizes).
-# 20,12 packed CUDA0 (15989/16384). n-ubatch 256 so LAYER PP compute
-# falls back (~1075 MiB/GPU); 512+PP was 1961 and first prefill OOM'd.
+# 20,12 packed CUDA0 (15989/16384). n-ctx 10000 leaves ~6 GiB/GPU, so
+# n-ubatch 1024 fits; 512+PP at ctx 235520 was 1961 MiB and first prefill OOM'd.
 # n-ctx 10000 is the per-slot share (KV pool = 10000*2). single-max-ctx
 # 10000 keeps a solo slot from growing into the second slot's cells.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
@@ -25,7 +25,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
   --tensor-split 18,14 \
-  --n-ctx 10000 --n-batch 1024 --n-ubatch 256 --n-threads 8 --n-rs-seq 3 \
+  --n-ctx 10000 --n-batch 1024 --n-ubatch 1024 --n-threads 8 --n-rs-seq 3 \
   --n-parallel 2 --queue-size 2 --single-max-ctx 10000 --kv-unified \
   --kv-type-k q8_0 --kv-type-v q8_0 \
   --spec-type draft-mtp \
