@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString};
+use std::mem;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -64,6 +65,13 @@ pub struct LoadParams {
     pub cache_type_v: u32,
     /// Separate MTP/draft GGUF (llama-server `-md`). None = in-model nextn tensors.
     pub model_draft: Option<PathBuf>,
+    /// llama-server `--rpc` endpoints (`host:port`). Empty = local devices only.
+    pub rpc_servers: Vec<String>,
+    /// Optional `libggml-rpc.so` when the pinned llama.cpp was built with
+    /// `GGML_RPC=OFF`. Ignored when the RPC backend is already registered.
+    pub rpc_backend: Option<PathBuf>,
+    /// llama-server `--tensor-split` proportions. Empty = split by free VRAM.
+    pub tensor_split: Vec<f32>,
 }
 
 impl Default for LoadParams {
@@ -87,6 +95,9 @@ impl Default for LoadParams {
             cache_type_k: GGML_TYPE_F16 as u32,
             cache_type_v: GGML_TYPE_F16 as u32,
             model_draft: None,
+            rpc_servers: Vec::new(),
+            rpc_backend: None,
+            tensor_split: Vec::new(),
         }
     }
 }
@@ -211,8 +222,12 @@ impl Model {
             spec = ?params.spec.types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             mmproj = params.mmproj.as_ref().map(|p| p.display().to_string()),
             model_draft = params.model_draft.as_ref().map(|p| p.display().to_string()),
+            rpc = ?params.rpc_servers,
+            tensor_split = ?params.tensor_split,
             "loading GGUF"
         );
+
+        register_rpc_servers(&params.rpc_servers, params.rpc_backend.as_deref())?;
 
         let mut mparams = unsafe { llama_model_default_params() };
         mparams.n_gpu_layers = params.n_gpu_layers;
@@ -229,7 +244,28 @@ impl Model {
             mparams.tensor_buft_overrides = ptr;
         }
 
+        // Proportions must stay alive until `llama_model_load_from_file` returns.
+        // llama.cpp copies `llama_max_devices()` floats, so pad with zeros.
+        let mut tensor_split_buf = Vec::new();
+        if !params.tensor_split.is_empty() {
+            let n_dev = unsafe { llama_max_devices() };
+            if params.tensor_split.len() >= n_dev {
+                return Err(Error::Load {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "--tensor-split has {} values, llama_max_devices is {n_dev}",
+                        params.tensor_split.len()
+                    ),
+                });
+            }
+            tensor_split_buf = vec![0.0f32; n_dev];
+            tensor_split_buf[..params.tensor_split.len()].copy_from_slice(&params.tensor_split);
+            mparams.tensor_split = tensor_split_buf.as_ptr();
+        }
+
         let model = unsafe { llama_model_load_from_file(c_path.as_ptr(), mparams) };
+        // llama.cpp copies tensor_split during load; keep the buffer until then.
+        let _ = tensor_split_buf.len();
         if model.is_null() {
             return Err(Error::Load {
                 path: path.to_path_buf(),
@@ -1261,38 +1297,190 @@ fn init_backend() {
             // cargo test / the server binary do not sit next to libggml-{hip,cuda}.so
             let bin = CString::new(golbang_sys::LLAMA_BIN_DIR).expect("LLAMA_BIN_DIR");
             ggml_backend_load_all_from_path(bin.as_ptr());
-
-            // Enumerate registered backends + their devices so the CUDA (or HIP)
-            // backend is visible in the boot log.
-            let reg_count = ggml_backend_reg_count();
-            for reg_idx in 0..reg_count {
-                let reg = ggml_backend_reg_get(reg_idx);
-                if reg.is_null() {
-                    continue;
-                }
-                let name = CStr::from_ptr(ggml_backend_reg_name(reg)).to_string_lossy();
-                let dev_count = ggml_backend_reg_dev_count(reg);
-                tracing::info!(backend = %name, devices = dev_count, "registered backend");
-                for dev_idx in 0..dev_count {
-                    let dev = ggml_backend_reg_dev_get(reg, dev_idx);
-                    if dev.is_null() {
-                        continue;
-                    }
-                    let dev_name =
-                        CStr::from_ptr(ggml_backend_dev_name(dev)).to_string_lossy();
-                    let desc = CStr::from_ptr(ggml_backend_dev_description(dev))
-                        .to_string_lossy();
-                    tracing::info!(backend = %name, device = %dev_name, desc = %desc, "backend device");
-                }
-            }
+            log_registered_backends();
         }
         tracing::info!(
             bin = golbang_sys::LLAMA_BIN_DIR,
             sha = golbang_sys::LLAMA_CPP_SHA,
             gpu = golbang_sys::GOLBANG_GPU,
+            rpc = unsafe { llama_supports_rpc() },
             "llama backend initialized"
         );
     });
+}
+
+unsafe fn log_registered_backends() {
+    let reg_count = unsafe { ggml_backend_reg_count() };
+    for reg_idx in 0..reg_count {
+        let reg = unsafe { ggml_backend_reg_get(reg_idx) };
+        if reg.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(ggml_backend_reg_name(reg)) }.to_string_lossy();
+        let dev_count = unsafe { ggml_backend_reg_dev_count(reg) };
+        tracing::info!(backend = %name, devices = dev_count, "registered backend");
+        for dev_idx in 0..dev_count {
+            let dev = unsafe { ggml_backend_reg_dev_get(reg, dev_idx) };
+            if dev.is_null() {
+                continue;
+            }
+            let dev_name =
+                unsafe { CStr::from_ptr(ggml_backend_dev_name(dev)) }.to_string_lossy();
+            let desc =
+                unsafe { CStr::from_ptr(ggml_backend_dev_description(dev)) }.to_string_lossy();
+            let mut free = 0usize;
+            let mut total = 0usize;
+            unsafe { ggml_backend_dev_memory(dev, &mut free, &mut total) };
+            tracing::info!(
+                backend = %name,
+                device = %dev_name,
+                desc = %desc,
+                free_mib = free / (1024 * 1024),
+                total_mib = total / (1024 * 1024),
+                "backend device"
+            );
+        }
+    }
+}
+
+/// llama.cpp `add_rpc_devices`: load the RPC backend if needed, then
+/// `ggml_backend_rpc_add_server` + `ggml_backend_register` per endpoint.
+fn register_rpc_servers(servers: &[String], backend_so: Option<&Path>) -> Result<()> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+
+    type RpcAddServer = unsafe extern "C" fn(*const c_char) -> ggml_backend_reg_t;
+
+    unsafe {
+        let mut rpc_reg = backend_reg_by_name("RPC");
+        if rpc_reg.is_null() {
+            let so = resolve_rpc_backend(backend_so)?;
+            let c_so = CString::new(so.to_string_lossy().as_bytes()).map_err(|_| Error::Load {
+                path: so.clone(),
+                reason: "rpc backend path contains interior NUL".into(),
+            })?;
+            tracing::info!(path = %so.display(), "loading RPC backend .so");
+            rpc_reg = ggml_backend_load(c_so.as_ptr());
+            if rpc_reg.is_null() {
+                return Err(Error::Load {
+                    path: so,
+                    reason: "ggml_backend_load returned null for libggml-rpc.so (build that tree with GGML_RPC=ON, or GGML_BACKEND_DL=ON for a plugin)".into(),
+                });
+            }
+        }
+
+        let proc_name = CString::new("ggml_backend_rpc_add_server").expect("ascii");
+        let fn_ptr = ggml_backend_reg_get_proc_address(rpc_reg, proc_name.as_ptr());
+        if fn_ptr.is_null() {
+            return Err(Error::Load {
+                path: PathBuf::from("rpc"),
+                reason: "RPC backend has no ggml_backend_rpc_add_server".into(),
+            });
+        }
+        let add_server: RpcAddServer = mem::transmute(fn_ptr);
+
+        for server in servers {
+            let c_ep = CString::new(server.as_bytes()).map_err(|_| Error::Load {
+                path: PathBuf::from(server.as_str()),
+                reason: "rpc endpoint contains interior NUL".into(),
+            })?;
+            let reg = add_server(c_ep.as_ptr());
+            if reg.is_null() {
+                return Err(Error::Load {
+                    path: PathBuf::from(server.as_str()),
+                    reason: "ggml_backend_rpc_add_server returned null (is ggml-rpc-server listening?)".into(),
+                });
+            }
+            ggml_backend_register(reg);
+            let name = CStr::from_ptr(ggml_backend_reg_name(reg)).to_string_lossy();
+            tracing::info!(
+                endpoint = %server,
+                backend = %name,
+                devices = ggml_backend_reg_dev_count(reg),
+                "RPC server registered"
+            );
+        }
+        log_registered_backends();
+    }
+    Ok(())
+}
+
+fn backend_reg_by_name(name: &str) -> ggml_backend_reg_t {
+    let c = CString::new(name).expect("backend name is ASCII");
+    unsafe { ggml_backend_reg_by_name(c.as_ptr()) }
+}
+
+fn resolve_rpc_backend(explicit: Option<&Path>) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(p) = explicit {
+        candidates.push(p.to_path_buf());
+    }
+    let bin = PathBuf::from(golbang_sys::LLAMA_BIN_DIR);
+    candidates.push(bin.join("libggml-rpc.so"));
+    candidates.push(bin.join("libggml-rpc.so.0"));
+    if let Some(tree) = bin.parent().and_then(|p| p.parent()) {
+        candidates.push(tree.join("build-rpc-hip/bin/libggml-rpc.so"));
+        candidates.push(tree.join("build-rpc-cuda/bin/libggml-rpc.so"));
+    }
+    for p in &candidates {
+        if p.is_file() {
+            return Ok(p.clone());
+        }
+    }
+    Err(Error::Load {
+        path: candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("libggml-rpc.so")),
+        reason: format!(
+            "RPC backend not registered and libggml-rpc.so not found (looked in {})",
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+/// llama-server `--rpc` list: comma-separated `host:port`.
+pub fn parse_rpc_servers(s: &str) -> Result<Vec<String>> {
+    let out: Vec<String> = s
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if out.is_empty() {
+        return Err(Error::Load {
+            path: PathBuf::from("--rpc"),
+            reason: "no RPC servers specified".into(),
+        });
+    }
+    Ok(out)
+}
+
+/// llama-server `--tensor-split`: comma or slash separated proportions.
+pub fn parse_tensor_split(s: &str) -> Result<Vec<f32>> {
+    let mut out = Vec::new();
+    for part in s.split([',', '/']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let v: f32 = part.parse().map_err(|_| Error::Load {
+            path: PathBuf::from("--tensor-split"),
+            reason: format!("not a float: {part}"),
+        })?;
+        out.push(v);
+    }
+    if out.is_empty() {
+        return Err(Error::Load {
+            path: PathBuf::from("--tensor-split"),
+            reason: "empty".into(),
+        });
+    }
+    Ok(out)
 }
 
 unsafe extern "C" fn forward_llama_log(
@@ -1367,7 +1555,10 @@ impl CpuMoeOverrides {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_draft_model, mtp_n_outputs_max, mtp_process_items, FFN_EXPS_REGEX, LoadParams};
+    use super::{
+        load_draft_model, mtp_n_outputs_max, mtp_process_items, parse_rpc_servers,
+        parse_tensor_split, FFN_EXPS_REGEX, LoadParams,
+    };
     use crate::batch::BatchToken;
     use std::path::Path;
 
@@ -1420,5 +1611,20 @@ mod tests {
             format!("blk\\.{i}{FFN_EXPS_REGEX}", i = 31),
             r"blk\.31\.ffn_(up|down|gate|gate_up)_(ch|)exps"
         );
+    }
+
+    #[test]
+    fn parse_rpc_servers_splits_and_trims() {
+        let got = parse_rpc_servers(" 127.0.0.1:50052 , 127.0.0.1:50053 ").unwrap();
+        assert_eq!(got, ["127.0.0.1:50052", "127.0.0.1:50053"]);
+        assert!(parse_rpc_servers("  ,  ").is_err());
+    }
+
+    #[test]
+    fn parse_tensor_split_accepts_comma_or_slash() {
+        assert_eq!(parse_tensor_split("32,16").unwrap(), [32.0, 16.0]);
+        assert_eq!(parse_tensor_split("32/16/16").unwrap(), [32.0, 16.0, 16.0]);
+        assert!(parse_tensor_split("").is_err());
+        assert!(parse_tensor_split("abc").is_err());
     }
 }

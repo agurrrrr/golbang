@@ -1,0 +1,23 @@
+[Unit]
+Description=ggml-rpc-server - Tesla V100 CUDA for golbang HIP RPC (localhost only)
+After=network.target
+Conflicts=golbang-cuda-qwen38.service qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build-rpc-cuda/bin:/opt/cuda-12.8/lib64
+# Proof-of-concept RPC. Bind localhost only. RDMA off (ConnectX-3 BadTLP).
+ExecStart=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build-rpc-cuda/bin/ggml-rpc-server \
+  -H 127.0.0.1 -p 50052 -c
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

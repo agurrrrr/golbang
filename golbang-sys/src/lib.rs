@@ -72,6 +72,9 @@ mod api_names {
         let _get_h = golbang_llama_get_embeddings_nextn;
         let _mtmd = mtmd_init_from_file;
         let _bmp = mtmd_helper_bitmap_init_from_buf;
+        let _rpc = llama_supports_rpc;
+        let _rpc_proc = ggml_backend_reg_get_proc_address;
+        let _rpc_reg = ggml_backend_register;
         let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
         let expected = if gpu.trim().eq_ignore_ascii_case("cuda") {
             "c5d759c8a9e02653e9acd2442599b4c8eccc5ba5"

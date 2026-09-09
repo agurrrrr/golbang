@@ -40,6 +40,7 @@ const HEADER_GIT_PATHS: &[(&str, &str)] = &[
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_DIR");
+    println!("cargo:rerun-if-env-changed=GOLBANG_LLAMA_BIN_DIR");
     println!("cargo:rerun-if-env-changed=GOLBANG_GPU");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/llama_ext_shim.cpp");
@@ -76,7 +77,22 @@ fn main() {
         );
     }
 
-    let bin_dir = llama_dir.join("build/bin");
+    // Default is `<tree>/build/bin` (production HIP/CUDA pin). Override for
+    // a same-SHA sibling cmake dir such as `build-rpc-hip` — do not point this
+    // at a different git HEAD.
+    let bin_dir = match env::var("GOLBANG_LLAMA_BIN_DIR") {
+        Ok(p) if !p.trim().is_empty() => {
+            let dir = PathBuf::from(p);
+            if !dir.is_dir() {
+                panic!(
+                    "GOLBANG_LLAMA_BIN_DIR does not exist: {}. Same SHA as {expected_sha}, different cmake dir only.",
+                    dir.display()
+                );
+            }
+            dir
+        }
+        _ => llama_dir.join("build/bin"),
+    };
 
     // Backend-specific .so + byte check.
     let (backend_so, link_libs, link_search_extra): (PathBuf, &[&str], &[&str]);
@@ -214,6 +230,8 @@ fn main() {
         .allowlist_function("ggml_backend_reg_get")
         .allowlist_function("ggml_backend_reg_name")
         .allowlist_function("ggml_backend_reg_by_name")
+        .allowlist_function("ggml_backend_reg_get_proc_address")
+        .allowlist_function("ggml_backend_register")
         .allowlist_function("ggml_backend_reg_dev_count")
         .allowlist_function("ggml_backend_reg_dev_get")
         .allowlist_function("ggml_backend_dev_count")
@@ -222,6 +240,7 @@ fn main() {
         .allowlist_function("ggml_backend_dev_description")
         .allowlist_function("ggml_backend_dev_type")
         .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_dev_memory")
         .allowlist_function("ggml_backend_cpu_buffer_type")
         .allowlist_function("ggml_backend_dev_buffer_type")
         .allowlist_type("ggml_log_level")

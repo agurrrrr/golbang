@@ -242,6 +242,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 - `--prompt-progress` (기본 on): SSE `prompt_progress`로 긴 프리필 동안 연결 유지
 - `--api-key` (`Authorization: Bearer` 또는 `X-Api-Key`)
 - `--alias` (llama-server `-a`)
+- `--rpc` / `--tensor-split` (llama-server와 동일. HIP 메인 + `ggml-rpc-server`. 생산 HIP `build/`에는 RPC를 섞지 않고 같은 SHA의 `build-rpc-hip`을 `GOLBANG_LLAMA_BIN_DIR`로 링크)
 
 없는 것: embeddings, rerank, 크로스 슬롯 prefix 복사, `fifo` 이외 정책,
 순수 Rust GPU 커널(P4는 P6 gate 실패로 열지 않음).

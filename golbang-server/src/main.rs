@@ -8,7 +8,7 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use golbang_core::{
     Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
-    SpecParams, SpecType, parse_ggml_type, spawn_scheduler,
+    SpecParams, SpecType, parse_ggml_type, parse_rpc_servers, parse_tensor_split, spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -173,6 +173,21 @@ struct Args {
     #[arg(long, env = "GOLBANG_LOAD_MTP", default_value_t = false)]
     load_mtp: bool,
 
+    /// llama-server `--rpc`: comma-separated `host:port` of `ggml-rpc-server`.
+    /// Requires the linked llama.cpp to have the RPC backend (`GGML_RPC=ON`)
+    /// or a loadable `libggml-rpc.so` (`--rpc-backend`).
+    #[arg(long, env = "GOLBANG_RPC")]
+    rpc: Option<String>,
+
+    /// Path to `libggml-rpc.so` when the pinned HIP/CUDA tree was built without RPC.
+    #[arg(long, env = "GOLBANG_RPC_BACKEND")]
+    rpc_backend: Option<PathBuf>,
+
+    /// llama-server `--tensor-split`, e.g. `32,16` for MI50+V100.
+    /// Empty = split by free VRAM.
+    #[arg(long, env = "GOLBANG_TENSOR_SPLIT")]
+    tensor_split: Option<String>,
+
     /// llama-server `return_progress`. SSE `data:` chunks include
     /// `prompt_progress` (`total`/`cache`/`processed`/`time_ms`) so a long
     /// prefill keeps HTTP idle timers from firing. Default on. Per-request
@@ -274,6 +289,27 @@ async fn main() -> Result<()> {
         cache_type_v: parse_ggml_type(&args.spec_draft_type_v).map_err(anyhow::Error::msg)?,
     };
     let load_mtp = args.load_mtp || spec.wants_mtp();
+    let rpc_servers = match args.rpc.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => parse_rpc_servers(s).map_err(anyhow::Error::msg)?,
+        None => Vec::new(),
+    };
+    let tensor_split = match args
+        .tensor_split
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => parse_tensor_split(s).map_err(anyhow::Error::msg)?,
+        None => Vec::new(),
+    };
+    if !rpc_servers.is_empty() {
+        tracing::info!(
+            servers = ?rpc_servers,
+            rpc_backend = args.rpc_backend.as_ref().map(|p| p.display().to_string()),
+            tensor_split = ?tensor_split,
+            "RPC offload enabled"
+        );
+    }
     // Captured before `spec` is moved into Model::load: the scheduler reserves
     // (verify_n_max + 1) * n_active draft cells from the KV pool (#8565).
     let spec_n_max = spec.verify_n_max().max(0) as u32;
@@ -308,6 +344,9 @@ async fn main() -> Result<()> {
             cache_type_k: parse_ggml_type(&args.kv_type_k).map_err(anyhow::Error::msg)?,
             cache_type_v: parse_ggml_type(&args.kv_type_v).map_err(anyhow::Error::msg)?,
             model_draft: args.model_draft.clone(),
+            rpc_servers,
+            rpc_backend: args.rpc_backend.clone(),
+            tensor_split,
         },
     )
     .with_context(|| format!("load {}", model_path.display()))?;

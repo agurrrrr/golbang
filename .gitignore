@@ -1,5 +1,6 @@
 /target
 /target-hip/
+/target-hip-rpc/
 /target-cuda/
 **/*.rs.bk
 Cargo.lock.bak
