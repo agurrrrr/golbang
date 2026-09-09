@@ -1,7 +1,7 @@
 [Unit]
-Description=golbang OpenAI server - Unsloth Qwen3.8-27B UD-Q3_K_XL + fused MTP (V100 CUDA)
+Description=golbang OpenAI server - Unsloth Qwen3.8-27B UD-Q4_K_XL + fused MTP (2x V100 CUDA)
 After=network.target
-Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service
+Conflicts=qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service ggml-rpc-v100.service
 
 [Service]
 Type=simple
@@ -9,17 +9,22 @@ User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
 Environment=HOME=/home/agurrrrr
-Environment=CUDA_VISIBLE_DEVICES=0
+# Two Tesla V100-SXM2 16 GiB (PCI 41:00.0 + 84:00.0). LAYER split; no NVLink.
+Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
+# tensor-split 18,14: 16,16 put 7216/8837 MiB on CUDA0/1 (FA vs GDN sizes).
+# 20,12 packed CUDA0 (15989/16384). n-ubatch 256 so LAYER PP compute
+# falls back (~1075 MiB/GPU); 512+PP was 1961 and first prefill OOM'd.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q3_K_XL.gguf \
+  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   --alias qwen3.8-27b-cuda \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 53248 --n-batch 1024 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 1 --queue-size 1 --single-max-ctx 53248 \
+  --tensor-split 18,14 \
+  --n-ctx 235520 --n-batch 1024 --n-ubatch 256 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 1 --queue-size 1 --single-max-ctx 235520 --kv-unified \
   --kv-type-k q8_0 --kv-type-v q8_0 \
   --spec-type draft-mtp \
   --spec-draft-n-max 3 \
@@ -30,7 +35,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --api-key REDACTED_KEY1
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=360
+TimeoutStartSec=600
 StandardOutput=journal
 StandardError=journal
 

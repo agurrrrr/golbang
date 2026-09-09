@@ -379,7 +379,7 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 |------|------|------|
 | `deploy/golbang-qwen38.service` | Qwen3.8-27B UD-Q4_K_XL + mmproj + MTP, KV 140k / solo 128k | 8083 |
 | `deploy/golbang-deepseek.service` | DSV4-Flash IQ2_M, `n_cpu_moe=32` | 8080 |
-| `deploy/golbang-cuda-qwen38.service` | Escha Qwen3.8-27B W2 Q8E + MTP (V100 CUDA) | 8084 |
+| `deploy/golbang-cuda-qwen38.service` | Unsloth Qwen3.8-27B UD-Q4_K_XL + MTP, 2×V100 LAYER `--tensor-split 18,14`, ctx 235520 | 8084 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,
