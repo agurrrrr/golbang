@@ -2,6 +2,7 @@
 /target-hip/
 /target-hip-rpc/
 /target-cuda/
+/target-vulkan/
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb

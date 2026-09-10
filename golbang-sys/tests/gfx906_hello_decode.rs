@@ -1,7 +1,7 @@
 //! P0 connection check: load a small GGUF, decode `"Hello"` once.
 //!
-//! Backend (`hip` | `cuda`) is selected by `GOLBANG_GPU` at build time; the
-//! test asserts the matching backend/device strings.
+//! Backend (`hip` | `cuda` | `vulkan`) is selected by `GOLBANG_GPU` at
+//! build time; the test asserts the matching backend/device strings.
 //!
 //! ```text
 //! GOLBANG_TEST_MODEL=/path/to/small.gguf cargo test -p golbang-sys -- --nocapture
@@ -79,6 +79,7 @@ fn hello_decode_once_on_gpu() {
     let gpu = gpu.trim().to_lowercase();
     let (expect_backend, expect_device): (Vec<&str>, Vec<&str>) = match gpu.as_str() {
         "cuda" => (vec!["CUDA"], vec!["CUDA", "NVIDIA", "GeForce"]),
+        "vulkan" => (vec!["Vulkan"], vec!["VEGA20", "RADV", "Vulkan"]),
         _ => (vec!["HIP", "ROCm"], vec!["gfx906", "0x66a1"]),
     };
 

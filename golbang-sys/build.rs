@@ -1,6 +1,7 @@
 //! SHA-pinned `llama.h` bindgen + matching backend `.so`.
 //!
-//! Backend is selected via `GOLBANG_GPU` env (`hip` default, `cuda` optional).
+//! Backend is selected via `GOLBANG_GPU` env (`hip` default, `cuda` /
+//! `vulkan` optional).
 //!
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
@@ -8,6 +9,11 @@
 //! - `cuda` → `llama.cpp-escha` worktree (`escha-w2-dense`, GGML_OP_ESCHA_MUL_MAT),
 //!   CUDA-symbol `.so` byte check, CUDA runtime (`cudart`/`cublas`) link.
 //!   Rollback tree: `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
+//! - `vulkan` → same tree/SHA as `hip` (`llama.cpp-glm5next`), but the
+//!   `build-vulkan/` cmake dir (`GGML_VULKAN=ON`, Mesa RADV). No ROCm link;
+//!   the system `libvulkan.so.1` is used. The gfx906 HIP kernel ports
+//!   (DPP/mmq/GCN repack) are HIP-only — the Vulkan path tests the plain
+//!   upstream kernels on the same model.
 //!
 //! Do not point bindgen at a live header from a sibling tree. SHA or `.so`
 //! drift is a hard error — rebuild that tree, then bump this pin.
@@ -48,12 +54,12 @@ fn main() {
     let gpu = env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
     let gpu = gpu.trim().to_lowercase();
     match gpu.as_str() {
-        "hip" | "cuda" => {}
-        other => panic!("GOLBANG_GPU must be 'hip' or 'cuda', got '{other}'"),
+        "hip" | "cuda" | "vulkan" => {}
+        other => panic!("GOLBANG_GPU must be 'hip', 'cuda' or 'vulkan', got '{other}'"),
     }
 
     let (expected_sha, default_dir) = match gpu.as_str() {
-        "hip" => (EXPECTED_SHA_HIP, DEFAULT_HIP_DIR),
+        "hip" | "vulkan" => (EXPECTED_SHA_HIP, DEFAULT_HIP_DIR),
         "cuda" => (EXPECTED_SHA_CUDA, DEFAULT_CUDA_DIR),
         _ => unreachable!(),
     };
@@ -77,8 +83,9 @@ fn main() {
         );
     }
 
-    // Default is `<tree>/build/bin` (production HIP/CUDA pin). Override for
-    // a same-SHA sibling cmake dir such as `build-rpc-hip` — do not point this
+    // Default is `<tree>/build/bin` (production HIP/CUDA pin), or
+    // `<tree>/build-vulkan/bin` for the Vulkan build. Override for a
+    // same-SHA sibling cmake dir such as `build-rpc-hip` — do not point this
     // at a different git HEAD.
     let bin_dir = match env::var("GOLBANG_LLAMA_BIN_DIR") {
         Ok(p) if !p.trim().is_empty() => {
@@ -91,7 +98,7 @@ fn main() {
             }
             dir
         }
-        _ => llama_dir.join("build/bin"),
+        _ => llama_dir.join(if gpu == "vulkan" { "build-vulkan/bin" } else { "build/bin" }),
     };
 
     // Backend-specific .so + byte check.
@@ -114,6 +121,25 @@ fn main() {
             backend_so = hip_so;
             link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-hip", "mtmd"];
             link_search_extra = &["/opt/rocm/lib"];
+        }
+        "vulkan" => {
+            let vk_so = first_existing(&[
+                bin_dir.join("libggml-vulkan.so"),
+                bin_dir.join("libggml-vulkan.so.0"),
+            ]);
+            let bytes = fs::read(&vk_so).unwrap_or_else(|e| {
+                panic!("failed to read {}: {e}", vk_so.display());
+            });
+            if !bytes.windows(b"ggml_vulkan".len()).any(|w| w == b"ggml_vulkan") {
+                panic!(
+                    "{} does not contain the ggml_vulkan marker. SHA/.so drift — rebuild build-vulkan.",
+                    vk_so.display()
+                );
+            }
+            backend_so = vk_so;
+            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-vulkan", "mtmd"];
+            // System loader finds libvulkan.so.1; no extra search path.
+            link_search_extra = &[];
         }
         "cuda" => {
             let cuda_so = first_existing(&[
@@ -278,6 +304,10 @@ fn main() {
             for lib in ["cudart", "cublas"] {
                 println!("cargo:rustc-link-lib=dylib={lib}");
             }
+        }
+        "vulkan" => {
+            // libvulkan.so.1 is a DT_NEEDED of libggml-vulkan.so itself;
+            // no direct link needed.
         }
         _ => unreachable!(),
     }
