@@ -1,0 +1,180 @@
+{
+  "label": "vulkan-gfx906",
+  "when": "2026-09-10T07:39:38.890040+00:00",
+  "base": "http://127.0.0.1:8083",
+  "model": "qwen3.8-27b-vulkan",
+  "gpu_before": {
+    "edge": "34.0",
+    "junction": "36.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "26.0"
+  },
+  "cases": [
+    {
+      "id": "smoke16",
+      "max_tokens": 16,
+      "gpu_before": {
+        "edge": "34.0",
+        "junction": "36.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "26.0"
+      },
+      "gpu_after": {
+        "edge": "36.0",
+        "junction": "40.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "25.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 10,
+        "draft_accepted_total": 6
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 2.8634087780010304,
+      "finish_reason": "length",
+      "prompt_n": 57,
+      "predicted_n": 16,
+      "cache_n": 0,
+      "prompt_ms": 1164.3576819999998,
+      "predicted_ms": 1694.1572,
+      "prompt_per_second": 48.954029231028,
+      "predicted_per_second": 9.444223948049212,
+      "draft_n": 10,
+      "draft_n_accepted": 6,
+      "content_n": 0,
+      "reasoning_n": 60,
+      "content": "",
+      "reasoning": "User says: \"Reply with exactly: OK\". Need final exactly OK.\n",
+      "error": null
+    },
+    {
+      "id": "para84",
+      "max_tokens": 84,
+      "gpu_before": {
+        "edge": "35.0",
+        "junction": "37.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "25.0"
+      },
+      "gpu_after": {
+        "edge": "39.0",
+        "junction": "42.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 39,
+        "draft_accepted_total": 38
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 9.417339986997831,
+      "finish_reason": "length",
+      "prompt_n": 75,
+      "predicted_n": 84,
+      "cache_n": 0,
+      "prompt_ms": 1745.139346,
+      "predicted_ms": 7667.156359,
+      "prompt_per_second": 42.976510828150225,
+      "predicted_per_second": 10.955821958867137,
+      "draft_n": 39,
+      "draft_n_accepted": 38,
+      "content_n": 0,
+      "reasoning_n": 444,
+      "content": "",
+      "reasoning": "We need answer user: \"In one short paragraph, explain what speculative decoding is and why it can raise tokens per second on a single GPU.\" Need concise one paragraph. Need final only. Ensure accurate: speculative decoding uses small draft model to propose multiple tokens, large target model verifies in parallel (one forward pass) and accepts prefix that matches, rejects/resamples at first mismatch. Raises tokens/sec because LLM decoding is",
+      "error": null
+    },
+    {
+      "id": "mid200",
+      "max_tokens": 200,
+      "gpu_before": {
+        "edge": "37.0",
+        "junction": "39.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "42.0",
+        "junction": "46.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 95,
+        "draft_accepted_total": 92
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 20.094654651999008,
+      "finish_reason": "length",
+      "prompt_n": 84,
+      "predicted_n": 200,
+      "cache_n": 0,
+      "prompt_ms": 1805.8827499999998,
+      "predicted_ms": 18282.917776000002,
+      "prompt_per_second": 46.51464775329407,
+      "predicted_per_second": 10.939172972846825,
+      "draft_n": 95,
+      "draft_n_accepted": 92,
+      "content_n": 0,
+      "reasoning_n": 954,
+      "content": "",
+      "reasoning": "We need answer user's request: \"Write a detailed technical paragraph (about 180 words) on how flash attention reduces HBM traffic during transformer decode. Do not use a bullet list.\"\n\nNeed produce one paragraph about 180 words. Need ensure no bullet list. Need technical. Let's draft around 180 words. Count carefully.\n\nDraft:\n\"During transformer decode, each new token attends to all previous keys and values, so the attention operation repeatedly reads the growing KV cache from high-bandwidth memory (HBM) and writes intermediate attention scores back to HBM in naïve implementations. Flash attention reduces this traffic by exploiting the GPU memory hierarchy: it tiles the query, key, and value matrices into blocks that fit in fast on-chip SRAM, computes partial attention scores, online softmax statistics, and partial outputs without materializing the full N×N attention matrix in HBM. For decode, where the query length is one but the key/value",
+      "error": null
+    },
+    {
+      "id": "long1024",
+      "max_tokens": 1024,
+      "gpu_before": {
+        "edge": "40.0",
+        "junction": "42.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "gpu_after": {
+        "edge": "52.0",
+        "junction": "55.0",
+        "sclk": "sclk clock level: 5: (1386Mhz)",
+        "power_w": "27.0"
+      },
+      "metrics_delta": {
+        "draft_tokens_total": 312,
+        "draft_accepted_total": 296
+      },
+      "ok": true,
+      "http": 200,
+      "wall_s": 109.01506874000188,
+      "finish_reason": "length",
+      "prompt_n": 90,
+      "predicted_n": 1024,
+      "cache_n": 0,
+      "prompt_ms": 1709.000034,
+      "predicted_ms": 107300.232933,
+      "prompt_per_second": 52.662374610578865,
+      "predicted_per_second": 9.543315722710519,
+      "draft_n": 312,
+      "draft_n_accepted": 296,
+      "content_n": 0,
+      "reasoning_n": 4820,
+      "content": "",
+      "reasoning": "We need to respond to user: \"Write a long technical essay (at least 800 words) on speculative decoding, flash attention, and KV-cache traffic on a single GPU. Use only paragraphs, no bullet lists.\"\n\nNeed produce final only paragraphs, no bullets. Need at least 800 words. Need technical essay. Ensure no bullet lists. Could have headings? User says only paragraphs, no bullet lists. Headings maybe okay? But safer only paragraphs, no headings? \"Use only paragraphs\" likely means prose paragraphs, no lists. We can write multiple paragraphs. Need at least 800 words. Let's draft around 1000-1200 words. Need cover speculative decoding, flash attention, KV-cache traffic on single GPU. Technical. No bullets. Ensure no numbered lists. Could mention equations in prose. Need avoid semicolon? fine.\n\nNeed think content:\n- Intro: LLM inference on single GPU, autoregressive decoding bottleneck memory bandwidth, KV cache.\n- Speculative decoding: draft model or n-gram, verify with target model in parallel, accept/reject, speedup, latency, throughput, single GPU constraints, draft overhead, batch size, acceptance rate, tree attention, KV cache management, speculative tokens increase compute but reduce memory-bound steps.\n- Flash attention: IO-aware exact attention, tiling, online softmax, HBM vs SRAM, reduces memory traffic for attention, O(N) not O(N^2) memory, recomputation in backward, for inference prefill and decode. On single GPU, flash attention helps prefill and long context, but decode attention still memory-bound due to KV cache reads.\n- KV-cache traffic: each decode step reads all previous K/V, size 2 * layers * heads * head_dim * seq_len * dtype bytes, bandwidth bound. Single GPU memory bandwidth limits tokens/s. Flash attention reduces intermediate attention matrix traffic but not KV cache reads. Speculative decoding changes traffic: verifying multiple tokens reads KV cache once for multiple positions? Actually target model forward over candidate sequence length L: attention for each new token attends to previous KV plus within candidate. It reads KV cache for each candidate token? In batched verification, can process multiple tokens in one forward pass, reading KV cache multiple times? Need nuance: For a batch of candidate tokens, each token's attention query attends to full KV cache; if implemented as batched sequence, KV cache may be read for each token (or each query block) unless fused. But compared to sequential decoding, one verification step reads KV cache for m tokens, but can be more compute-bound and may reuse KV in SRAM? Flash attention tiles queries and keys/values; for multiple speculative tokens, query length m, KV length N. It reads KV once per query tile? In flash attention, for each query tile, it loops over KV tiles, so if query tile contains multiple speculative tokens, KV tiles read once for that query tile. If m small, maybe one query tile, KV read once, yielding m tokens per KV read, reducing traffic per accepted token. But if m large, multiple query tiles, KV read multiple times. Also target model FFN/MLP compute for m tokens. Acceptance: expected accepted tokens per verification. Speedup when acceptance high and draft cheap.\n- Single GPU: no multi-GPU parallelism, memory capacity limits context and batch. KV cache traffic dominates. Techniques: paged attention, quantization, GQA/MQA, sliding window, offloading? But essay focus.\n- Interplay: speculative decoding + flash attention: flash attention enables efficient verification of longer candidate sequences and tree attention; reduces memory for attention scores; but KV cache traffic remains. Speculative decoding can turn memory-bound decode into more compute-bound verification, improving utilization if GPU has spare compute. But if bandwidth is bottleneck and acceptance low, overhead.\n- Detailed math: Let B bandwidth, KV bytes per token per layer etc. Sequential decode time ~ KV_bytes / B + compute. Speculative with m candidates: verification reads KV maybe m times? Actually if flash attention with query length m, KV read count depends on tiling. For small m, one query block, KV read once, so traffic per verification ~ KV_bytes, producing up to m+1 tokens, reducing traffic per token by factor. But target model must compute m tokens: FLOPs scale with m. If GPU compute underutilized, good. If not, no.\n- Draft model: small model on same GPU, adds memory and compute; can be same model with early exit? n-gram zero cost but lower acceptance. Draft KV cache separate? If draft model separate, its KV cache traffic too. If using same target for draft? Speculative sampling with same model? Usually draft model. On single GPU, memory for draft weights and KV may be significant. Could use quantized draft.\n- Flash attention details: standard attention computes S=QK^T, softmax, PV",
+      "error": null
+    }
+  ],
+  "metrics_before": {
+    "draft_tokens_total": 48,
+    "draft_accepted_total": 46
+  },
+  "gpu_after": {
+    "edge": "51.0",
+    "junction": "54.0",
+    "sclk": "sclk clock level: 5: (1386Mhz)",
+    "power_w": "27.0"
+  },
+  "metrics_after": {
+    "draft_tokens_total": 504,
+    "draft_accepted_total": 478
+  }
+}
