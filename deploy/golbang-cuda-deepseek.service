@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - DeepSeek-V4-Flash-0731 UD-IQ2_M (2x V100 CUDA)
+Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (2x V100 CUDA)
 After=network.target
 Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service ggml-rpc-v100.service
 
@@ -15,24 +15,15 @@ Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
-# DSV4-Flash 284B MoE, IQ2_M 84.68 GiB.
-# n-cpu-moe 43 (ALL experts on CPU): the MI50 unit packs n-cpu-moe 32
-# (GPU weights 26.9 GiB + KV 2.9 + compute 2.2 = 32.0 GiB on ONE 32 GiB card).
-# On 2x16 GiB that does not fit: LAYER split gives every device a FULL
-# n-ubatch compute buffer (~2.2 GiB each), so the total is
-# 26.9 + 2.9 + 2.2*2 = 34.2 GiB > 32.768 GiB even before CUDA contexts.
-# With all 43 expert layers on CPU, GPU weights drop to ~4.7 GiB
-# (attention/norm/embedding/shared-experts only) and the ledger is
-# ~4.7 + 2.9 + 4.4 = 12.0 GiB total (~6.0 GiB/GPU) — comfortable.
-# Cost: decode slows (all expert GEMVs on CPU, ~6-7 tok/s vs 7.8 on MI50).
-# Prefill should improve (V100 FP16 125 TFLOPS vs MI50 13.1).
-# tensor-split 16,16: with only ~4.7 GiB of GPU weights the FA/GDN size skew
-# that forced 18,14 on cuda-qwen38 is harmless here.
-# n-batch 5800 / n-ubatch 1024 / n-parallel 1: same as MI50 production
-# (prefill_max=5800, compute capped at ubatch).
+# DeepSeek-V4.1-Flash Q2_K (arch deepseek4), 7 shards, 246 GiB file.
+# n-cpu-moe 43 = ALL 43 MoE layers on CPU (the model has 43 layers): expert
+# weights are far too large for 2x16 GiB, GPU keeps non-expert weights + KV.
+# tensor-split 16,16: LAYER split, even.
+# n-batch 5800 / n-ubatch 1024 / n-parallel 1: same as MI50 production.
+# NOTE: unit file only — not yet started/tested on CUDA.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
-  --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
-  --alias dsv4-flash-cuda \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-cuda \
   --host 0.0.0.0 --port 8086 \
   --n-gpu-layers 99 --n-cpu-moe 43 --flash-attn on \
   --tensor-split 16,16 \
@@ -42,7 +33,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --api-key REDACTED_KEY1
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=600
+TimeoutStartSec=900
 StandardOutput=journal
 StandardError=journal
 MemoryMax=120G

@@ -1,5 +1,5 @@
 [Unit]
-Description=golbang OpenAI server - DeepSeek-V4-Flash-0731 UD-IQ2_M (MI50)
+Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (MI50)
 After=network.target
 Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-qwen38.service golbang-qwen48.service golbang-glm53flash.service
 
@@ -13,19 +13,28 @@ Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build/bin
 Environment=RUST_LOG=info
-# n-ubatch=1024: llama-server uses -b/-ub 5800, but this llama.cpp SHA needs ~5 GiB
-# compute at ubatch=5800 and OOMs next to 60k KV on 32 GiB. n-batch stays 5800.
+# DeepSeek-V4.1-Flash Q2_K (arch deepseek4), 7 shards, 246 GiB file.
+# Loader patch (llama.cpp-glm5next, wiki dsv41-on-golbang): 83 engram/sparse/
+# compressor/indexer tensors are TENSOR_SKIP (counted but NOT loaded) -> engram
+# + sparse attention absent, output quality degraded (expected: "just make it run").
+# n-cpu-moe 35: pins expert weights of the FIRST 35 layers to CPU -> only 5 layers
+# of experts on GPU (5 x 4.58 = 22.9 GiB) + non-expert 2.7 GiB = 25.6 GiB weights,
+# leaving ~7 GiB for 60k KV (~2.9) + compute buffer. n-cpu-moe 32 (8 GPU expert
+# layers = 36.6 GiB) OOMs the 32 GiB MI50: "allocating 40285.60 MiB ... out of memory".
+# n-ubatch=1024: ubatch=5800 compute OOMs next to 60k KV on 32 GiB. n-batch stays 5800.
+# TimeoutStartSec=900: 246 GiB mmap load takes several minutes.
 ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
-  --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-hip \
   --host 0.0.0.0 --port 8080 \
-  --n-gpu-layers 99 --n-cpu-moe 32 --flash-attn on \
+  --n-gpu-layers 99 --n-cpu-moe 35 --flash-attn on \
   --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 1 \
   --jinja --reasoning-format deepseek \
   --api-key REDACTED_KEY1
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=300
+TimeoutStartSec=900
 StandardOutput=journal
 StandardError=journal
 MemoryMax=120G
