@@ -16,11 +16,22 @@ Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 # DeepSeek-V4.1-Flash Q2_K (arch deepseek4), 7 shards, 246 GiB file.
-# n-cpu-moe 43 = ALL 43 MoE layers on CPU (the model has 43 layers): expert
-# weights are far too large for 2x16 GiB, GPU keeps non-expert weights + KV.
+# Requires the V4.1 loader patches on the llama.cpp-escha tree (same 5 patches as
+# the HIP/glm5next tree: llama-arch.{h,cpp} engram/sparse tensor entries,
+# deepseek4.cpp skip_file_tensor + ratio guard + output-hc mean fallback,
+# llama-kv-cache.cpp rot guards). See wiki dsv41-on-golbang.
+# n-cpu-moe 43 = ALL MoE layers on CPU: expert weights (183 GiB) cannot fit
+# 2x16 GiB, so the GPU keeps only non-expert weights + KV. Tested 2026-09-11:
+# load ~2 min, weights CUDA0 1.17 + CUDA1 1.58 GiB, KV 1.23+1.12, compute 3.3+0.6.
+# Measured (n-cpu-moe 43): prefill 7->216 t/s (88->3170 tok), decode 10.7->15.6 t/s.
+# n-cpu-moe 38 also loads (2 expert layers land entirely on CUDA1, 10.9 GiB) but
+# decode is unchanged (~9-16 t/s): the bottleneck is the CPU expert GEMV.
 # tensor-split 16,16: LAYER split, even.
 # n-batch 5800 / n-ubatch 1024 / n-parallel 1: same as MI50 production.
-# NOTE: unit file only — not yet started/tested on CUDA.
+# NOTE: output is degraded — engram conditional memory and V4.1 cross-layer sparse
+# attention (kv_source/index_source/dspark) are not modeled by the V4 runtime, and
+# the early-converted GGUF lacks the engram hash constants. See wiki dsv41-on-golbang.
+# This unit is validated for loading + speed only.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
   --alias dsv41-flash-cuda \
