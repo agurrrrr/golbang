@@ -383,6 +383,8 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 | `deploy/golbang-cuda-deepseek.service` | DSV4.1-Flash Q2_K (deepseek4), `n_cpu_moe=43` (expert 전량 CPU), 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-cuda` | 8086 |
 | `deploy/golbang-glm53flash.service` | GLM-5.3-Flash AJ-IQ2_XXS (MI50) | 8085 |
 | `deploy/llama-server-dsv41.service` | upstream llama.cpp `llama-server` (`llama.cpp-v41` = master `9cbf07987` + gfx906 포트 + DSV4.1 로더 패치), DSV4.1-Flash Q2_K, `n_cpu_moe=35`, alias `dsv41-flash-llama` | 8080 |
+| `deploy/llama-server-dsv41-native.service` | 네이티브 deepseek41 런타임 (`llama.cpp-ds41` = vcruz305 `runtime/deepseek41` + gfx906 포트, MI50 HIP), DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=35`, alias `dsv41-flash-native` | 8080 |
+| `deploy/llama-server-dsv41-native-cuda.service` | 위 트리의 CUDA(sm_70) 빌드 `build-cuda`, DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=39`, 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-native-cuda` | 8086 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,

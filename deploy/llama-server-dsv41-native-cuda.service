@@ -1,0 +1,62 @@
+[Unit]
+Description=llama.cpp server - DeepSeek-V4.1-Flash Q2_K (2x V100 CUDA, vcruz305 runtime/deepseek41 native runtime)
+After=network.target
+# Same rationale as the MI50 native unit: do not use the name llama-server.service
+# (shepherd.service has Wants=llama-server.service, see wiki shepherd-llama-server-conflict).
+# Conflicts with every other DSV4/DSV4.1 unit and with the V100 qwen38 server. The 246 GiB
+# model plus 60 GiB engram tables do not leave host RAM for two instances at once, and the
+# V100 pool is shared with golbang-cuda-qwen38, so only one of these runs at a time.
+Conflicts=llama-server.service llama-server-dsv41.service llama-server-dsv41-native.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service golbang-cuda-deepseek.service ggml-rpc-v100.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HOME=/home/agurrrrr
+# Two Tesla V100-SXM2 16 GiB (PCI 41:00.0 + 84:00.0), LAYER split, no NVLink.
+Environment=CUDA_VISIBLE_DEVICES=0,1
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build-cuda/bin:/opt/cuda-12.8/lib64
+# Runtime: vcruz305/llama.cpp runtime/deepseek41 (f37da5711) + gfx906 ports, CUDA backend.
+# Tree: /home/agurrrrr/code/local-llm/llama.cpp-ds41 (separate build-cuda; the HIP build/ stays).
+# This is the native deepseek41 runtime: engram, hyper-connections and sparse attention are
+# real, so output is coherent (unlike the loader-patched deepseek4 units). See wiki
+# dsv41-native-runtime. The CUDA build matches the HIP one except for the backend
+# (see wiki cuda-hip-separate-builds).
+# Model: /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/ - the Hub first shard carries the
+# deepseek41 KV prefix and the 5 engram hash constants were added from the checkpoint tokenizer.
+# Keep --ctx-size at 16384: V4.1's second-level candidate mask is not implemented, so above
+# candidate_topk_blocks * candidate_block_size (16K) the runtime stops being exact.
+# --n-cpu-moe keeps the first N layers' expert weights on CPU. Expert weights total 183 GiB,
+# so the 32 GiB V100 pool can hold only a few expert layers. Under an even layer split the
+# remaining expert layers pile onto CUDA1, so the ceiling is low. Measured 2026-09-12:
+#   n-cpu-moe 38 -> CUDA1 16015/16384 MiB (2 expert layers, ~0.4 GiB free: too tight)
+#   n-cpu-moe 39 -> CUDA1 11507/16384 MiB (1 expert layer, ~5 GiB free)
+# Decode is identical (~4.0 t/s; the CPU expert GEMV is the bottleneck), so 39 is the safe
+# production value. 37 tries to put 3 expert layers on CUDA1 -> OOM.
+# --tensor-split 16,16: even LAYER split.
+# engram tables (~60 GiB) are TENSOR_READ_LAZY on the host, so mmap must stay on.
+# Measured (2026-09-12, n-cpu-moe 39): "17 x 23" -> 391, "capital of France" -> Paris;
+# prefill 34.6 t/s @ 973 tok, decode ~4.0-4.4 t/s (MI50 native: prefill 7.7, decode 3.9).
+ExecStart=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build-cuda/bin/llama-server \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-native-cuda \
+  --host 0.0.0.0 --port 8086 \
+  --n-gpu-layers 99 --n-cpu-moe 39 --flash-attn on \
+  --tensor-split 16,16 \
+  --ctx-size 16384 --batch-size 4096 --ubatch-size 1024 --threads 32 \
+  --parallel 1 \
+  --jinja --reasoning-format deepseek \
+  --metrics \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target
