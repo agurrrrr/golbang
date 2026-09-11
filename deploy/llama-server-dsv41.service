@@ -1,0 +1,43 @@
+[Unit]
+Description=llama.cpp server - DeepSeek-V4.1-Flash Q2_K (MI50, upstream master + V4.1 loader patch)
+After=network.target
+# Not named llama-server.service on purpose: shepherd.service has Wants=llama-server.service
+# (see wiki shepherd-llama-server-conflict). Conflicts only with the other MI50 servers.
+Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=ROCBLAS_USE_HIPBLASLT=0
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-v41/build/bin
+# Upstream master (43f3dda62) + gfx906 furnace ports (DPP / MMQ I=64 / GCN repack) +
+# the DSV4.1 loader patches ported to master (wiki dsv41-on-golbang). Tree: llama.cpp-v41.
+# Model: DeepSeek-V4.1-Flash Q2_K (arch deepseek4), 7 shards, 246 GiB.
+# Engram + sparse (ratio 1/2 CSA2/DSpark) tensors are TENSOR_SKIP: counted but NOT loaded,
+# so output quality is degraded (same caveat as the golbang dsv41 units).
+# --n-cpu-moe 35 keeps the first 35 layers' expert weights on CPU (5 expert layers on the
+# 32 GiB MI50); -ncmoe 32 OOMs. --ubatch-size 1024: 5800 OOMs next to 60k KV.
+ExecStart=/home/agurrrrr/code/local-llm/llama.cpp-v41/build/bin/llama-server \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-llama \
+  --host 0.0.0.0 --port 8080 \
+  --n-gpu-layers 99 --n-cpu-moe 35 --flash-attn on \
+  --ctx-size 60000 --batch-size 5800 --ubatch-size 1024 --threads 32 \
+  --parallel 1 \
+  --jinja --reasoning-format deepseek \
+  --metrics \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target

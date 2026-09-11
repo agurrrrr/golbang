@@ -382,6 +382,7 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 | `deploy/golbang-cuda-qwen38.service` | Unsloth Qwen3.8-27B UD-Q4_K_XL + MTP, 2×V100 LAYER `--tensor-split 18,14`, ctx 10000×2 | 8084 |
 | `deploy/golbang-cuda-deepseek.service` | DSV4.1-Flash Q2_K (deepseek4), `n_cpu_moe=43` (expert 전량 CPU), 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-cuda` | 8086 |
 | `deploy/golbang-glm53flash.service` | GLM-5.3-Flash AJ-IQ2_XXS (MI50) | 8085 |
+| `deploy/llama-server-dsv41.service` | upstream llama.cpp `llama-server` (`llama.cpp-v41` = master `9cbf07987` + gfx906 포트 + DSV4.1 로더 패치), DSV4.1-Flash Q2_K, `n_cpu_moe=35`, alias `dsv41-flash-llama` | 8080 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,
