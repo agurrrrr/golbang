@@ -20,12 +20,13 @@ Environment=RUST_LOG=info
 # the HIP/glm5next tree: llama-arch.{h,cpp} engram/sparse tensor entries,
 # deepseek4.cpp skip_file_tensor + ratio guard + output-hc mean fallback,
 # llama-kv-cache.cpp rot guards). See wiki dsv41-on-golbang.
-# n-cpu-moe 43 = ALL MoE layers on CPU: expert weights (183 GiB) cannot fit
-# 2x16 GiB, so the GPU keeps only non-expert weights + KV. Tested 2026-09-11:
-# load ~2 min, weights CUDA0 1.17 + CUDA1 1.58 GiB, KV 1.23+1.12, compute 3.3+0.6.
-# Measured (n-cpu-moe 43): prefill 7->216 t/s (88->3170 tok), decode 10.7->15.6 t/s.
-# n-cpu-moe 38 also loads (2 expert layers land entirely on CUDA1, 10.9 GiB) but
-# decode is unchanged (~9-16 t/s): the bottleneck is the CPU expert GEMV.
+# n-cpu-moe 38 = first 38 MoE layers' experts on CPU; the last 2 (blk.38/39,
+# ~10.9 GiB) land entirely on CUDA1. Expert weights (183 GiB) otherwise cannot
+# fit 2x16 GiB, so the GPU keeps non-expert weights + KV + those 2 expert layers.
+# Tested 2026-09-11: n-cpu-moe 43 and 38 both load; decode is ~equal (9-16 t/s)
+# because the bottleneck is the CPU expert GEMV, not the GPU expert layers.
+# Measured (n-cpu-moe 38): prefill 6.7->216 t/s (88->3170 tok), decode 9.4->15.8 t/s.
+# (n-cpu-moe 36 / 4 GPU expert layers asks CUDA1 for 20.3 GiB -> OOM.)
 # tensor-split 16,16: LAYER split, even.
 # n-batch 5800 / n-ubatch 1024 / n-parallel 1: same as MI50 production.
 # NOTE: output is degraded — engram conditional memory and V4.1 cross-layer sparse
@@ -36,7 +37,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
   --alias dsv41-flash-cuda \
   --host 0.0.0.0 --port 8086 \
-  --n-gpu-layers 99 --n-cpu-moe 43 --flash-attn on \
+  --n-gpu-layers 99 --n-cpu-moe 38 --flash-attn on \
   --tensor-split 16,16 \
   --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 1 \
