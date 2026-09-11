@@ -1,0 +1,47 @@
+[Unit]
+Description=llama.cpp server - DeepSeek-V4.1-Flash Q2_K (MI50, vcruz305 runtime/deepseek41 native runtime)
+After=network.target
+# Not named llama-server.service on purpose: shepherd.service has Wants=llama-server.service
+# (see wiki shepherd-llama-server-conflict). Conflicts with the other MI50 servers and with
+# the superseded loader-patched unit whose output is degraded.
+Conflicts=llama-server.service llama-server-dsv41.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=ROCBLAS_USE_HIPBLASLT=0
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build/bin
+# Runtime: vcruz305/llama.cpp runtime/deepseek41 (f37da5711) + gfx906 furnace ports.
+# Tree: /home/agurrrrr/code/local-llm/llama.cpp-ds41. This is the native deepseek41 runtime:
+# engram, hyper-connections and sparse attention are real, so output is coherent (unlike the
+# loader-patched deepseek4 units). See wiki dsv41-native-runtime.
+# Model: /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/ - the Hub first shard gives the
+# deepseek41 KV prefix and the 5 engram hash constants are added from the checkpoint tokenizer.
+# Keep --ctx-size at 16384: V4.1's second-level candidate mask is not implemented, so above
+# candidate_topk_blocks * candidate_block_size (16K) the runtime stops being exact.
+# --n-cpu-moe 35 keeps the first 35 layers' expert weights on CPU (5 expert layers on the
+# 32 GiB MI50); 34 OOMs once KV/compute is included.
+ExecStart=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build/bin/llama-server \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-native \
+  --host 0.0.0.0 --port 8080 \
+  --n-gpu-layers 99 --n-cpu-moe 35 --flash-attn on \
+  --ctx-size 16384 --batch-size 4096 --ubatch-size 1024 --threads 32 \
+  --parallel 1 \
+  --jinja --reasoning-format deepseek \
+  --metrics \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target
