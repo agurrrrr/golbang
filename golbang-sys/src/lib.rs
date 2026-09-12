@@ -2,7 +2,7 @@
 //!
 //! Safe wrappers live in `golbang-core` (P1). This crate only exposes the C ABI
 //! generated from the SHA-pinned llama.cpp tree selected by `GOLBANG_GPU`
-//! (`hip` → `llama.cpp-glm5next` / `cuda` → `llama.cpp-escha`).
+//! (`hip` → `llama.cpp-glm5next` / `cuda` → `llama.cpp-cuda-upstream`).
 //!
 //! Current names: [`llama_model_load_from_file`], [`llama_init_from_model`],
 //! [`llama_model_free`]. The older `llama_load_model_from_file` /
@@ -77,7 +77,7 @@ mod api_names {
         let _rpc_reg = ggml_backend_register;
         let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
         let expected = if gpu.trim().eq_ignore_ascii_case("cuda") {
-            "c5d759c8a9e02653e9acd2442599b4c8eccc5ba5"
+            "c069aa7f5f2beeead1a3a8e9f71510f1b64d0725"
         } else {
             "367ebbc20c2b20db411d5acf72b88d26a7c13d70"
         };

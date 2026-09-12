@@ -258,7 +258,7 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 | GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
 |-----|-----|---------------|----------------|---------|
 | HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
-| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-escha` (`escha-w2-dense`) | `c5d759c8a` |
+| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda-upstream` (`origin/master`) | `c069aa7f5` |
 | DSV4.1 HIP (MI50) | `GOLBANG_GPU=ds41` | `target-ds41` | `llama.cpp-ds41` (vcruz305 `runtime/deepseek41`) | `24032ea2b` |
 | DSV4.1 CUDA (V100) | `GOLBANG_GPU=ds41-cuda` | `target-ds41-cuda` | `llama.cpp-ds41` (`build-cuda`) | `24032ea2b` |
 

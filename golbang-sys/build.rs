@@ -6,9 +6,10 @@
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
 //!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
-//! - `cuda` → `llama.cpp-escha` worktree (`escha-w2-dense`, GGML_OP_ESCHA_MUL_MAT),
-//!   CUDA-symbol `.so` byte check, CUDA runtime (`cudart`/`cublas`) link.
-//!   Rollback tree: `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
+//! - `cuda` → `llama.cpp-cuda-upstream` (plain `origin/master`), CUDA-symbol
+//!   `.so` byte check, CUDA runtime (`cudart`/`cublas`) link. Rollback trees:
+//!   `llama.cpp-escha` @ `c5d759c8a` (`escha-w2-dense` + DSV4.1 loader patches)
+//!   and `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
 //! - `vulkan` → same tree/SHA as `hip` (`llama.cpp-glm5next`), but the
 //!   `build-vulkan/` cmake dir (`GGML_VULKAN=ON`, Mesa RADV). No ROCm link;
 //!   the system `libvulkan.so.1` is used. The gfx906 HIP kernel ports
@@ -34,9 +35,9 @@ use std::process::Command;
 /// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
 /// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
-const EXPECTED_SHA_CUDA: &str = "c5d759c8a9e02653e9acd2442599b4c8eccc5ba5";
+const EXPECTED_SHA_CUDA: &str = "c069aa7f5f2beeead1a3a8e9f71510f1b64d0725";
 const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
-const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-escha";
+const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream";
 /// DSV4.1 native runtime: vcruz305 `runtime/deepseek41` (`f37da5711`) + the
 /// gfx906 furnace ports. Different tree/SHA from the `hip`/`cuda` pins because
 /// this branch carries `deepseek41` and not glm5next.

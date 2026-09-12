@@ -1,5 +1,11 @@
 [Unit]
-Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (2x V100 CUDA)
+# DEPRECATED (2026-09-12): superseded by golbang-server-ds41-cuda.service, which
+# runs the DSV4.1 native runtime (llama.cpp-ds41, target-ds41-cuda, port 8089).
+# This unit loaded V4.1 through the DSV4.1 loader patches that used to ride on the
+# `cuda` pin tree (llama.cpp-escha). The `cuda` pin now points at plain upstream
+# (llama.cpp-cuda-upstream), which does not carry those patches, so this unit no
+# longer loads the model. Kept only as a record.
+Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (2x V100 CUDA) [DEPRECATED]
 After=network.target
 Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service ggml-rpc-v100.service
 
@@ -13,13 +19,13 @@ Environment=HOME=/home/agurrrrr
 # Same 2x V100 pool as golbang-cuda-qwen38 — Conflicts keeps them mutually exclusive.
 Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
-Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-escha/build/bin:/opt/cuda-12.8/lib64
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 # DeepSeek-V4.1-Flash Q2_K (arch deepseek4), 7 shards, 246 GiB file.
-# Requires the V4.1 loader patches on the llama.cpp-escha tree (same 5 patches as
-# the HIP/glm5next tree: llama-arch.{h,cpp} engram/sparse tensor entries,
+# Required (on the retired llama.cpp-escha pin) the V4.1 loader patches — same 5
+# as the HIP/glm5next tree: llama-arch.{h,cpp} engram/sparse tensor entries,
 # deepseek4.cpp skip_file_tensor + ratio guard + output-hc mean fallback,
-# llama-kv-cache.cpp rot guards). See wiki dsv41-on-golbang.
+# llama-kv-cache.cpp rot guards. See wiki dsv41-on-golbang.
 # n-cpu-moe 38 = first 38 MoE layers' experts on CPU; the last 2 (blk.38/39,
 # ~10.9 GiB) land entirely on CUDA1. Expert weights (183 GiB) otherwise cannot
 # fit 2x16 GiB, so the GPU keeps non-expert weights + KV + those 2 expert layers.
