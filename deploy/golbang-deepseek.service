@@ -15,11 +15,13 @@ Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/bui
 Environment=RUST_LOG=info
 # DeepSeek-V4-Flash-0731 UD-IQ2_M (arch deepseek4), 3 shards, 84.68 GiB.
 # Reverted from the DSV4.1-Flash Q2_K experiment (too slow for daily use).
+# Shards live on the local NVMe (/home), not the NAS: NFS mmap load took ~7.5 min
+# and thrashed under cgroup MemoryMax. DSV4.1 moved the other way (NAS + symlink).
 # n-cpu-moe 32: pins expert weights of the FIRST 32 layers to CPU, keeping the
 # rest on the 32 GiB MI50. n-ubatch=1024: ubatch=5800 compute OOMs next to 60k KV.
 # TimeoutStartSec=300: 84 GiB mmap load.
 ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
-  --model /home/agurrrrr/models-nas1/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   --alias deepseek-v4-flash-0731 \
   --host 0.0.0.0 --port 8080 \
   --n-gpu-layers 99 --n-cpu-moe 32 --flash-attn on \
