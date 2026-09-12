@@ -259,10 +259,18 @@ CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
 |-----|-----|---------------|----------------|---------|
 | HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
 | CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-escha` (`escha-w2-dense`) | `c5d759c8a` |
+| DSV4.1 HIP (MI50) | `GOLBANG_GPU=ds41` | `target-ds41` | `llama.cpp-ds41` (vcruz305 `runtime/deepseek41`) | `24032ea2b` |
+| DSV4.1 CUDA (V100) | `GOLBANG_GPU=ds41-cuda` | `target-ds41-cuda` | `llama.cpp-ds41` (`build-cuda`) | `24032ea2b` |
+
+`ds41`/`ds41-cuda`는 HIP/CUDA 링크 레시피를 그대로 쓰되 DSV4.1 네이티브 런타임
+트리(`deepseek41`; glm5next 없음)를 가리킨다. 따라서 별도 바이너리이고 `hip`/`cuda`
+핀을 대체하지 않는다 (위키 `golbang-as-dsv41-runtime`).
 
 서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
 `target-hip/release/golbang-server`, V100 서비스는
-`target-cuda/release/golbang-server` (유닛은 `deploy/`).
+`target-cuda/release/golbang-server`, DSV4.1 서비스는 각각
+`target-ds41/release/golbang-server`(HIP)와
+`target-ds41-cuda/release/golbang-server`(CUDA) (유닛은 `deploy/`).
 
 필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2 (HIP) / CUDA 12.8 toolkit
 (`/opt/cuda-12.8`, V100/Volta. CUDA 13은 compute_70을 지원하지 않음),
@@ -277,6 +285,12 @@ CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo build -p golbang-server --rele
 
 # CUDA (V100, CUDA 12.8)
 CARGO_TARGET_DIR=target-cuda GOLBANG_GPU=cuda cargo build -p golbang-server --release
+
+# DSV4.1 네이티브 런타임, MI50 HIP (llama.cpp-ds41/build/bin)
+CARGO_TARGET_DIR=target-ds41 GOLBANG_GPU=ds41 cargo build -p golbang-server --release
+
+# DSV4.1 네이티브 런타임, 2×V100 CUDA (llama.cpp-ds41/build-cuda/bin)
+CARGO_TARGET_DIR=target-ds41-cuda GOLBANG_GPU=ds41-cuda cargo build -p golbang-server --release
 
 # 테스트 (GOLBANG_GPU로 백엔드 선택, 기본 hip)
 CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo test -p golbang-sys -- --nocapture
@@ -385,6 +399,8 @@ systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
 | `deploy/llama-server-dsv41.service` | upstream llama.cpp `llama-server` (`llama.cpp-v41` = master `9cbf07987` + gfx906 포트 + DSV4.1 로더 패치), DSV4.1-Flash Q2_K, `n_cpu_moe=35`, alias `dsv41-flash-llama` | 8080 |
 | `deploy/llama-server-dsv41-native.service` | 네이티브 deepseek41 런타임 (`llama.cpp-ds41` = vcruz305 `runtime/deepseek41` + gfx906 포트, MI50 HIP), DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=35`, alias `dsv41-flash-native` | 8080 |
 | `deploy/llama-server-dsv41-native-cuda.service` | 위 트리의 CUDA(sm_70) 빌드 `build-cuda`, DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=39`, 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-native-cuda` | 8086 |
+| `deploy/golbang-server-ds41.service` | golbang-server + 네이티브 deepseek41 런타임 (`GOLBANG_GPU=ds41`, MI50 HIP), DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=35`, alias `dsv41-flash-golbang` | 8087 |
+| `deploy/golbang-server-ds41-cuda.service` | 위의 CUDA 빌드 (`GOLBANG_GPU=ds41-cuda`, `build-cuda`), `n_cpu_moe=39`, 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-golbang-cuda` | 8089 |
 
 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
 `ROCBLAS_USE_HIPBLASLT=0`,

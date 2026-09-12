@@ -1,0 +1,47 @@
+[Unit]
+Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (MI50, native deepseek41 runtime)
+After=network.target
+# golbang-server on the DSV4.1 native runtime (llama.cpp-ds41, vcruz305 runtime/deepseek41).
+# Same GPU pool as the MI50 llama-server units and cannot coexist with any other DSV4.1
+# instance (246 GiB model + 60 GiB engram tables exceed host RAM).
+Conflicts=llama-server.service llama-server-dsv41.service llama-server-dsv41-native.service llama-server-dsv41-native-cuda.service golbang-server-ds41-cuda.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service golbang-cuda-deepseek.service ggml-rpc-v100.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=ROCBLAS_USE_HIPBLASLT=0
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build/bin
+Environment=RUST_LOG=info
+# Binary: target-ds41 (GOLBANG_GPU=ds41 -> llama.cpp-ds41 @ 24032ea2b, HIP build/bin).
+# Unlike deploy/golbang-deepseek.service this is the *native* deepseek41 runtime:
+# engram, hyper-connections and sparse attention are real, so output is coherent.
+# Model: /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/ (Hub first shard with the
+# deepseek41 KV prefix + 5 engram hash constants). See wiki dsv41-native-runtime.
+# --n-ctx 16384: V4.1's second-level candidate mask is unimplemented, so above
+# candidate_topk_blocks * candidate_block_size (16K) the runtime stops being exact.
+# --n-cpu-moe 35: first 35 layers' expert weights on CPU (5 expert layers on the
+# 32 GiB MI50), matching llama-server-dsv41-native.service.
+# --n-rs-seq 1: DSV4 suffix rollback snapshot (bind drops the trailing <think>).
+ExecStart=/home/agurrrrr/code/golbang/target-ds41/release/golbang-server \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-golbang \
+  --host 0.0.0.0 --port 8087 \
+  --n-gpu-layers 99 --n-cpu-moe 35 --flash-attn on \
+  --n-ctx 16384 --n-batch 4096 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
+  --n-parallel 1 --queue-size 1 \
+  --jinja --reasoning-format deepseek \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target

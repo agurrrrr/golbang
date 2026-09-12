@@ -14,6 +14,14 @@
 //!   the system `libvulkan.so.1` is used. The gfx906 HIP kernel ports
 //!   (DPP/mmq/GCN repack) are HIP-only — the Vulkan path tests the plain
 //!   upstream kernels on the same model.
+//! - `ds41` → DSV4.1 native runtime tree (`llama.cpp-ds41`, vcruz305
+//!   `runtime/deepseek41` + gfx906 furnace ports), HIP build `build/bin`.
+//!   Reuses the HIP link recipe; the tree/SHA differs from `hip`.
+//! - `ds41-cuda` → same `llama.cpp-ds41` tree, CUDA-symbol `.so` check, CUDA
+//!   runtime link, and the `build-cuda/` cmake dir (V100 sm_70, CUDA 12.8).
+//!   This is a separate binary: the ds41 tree has `deepseek41` but not
+//!   glm5next, so it must not replace the `hip`/`cuda` pins. See wiki
+//!   `golbang-as-dsv41-runtime`.
 //!
 //! Do not point bindgen at a live header from a sibling tree. SHA or `.so`
 //! drift is a hard error — rebuild that tree, then bump this pin.
@@ -29,6 +37,11 @@ const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
 const EXPECTED_SHA_CUDA: &str = "c5d759c8a9e02653e9acd2442599b4c8eccc5ba5";
 const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
 const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-escha";
+/// DSV4.1 native runtime: vcruz305 `runtime/deepseek41` (`f37da5711`) + the
+/// gfx906 furnace ports. Different tree/SHA from the `hip`/`cuda` pins because
+/// this branch carries `deepseek41` and not glm5next.
+const EXPECTED_SHA_DS41: &str = "24032ea2b12cc0cc38dfa58099bc1ecb6890d6fc";
+const DEFAULT_DS41_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-ds41";
 const EXPECTED_LLAMA_H_LINES: usize = 1638;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
@@ -54,13 +67,25 @@ fn main() {
     let gpu = env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
     let gpu = gpu.trim().to_lowercase();
     match gpu.as_str() {
-        "hip" | "cuda" | "vulkan" => {}
-        other => panic!("GOLBANG_GPU must be 'hip', 'cuda' or 'vulkan', got '{other}'"),
+        "hip" | "cuda" | "vulkan" | "ds41" | "ds41-cuda" => {}
+        other => panic!(
+            "GOLBANG_GPU must be 'hip', 'cuda', 'vulkan', 'ds41' or 'ds41-cuda', got '{other}'"
+        ),
     }
+
+    // `ds41`/`ds41-cuda` reuse the HIP/CUDA link recipe but point at the DSV4.1
+    // native runtime tree (different SHA + cmake dirs).
+    let backend = match gpu.as_str() {
+        "hip" | "ds41" => "hip",
+        "cuda" | "ds41-cuda" => "cuda",
+        "vulkan" => "vulkan",
+        _ => unreachable!(),
+    };
 
     let (expected_sha, default_dir) = match gpu.as_str() {
         "hip" | "vulkan" => (EXPECTED_SHA_HIP, DEFAULT_HIP_DIR),
         "cuda" => (EXPECTED_SHA_CUDA, DEFAULT_CUDA_DIR),
+        "ds41" | "ds41-cuda" => (EXPECTED_SHA_DS41, DEFAULT_DS41_DIR),
         _ => unreachable!(),
     };
 
@@ -98,12 +123,16 @@ fn main() {
             }
             dir
         }
-        _ => llama_dir.join(if gpu == "vulkan" { "build-vulkan/bin" } else { "build/bin" }),
+        _ => llama_dir.join(match gpu.as_str() {
+            "vulkan" => "build-vulkan/bin",
+            "ds41-cuda" => "build-cuda/bin",
+            _ => "build/bin",
+        }),
     };
 
     // Backend-specific .so + byte check.
     let (backend_so, link_libs, link_search_extra): (PathBuf, &[&str], &[&str]);
-    match gpu.as_str() {
+    match backend {
         "hip" => {
             let hip_so = first_existing(&[
                 bin_dir.join("libggml-hip.so"),
@@ -114,8 +143,9 @@ fn main() {
             });
             if !bytes.windows(b"gfx906".len()).any(|w| w == b"gfx906") {
                 panic!(
-                    "{} does not contain gfx906. SHA/.so drift — switch to (B) in P3.",
-                    hip_so.display()
+                    "{} does not contain gfx906. SHA/.so drift at GOLBANG_GPU={gpu} — rebuild {}.",
+                    hip_so.display(),
+                    llama_dir.display()
                 );
             }
             backend_so = hip_so;
@@ -154,8 +184,9 @@ fn main() {
                 .any(|w| w == b"__cudaRegisterFatBinary")
             {
                 panic!(
-                    "{} does not contain CUDA runtime symbols. SHA/.so drift — rebuild llama.cpp-escha.",
-                    cuda_so.display()
+                    "{} does not contain CUDA runtime symbols. SHA/.so drift at GOLBANG_GPU={gpu} — rebuild {}.",
+                    cuda_so.display(),
+                    llama_dir.display()
                 );
             }
             backend_so = cuda_so;
@@ -294,7 +325,7 @@ fn main() {
     for lib in link_libs {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
-    match gpu.as_str() {
+    match backend {
         "hip" => {
             for lib in ["amdhip64", "hipblas", "rocblas"] {
                 println!("cargo:rustc-link-lib=dylib={lib}");

@@ -1,0 +1,48 @@
+[Unit]
+Description=golbang OpenAI server - DeepSeek-V4.1-Flash Q2_K (2x V100 CUDA, native deepseek41 runtime)
+After=network.target
+# golbang-server on the DSV4.1 native runtime (llama.cpp-ds41 build-cuda, vcruz305
+# runtime/deepseek41). Shares the 2x V100 pool with golbang-cuda-qwen38 and cannot
+# coexist with any other DSV4.1 instance (host RAM cannot hold two 246 GiB copies).
+Conflicts=llama-server.service llama-server-dsv41.service llama-server-dsv41-native.service llama-server-dsv41-native-cuda.service golbang-server-ds41.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-deepseek-rpc.service golbang-qwen38.service golbang-qwen38-vulkan.service golbang-qwen48.service golbang-glm53flash.service golbang-cuda-qwen38.service golbang-cuda-deepseek.service ggml-rpc-v100.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HOME=/home/agurrrrr
+# Two Tesla V100-SXM2 16 GiB (PCI 41:00.0 + 84:00.0), LAYER split, no NVLink.
+Environment=CUDA_VISIBLE_DEVICES=0,1
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-ds41/build-cuda/bin:/opt/cuda-12.8/lib64
+Environment=RUST_LOG=info
+# Binary: target-ds41-cuda (GOLBANG_GPU=ds41-cuda -> llama.cpp-ds41 @ 24032ea2b, CUDA build-cuda).
+# Same tree as the HIP unit, different backend. See wiki golbang-as-dsv41-runtime.
+# Model: /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/.
+# --n-ctx 16384: V4.1's second-level candidate mask is unimplemented (16K cap).
+# --n-cpu-moe 39 / --tensor-split 16,16: the 183 GiB of expert weights cannot fit 2x16 GiB.
+# Under an even layer split the remaining expert layers pile onto CUDA1, so 38 is too tight
+# and 37 OOMs. 39 (one expert layer on CUDA1, ~5 GiB free) is the safe production value;
+# decode is identical (~4.0 t/s, CPU expert GEMV bound). Matches llama-server-dsv41-native-cuda.
+# --n-rs-seq 1: DSV4 suffix rollback snapshot.
+ExecStart=/home/agurrrrr/code/golbang/target-ds41-cuda/release/golbang-server \
+  --model /home/agurrrrr/models/DeepSeek-V4.1-Flash-Q2_K-ds41/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --alias dsv41-flash-golbang-cuda \
+  --host 0.0.0.0 --port 8089 \
+  --n-gpu-layers 99 --n-cpu-moe 39 --flash-attn on \
+  --tensor-split 16,16 \
+  --n-ctx 16384 --n-batch 4096 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
+  --n-parallel 1 --queue-size 1 \
+  --jinja --reasoning-format deepseek \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target

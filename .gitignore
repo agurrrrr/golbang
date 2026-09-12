@@ -2,6 +2,8 @@
 /target-hip/
 /target-hip-rpc/
 /target-cuda/
+/target-ds41/
+/target-ds41-cuda/
 /target-vulkan/
 **/*.rs.bk
 Cargo.lock.bak
