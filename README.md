@@ -1,29 +1,36 @@
 # golbang
 
-> **골뱅이** — gfx906(AMD MI50)에서도 도는 GGUF LLM 추론 서버.
+> **골뱅이** — AMD MI50(gfx906)과 NVIDIA V100으로 **최신 대형·MoE 모델을 서빙**하는
+> GGUF LLM 추론 서버.
 > 서빙·스케줄·배칭은 Rust, GPU 수학은 SHA 고정된 llama.cpp(ggml)을 C ABI로 호출한다.
 > 서빙 표면은 OpenAI 호환 채팅 API 한 개로 최소한에 집중한다.
 
 *OpenAI-compatible GGUF inference server. Rust orchestration (axum + tokio) on top of
-SHA-pinned llama.cpp backends (HIP / CUDA / Vulkan), built for aging hardware like
-gfx906 that mainstream stacks are leaving behind. Single binary, no Python.*
+SHA-pinned llama.cpp backends (HIP / CUDA / Vulkan), built to serve current large and
+MoE models (Qwen3.8, DeepSeek-V4-Flash, GLM-5.3-Flash) on aging hardware like gfx906
+that mainstream stacks are leaving behind. Single binary, no Python.*
 
 ![Rust](https://img.shields.io/badge/Rust-edition%202024-dea584?logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![API](https://img.shields.io/badge/API-OpenAI%20chat%20completions-6e56cf)
 ![GPU](https://img.shields.io/badge/backends-HIP%20%C2%B7%20CUDA%20%C2%B7%20Vulkan-orange)
 
-llama-server와 **같은 GPU 커널**을 쓴다. 그래서 decode 속도는 대체로 동률이다.
+llama-server와 **같은 GPU 커널**을 쓰기 때문에 decode 속도는 대체로 동률이다.
 golbang이 노리는 지점은 처리량이 아니라 **스케줄 정책·취소·즉시 503·경량 제어면**이고,
-주 무대는 지원이 얇아지는 **gfx906 같은 오래된 카드**다.
+주 무대는 지원이 얇아지는 **gfx906(MI50)와 sm_70(V100)** 처럼 오래된 카드로
+**최신 대형·MoE 모델을 올리는 것**이다.
+무엇을 실제로 서빙하는지는 [무엇을 서빙하나](#무엇을-서빙하나-mi50와-v100)에,
+긴 에이전트 대화의 prefill을 줄이는 경로는 [프리필 단축: 호스트 접두 스냅샷 (P8)](#프리필-단축-호스트-접두-스냅샷-p8)에 적어뒀다.
 실측은 [한계](#한계)와 [`docs/bench/`](docs/bench/)에 좋은 숫자만 골라 쓰지 않고 있는 그대로 적어뒀다.
 
 ## 목차
 
 - [왜 만들었나](#왜-만들었나)
 - [한눈에](#한눈에)
+- [무엇을 서빙하나 (MI50와 V100)](#무엇을-서빙하나-mi50와-v100)
 - [빠른 시작](#빠른-시작)
 - [기능](#기능)
+- [프리필 단축: 호스트 접두 스냅샷 (P8)](#프리필-단축-호스트-접두-스냅샷-p8)
 - [설정](#설정)
 - [빌드 (백엔드별)](#빌드-백엔드별)
 - [배포 예시](#배포-예시)
@@ -74,6 +81,34 @@ GPU 연산만 SHA 고정된 `libllama`/`libggml-*`를 unsafe FFI로 호출한다
 - **오케스트레이션 = 100% Rust.** HTTP, 슬롯, 정책, 샘플링, 템플릿, reasoning/tool 파서.
 - **GPU 커널 = 검증된 llama.cpp.** Rust가 소유·호출하되 수식은 `ggml`이다.
 - **산출물 = 바이너리 하나.** `.so`는 같은 프로세스에 링크한다.
+
+## 무엇을 서빙하나 (MI50와 V100)
+
+이 프로젝트는 데모용 소형 모델로 멈추지 않는다. 아래는 `deploy/`의 systemd 유닛으로
+실제 돌리고 있는 최신 대형·MoE 모델 목록이다. MoE 모델에서는 VRAM 배분의 열쇠가
+`--n-cpu-moe`(앞 N개 블록의 expert 가중치를 CPU에 고정)다 — 이 값 하나로 카드 두 장의
+한계에 모델이 들어가냐 OOM이냐가 갈린다.
+
+### MI50 (gfx906, HIP / Vulkan)
+
+| 모델 | 양자화·구성 | 유닛 |
+|------|-------------|------|
+| Qwen3.8-27B | UD-Q4_K_XL, 100k ctx, KV q8_0, MTP+ngram speculative | `golbang-qwen38` (HIP), `golbang-qwen38-vulkan` (Vulkan) |
+| DeepSeek-V4-Flash-0731 | UD-IQ2_M, `--n-cpu-moe 32` | `golbang-deepseek` |
+| GLM-5.3-Flash | AJ-IQ2_XXS, `--n-cpu-moe 42` | `golbang-glm53flash` |
+| Qwen3.8-27B Uncensored | Q6_K | `golbang-qwen48` |
+
+### V100 (sm_70, CUDA 12.8, 2× 16 GiB)
+
+| 모델 | 양자화·구성 | 유닛 |
+|------|-------------|------|
+| Qwen3.8-27B | UD-Q4_K_XL + MTP, `--tensor-split` | `golbang-cuda-qwen38` |
+| Qwen3.8-Flash-Next | UD-Q4_K_XL, `--n-cpu-moe 48` (expert 전부 CPU), 100k ctx | `golbang-cuda-flashnext` |
+| DeepSeek-V4.1 | 네이티브 런타임 (`GOLBANG_GPU=ds41-cuda`) | `golbang-server-ds41-cuda` |
+
+Vulkan은 같은 모델을 다른 커널 경로로 돌려볼 수 있는 백엔드다. CUDA와 HIP은
+각각 따로 빌드하며, 하나의 바이너리가 두 GPU를 모두 보는 런타임 스위치는 없다
+([빌드](#빌드-백엔드별) 참조).
 
 ## 빠른 시작
 
@@ -140,7 +175,8 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
 - **과부하 계약** — bounded 큐가 가득이면 decode를 기다리지 않고 **즉시 503 + `Retry-After: 1`**
   (llama-server는 같은 상황에서 대기할 수 있다. 버그가 아니라 선택이다)
 - **다턴 prefix cache** — 슬롯 로컬 LCP 재사용 + 크로스 슬롯 접두 스냅샷.
-  3k 토큰 대화의 2턴째 prefill이 수 토큰으로 줄어든다 ([P5 기록](docs/bench/p5.md))
+  3k 토큰 대화의 2턴째 prefill이 수 토큰으로 줄어든다 ([P5 기록](docs/bench/p5.md)).
+  슬롯 밖으로 넓힌 호스트 접두 스냅샷은 [P8](#프리필-단축-호스트-접두-스냅샷-p8) 참조
 - 채팅 템플릿 — Qwen ChatML 하드코딩(기본) / GGUF `tokenizer.chat_template`을 minijinja로(`--jinja`) /
   `--chat-template-file` 재정의
 - **reasoning** — `--reasoning-format deepseek|auto`로 think 태그를 OpenAI `reasoning_content`로 분리.
@@ -153,6 +189,37 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
 - `--api-key` / `--alias` / `--rpc` / `--tensor-split` — llama-server와 같은 의미
 
 **없는 것:** embeddings, rerank, `fifo` 이외 스케줄 정책, 순수 Rust GPU 커널(P6 gate 실패로 닫힘).
+
+## 프리필 단축: 호스트 접두 스냅샷 (P8)
+
+에이전트(툴 루프)는 턴마다 지금까지의 프롬프트를 누적해 다시 보낸다. 매 턴을 0부터
+prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬롯 안에서 "2턴째 접미만"
+계산했다면, **P8은 그 접두 경로를 슬롯 밖·체인·워터마크 이후로 늘린다.** GPU 커널은
+한 줄도 고치지 않았고(diff 0), Rust 스케줄러만 건드렸다. 바탕은 이미 P5가 쓰던
+`Engine::seq_state_get`/`set`(`llama_state_seq_*_ext`, `PARTIAL_ONLY`)이고 새 FFI는 없다.
+
+| 갈래 | 하는 일 |
+|------|---------|
+| **P8-A** 의미 앵커 체인 | 프리필 끝 스냅샷을 한 장으로 덮어쓰지 않고 길이 오름차순 체인으로 남긴다. bind는 `n_tokens ≤ reuse_len+1`인 가장 긴 앵커에서 이어 간다 |
+| **P8-B** 슬롯 밖 공통 접두 | `PrefixStore`를 호스트 `SeqCheckpoint` 맵으로 재정의. 도구/시스템 head(스텁 창 6144–16384, 스트라이드 2048)를 전역에 두고, 다른 세션이 빈 슬롯에 붙으면 복원 후 접미만 |
+| **P8-C** 워터마크 생존 | 85% KV 점유에서 GPU 시퀀스만 `clear_seq`하고 호스트 체인·스토는 남긴다 (HiCache L2) |
+
+상수: `CHAIN_MAX_ANCHORS=8`, `HOST_RAM_CAP=2 GiB`, 스텁 창 6144–16384(스트라이드 2048).
+생산 저널에서 확인된 효용 — Qwen3.8-27B는 33671토큰 요청을 앵커 31767에서 복원한 뒤
+접미 1905토큰만 15.4초에 붙였다(0부터면 4~5분). DeepSeek-V4-Flash는 35805토큰 중
+34989를 복원하고 접미 816만 돌렸다. 저널 판별 문구는 `prefix restored from checkpoint`,
+`host prefix snapshot promoted`, `host snapshot restored`/`host snapshot miss`,
+`retained prefix kv released; host anchors kept`다.
+
+**정직한 한계(과장하지 않는다).** P8은 모든 전량 prefill을 없애지 않는다.
+
+- 빈 슬롯 복원(B)은 `--n-parallel 2`에서 열린다. `n_parallel=1`이면 빈 슬롯이 없어 같은 슬롯 affinity(A)만 히트한다.
+- 스토 승격은 첫 긴 prefill이 스텁 창 경계(6144/8192/12288…)에 정확히 착지해야 남는다. DeepSeek 유닛은 `-b 5800`이라 경계를 건너뛴다.
+- `tools`를 빼면 공통 접두가 LCP 약 3787로 스텁 창(6144–16384) 밖으로 떨어져 전량으로 다시 돈다.
+- 워터마크 생존(C)은 코드와 단위 테스트로 잠겼으나, 관측한 생산 창에서 85% 워터마크가 발화하지 않아 라이브 확인은 아직이다.
+
+전체 근거·상수·저널 표는 [`docs/bench/p8.md`](docs/bench/p8.md)에 있다.
+
 ## 설정
 
 대부분의 플래그는 `GOLBANG_*` 환경 변수와 동일하다. `--help`가 최종 진실이고,
@@ -224,15 +291,16 @@ SSE / JSON / 빈 messages 4xx / decode 중 503까지 돌고, 없으면 스킵한
 
 ## 벤치마크 요약
 
-같은 커널을 쓰기 때문에 decode 단독으로는 llama-server를 이기지 않는다.
 측정을 숨기지 않고 전부 커밋한다. raw JSON은 `docs/bench/raw/`, 재현 스크립트는 `scripts/`다.
+아래 표는 숫자만 적고, 비교 취지는 [도입부](#golbang)의 한 문장으로 갈음한다.
 
 | 비교 | 결과 | 문서 |
 |------|------|------|
-| vs llama-server (MI50, DSV4-Flash IQ2_M) | decode ~8 t/s **동률**. 660토큰 prefill 동급, 2540토큰은 `-ub` 차이로 llama 우위. 과부하 4-way는 golbang 스위트 wall 6.4s vs llama 11.5s (503 즉시 거절) | [`golbang-vs-llama-server.md`](docs/bench/golbang-vs-llama-server.md) |
-| vs llama-server (RTX 3060) | decode **동률** 13.2–13.4 t/s, prefill은 golbang **1.4–1.7×** | [`golbang-vs-llama-cuda.md`](docs/bench/golbang-vs-llama-cuda.md) |
-| P7 Qwen3.8-27B decode 패리티 | 16/200토큰 밴드 충족, 84/장문 밴드는 ±3% 내외 | [`p7.md`](docs/bench/p7.md) |
-| 다턴 prefix cache | 2.5k 토큰 재요청 시 cache_n≈2540, wall 34s → 4s | [`p5.md`](docs/bench/p5.md) |
+| vs llama-server (MI50, DSV4-Flash IQ2_M) | decode ~8 t/s. 660토큰 prefill 동급, 2540토큰은 `-ub` 차이로 llama 우위. 과부하 4-way는 golbang 스위트 wall 6.4s vs llama 11.5s (503 즉시 거절) | [`golbang-vs-llama-server.md`](docs/bench/golbang-vs-llama-server.md) |
+| vs llama-server (RTX 3060) | decode 13.2–13.4 t/s, prefill은 golbang **1.4–1.7×** | [`golbang-vs-llama-cuda.md`](docs/bench/golbang-vs-llama-cuda.md) |
+| P7 Qwen3.8-27B decode 밴드 | 16/200토큰 밴드 충족, 84/장문 밴드는 ±3% 내외 | [`p7.md`](docs/bench/p7.md) |
+| 다턴 prefix cache (P5) | 3k 토큰 재요청 wall 34s → 4s | [`p5.md`](docs/bench/p5.md) |
+| 호스트 접두 스냅샷 (P8) | 30k~70k 전량 prefill을 접미 수백~수천 토큰으로 (한계는 위 [P8](#프리필-단축-호스트-접두-스냅샷-p8) 참조) | [`p8.md`](docs/bench/p8.md) |
 
 **llama-server를 그냥 쓰는 게 더 나을 수도 있다.** golbang은 GPU 커널 경쟁이 아니라
 Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수 llama.cpp 배포가 필요한
@@ -254,6 +322,9 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
 2. **제출** — `try_submit`은 non-blocking. 큐 가득지면 503.
 3. **join** — 빈 슬롯에, **이번 decode 반환 직후에만** 붙인다.
 4. **bind** — 토큰화 후 슬롯 prefix와 LCP 재사용. 재사용 구간은 prefill하지 않는다.
+   슬롯에서 맞지 않으면 호스트 접두 스냅샷으로 시야를 넓힌다 — 슬롯 로컬 앵커 체인(P8-A),
+   전역 `PrefixStore`에서 빈 슬롯 복원(P8-B). 어느 쪽도 미스일 때만 전량 prefill이다
+   ([P8](#프리필-단축-호스트-접두-스냅샷-p8)).
 5. **plan** — decoding 슬롯 우선, 남는 칸에 prefill. 큰 prefill과 decode를 한
    `llama_decode`에 섞지 않는다 (`mixed_prefill_max`).
 6. **GPU** — `spawn_blocking` 단일 워커의 `Mutex<Model>`에서 decode → 샘플 → MTP draft.
@@ -263,10 +334,12 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
 
 ## 한계
 
-- **같은 커널, 같은 천장.** decode는 llama-server와 동률이다. MoE 모델의 병목은
-  커널이 아니라 CPU expert 오프로드(`n-cpu-moe`)다.
+- **같은 커널, 같은 천장.** MoE 모델의 병목은 GPU 커널이 아니라 CPU expert 오프로드(`n-cpu-moe`)다.
 - **장문 prefill 설정.** VRAM이 빠듯한 카드에서는 `--n-ubatch`를 낮춰야 해서
   llama-server의 큰 `-ub`보다 긴 prefill이 느릴 수 있다.
+- **P8 접두 복원은 조건부.** 빈 슬롯 복원은 `--n-parallel 2`에서 열리고, 승격은 첫 긴
+  prefill이 스텁 창 경계에 착지해야 남으며, `tools`를 빼면 공통 접두가 창 밖으로
+  떨어져 전량으로 다시 돈다. 세부와 미확인 조건은 [P8](#프리필-단축-호스트-접두-스냅샷-p8) 참조.
 - **스케줄 정책은 FIFO뿐.** trait은 교체 가능하게 열어뒀지만 추가 구현이 없다.
 - **비전 prefix.** 이미지 요청은 슬롯 KV를 비운다 (prefix hit 없음).
 - **단일 모델.** 프로세스당 모델 하나. 멀티 모델 게이트웨이는 범위 밖이다.
@@ -279,6 +352,7 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | P0–P7 단계와 완료 기준 (체크박스) |
 | [`docs/work-orders/`](docs/work-orders/) | 단계별 실행 지시서 |
 | [`docs/bench/`](docs/bench/) | 성능 기록 + `raw/` 원본 JSON |
+| [`docs/bench/p8.md`](docs/bench/p8.md) | 호스트 접두 스냅샷: 배경·A/B/C·상수·생산 저널·정직한 한계 |
 | [`scripts/`](scripts/) | 벤치 재현 스크립트 (표준 라이브러리만 사용) |
 | [`deploy/`](deploy/) | systemd 유닛 예시 |
 
