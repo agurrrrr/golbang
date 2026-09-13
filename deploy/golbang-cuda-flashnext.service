@@ -1,0 +1,44 @@
+[Unit]
+Description=golbang OpenAI server - Qwen3.8-Flash-Next UD-Q4_K_XL (2x V100 CUDA, experts on CPU)
+After=network.target
+Conflicts=golbang-cuda-qwen38.service qwen3.8-q2.service comfyui-cuda.service qwen3.8-unleashed-q2.service golbang-glm53flash.service ggml-rpc-v100.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+Environment=HOME=/home/agurrrrr
+Environment=CUDA_VISIBLE_DEVICES=0,1
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream/build/bin:/opt/cuda-12.8/lib64
+Environment=RUST_LOG=info
+# Qwen3.8-Flash-Next (arch qwen4exp, 176.94 B, 6 B active) UD-Q4_K_XL, 4 shards.
+# mmap is mandatory: the PLE n-gram table (per_layer_token_embd, 27.4 GiB) is
+# TENSOR_READ_LAZY and is gathered from the mapping row by row. Do NOT pass
+# --no-mmap, or the whole 27.4 GiB table is loaded into RAM.
+# n-cpu-moe 48 keeps every expert on CPU. Moving the tail experts to the V100s
+# was slower (6.3 vs 9.1 tok/s): the 48-layer expert pool lands in layers N..47,
+# which a proportional tensor-split pushes onto one device and unbalances.
+# n-threads 32 beats 64 (SMT oversubscription).
+# Measured on 2x V100 + EPYC 7452: prefill ~17 tok/s warm, decode ~10 tok/s.
+ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
+  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --alias qwen3.8-flash-next \
+  --host 0.0.0.0 --port 8090 \
+  --n-gpu-layers 99 --n-cpu-moe 48 --flash-attn on \
+  --tensor-split 16,16 \
+  --n-ctx 16384 --n-batch 1024 --n-ubatch 512 --n-threads 32 --n-rs-seq 1 \
+  --n-parallel 1 --queue-size 2 \
+  --jinja --reasoning-format deepseek \
+  --api-key REDACTED_KEY1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+MemoryHigh=115G
+MemoryMax=122G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
