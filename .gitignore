@@ -1,11 +1,28 @@
+# build artifacts
 /target
-/target-hip/
-/target-hip-rpc/
-/target-cuda/
-/target-ds41/
-/target-ds41-cuda/
-/target-vulkan/
+/target-*/
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb
+
+#local scratch / tooling output
+.temp/
+.tmp-hub/
+.rocprofv3/
+*.csv
+
+#python
 __pycache__/
+*.pyc
+
+#secrets — never commit real keys
+.env
+*.env
+!deploy/secrets.env.example
+secrets*.env
+
+#editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

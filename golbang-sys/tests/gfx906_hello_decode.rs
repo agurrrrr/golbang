@@ -238,12 +238,20 @@ fn hello_decode_once_on_gpu() {
             true,
             true,
         );
-        assert_eq!(n_written, n_tok, "tokenize wrote {n_written}, expected {n_tok}");
+        assert_eq!(
+            n_written, n_tok,
+            "tokenize wrote {n_written}, expected {n_tok}"
+        );
         eprintln!("prompt '{prompt}' -> {n_written} tokens: {tokens:?}");
 
         let batch = llama_batch_get_one(tokens.as_mut_ptr(), n_written);
         let rc = llama_decode(ctx, batch);
-        assert_eq!(rc, 0, "llama_decode returned {rc}\nlogs:\n{}", logs_snapshot());
+        assert_eq!(
+            rc,
+            0,
+            "llama_decode returned {rc}\nlogs:\n{}",
+            logs_snapshot()
+        );
 
         let logits = llama_get_logits(ctx);
         assert!(!logits.is_null(), "llama_get_logits returned null");

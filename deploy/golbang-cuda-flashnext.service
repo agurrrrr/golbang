@@ -8,6 +8,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 Environment=HOME=/home/agurrrrr
 Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -36,7 +37,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --n-ctx 100000 --n-batch 1024 --n-ubatch 512 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \
-  --api-key REDACTED_KEY1
+  --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=600

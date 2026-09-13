@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import time
@@ -18,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
-API_KEY = "REDACTED_KEY1"
+API_KEY = os.environ.get("GOLBANG_API_KEY", "")
 PARA = (
     "DeepSeek-V4-Flash is a mixture-of-experts language model. "
     "Each token activates a small subset of experts. "

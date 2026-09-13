@@ -233,10 +233,7 @@ mod tests {
             effective_cap(policy, used, POOL, others, SPEC, 1),
             POOL - others - spec_reserve(SPEC, 1)
         );
-        assert_eq!(
-            effective_cap(policy, used, POOL, others, SPEC, 1),
-            70_329
-        );
+        assert_eq!(effective_cap(policy, used, POOL, others, SPEC, 1), 70_329);
         // Dual ~70k would have bound without spec reserve (cap 70016) and then
         // overflow on drafts. With reserve the joiner is below 70k.
         let join = cap_for_join(70_000, 2, POOL, SOLO, SPEC);

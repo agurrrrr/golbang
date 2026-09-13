@@ -8,6 +8,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 # vulkaninfo order on this box: 0=V100(41:00), 1=MI50(83:00), 2=V100(84:00).
 # Expose only the MI50 to the Vulkan backend.
 Environment=GGML_VK_VISIBLE_DEVICES=1
@@ -30,7 +31,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-vulkan/release/golbang-server \
   --spec-draft-p-min 0.9 \
   --spec-draft-type-k q8_0 \
   --spec-draft-type-v q8_0 \
-  --api-key REDACTED_KEY1
+  --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300

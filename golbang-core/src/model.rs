@@ -1330,8 +1330,7 @@ unsafe fn log_registered_backends() {
             if dev.is_null() {
                 continue;
             }
-            let dev_name =
-                unsafe { CStr::from_ptr(ggml_backend_dev_name(dev)) }.to_string_lossy();
+            let dev_name = unsafe { CStr::from_ptr(ggml_backend_dev_name(dev)) }.to_string_lossy();
             let desc =
                 unsafe { CStr::from_ptr(ggml_backend_dev_description(dev)) }.to_string_lossy();
             let mut free = 0usize;
@@ -1467,7 +1466,9 @@ fn register_rpc_servers(servers: &[String], backend_so: Option<&Path>) -> Result
             if reg.is_null() {
                 return Err(Error::Load {
                     path: PathBuf::from(server.as_str()),
-                    reason: "ggml_backend_rpc_add_server returned null (is ggml-rpc-server listening?)".into(),
+                    reason:
+                        "ggml_backend_rpc_add_server returned null (is ggml-rpc-server listening?)"
+                            .into(),
                 });
             }
             ggml_backend_register(reg);
@@ -1634,8 +1635,8 @@ impl CpuMoeOverrides {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_draft_model, mtp_n_outputs_max, mtp_process_items, parse_rpc_servers,
-        parse_tensor_split, wait_rpc_endpoints_until, FFN_EXPS_REGEX, LoadParams,
+        FFN_EXPS_REGEX, LoadParams, load_draft_model, mtp_n_outputs_max, mtp_process_items,
+        parse_rpc_servers, parse_tensor_split, wait_rpc_endpoints_until,
     };
     use crate::batch::BatchToken;
     use std::net::TcpListener;
@@ -1675,8 +1676,8 @@ mod tests {
 
     #[test]
     fn draft_model_missing_file_errors() {
-        let err = load_draft_model(Path::new("/no/such/draft.gguf"), &LoadParams::default())
-            .unwrap_err();
+        let err =
+            load_draft_model(Path::new("/no/such/draft.gguf"), &LoadParams::default()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not a file"), "{msg}");
     }

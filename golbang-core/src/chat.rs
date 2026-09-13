@@ -4,7 +4,7 @@
 //! apply `tokenizer.chat_template` with minijinja (same idea as llama-server).
 
 use minijinja::value::Kwargs;
-use minijinja::{context, Environment, UndefinedBehavior, Value};
+use minijinja::{Environment, UndefinedBehavior, Value, context};
 use tracing::warn;
 
 use crate::tools::ToolCall;
@@ -190,20 +190,21 @@ fn message_to_jinja(m: &ChatMessage) -> serde_json::Value {
         obj["tool_call_id"] = serde_json::json!(id);
     }
     if !m.tool_calls.is_empty() {
-        obj["tool_calls"] = serde_json::json!(m
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": arguments_for_jinja(&tc.arguments),
-                    }
+        obj["tool_calls"] = serde_json::json!(
+            m.tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": arguments_for_jinja(&tc.arguments),
+                        }
+                    })
                 })
-            })
-            .collect::<Vec<_>>());
+                .collect::<Vec<_>>()
+        );
     }
     obj
 }
@@ -299,12 +300,16 @@ mod tests {
     fn trailing_assistant_skips_generation_prefix() {
         let applied = apply_chat_template(&[msg("user", "hi"), msg("assistant", "hey")]);
         assert!(applied.used_chatml);
-        assert!(applied
-            .prompt
-            .ends_with("<|im_start|>assistant\nhey<|im_end|>\n"));
-        assert!(!applied
-            .prompt
-            .ends_with("<|im_start|>assistant\n<|im_start|>assistant\n"));
+        assert!(
+            applied
+                .prompt
+                .ends_with("<|im_start|>assistant\nhey<|im_end|>\n")
+        );
+        assert!(
+            !applied
+                .prompt
+                .ends_with("<|im_start|>assistant\n<|im_start|>assistant\n")
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 Environment=HOME=/home/agurrrrr
 # Two Tesla V100-SXM2 16 GiB (PCI 41:00.0 + 84:00.0). LAYER split; no NVLink.
 Environment=CUDA_VISIBLE_DEVICES=0,1
@@ -25,16 +26,16 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --host 0.0.0.0 --port 8084 \
   --n-gpu-layers 99 --flash-attn on \
   --tensor-split 18,14 \
-  --n-ctx 10000 --n-batch 1024 --n-ubatch 1024 --n-threads 8 --n-rs-seq 3 \
-  --n-parallel 2 --queue-size 2 --single-max-ctx 10000 --kv-unified \
+  --n-ctx 100000 --n-batch 1024 --n-ubatch 512 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 2 --queue-size 2 --single-max-ctx 100000 --kv-unified \
   --kv-type-k q8_0 --kv-type-v q8_0 \
   --spec-type draft-mtp \
   --spec-draft-n-max 3 \
-  --spec-draft-p-min 0.0 \
+  --spec-draft-p-min 0.9 \
   --no-mmap --jinja --reasoning-format deepseek \
-  --reasoning-effort medium \
-  --reasoning-budget 2048 \
-  --api-key REDACTED_KEY1
+  --reasoning-effort xhigh\
+  --reasoning-budget 6144 \
+  --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=600

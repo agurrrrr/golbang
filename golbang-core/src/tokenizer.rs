@@ -70,7 +70,12 @@ impl<'a> Tokenizer<'a> {
         Ok(tokens)
     }
 
-    pub fn decode(&self, tokens: &[Token], remove_special: bool, unparse_special: bool) -> Result<String> {
+    pub fn decode(
+        &self,
+        tokens: &[Token],
+        remove_special: bool,
+        unparse_special: bool,
+    ) -> Result<String> {
         if tokens.is_empty() {
             return Ok(String::new());
         }

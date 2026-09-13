@@ -67,10 +67,7 @@ impl Sampler {
             pairs.truncate(k);
         }
 
-        let max_l = pairs
-            .iter()
-            .map(|p| p.1)
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_l = pairs.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for p in &mut pairs {
             p.1 = (p.1 - max_l).exp();

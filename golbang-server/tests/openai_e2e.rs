@@ -198,8 +198,8 @@ async fn openai_sse_json_and_empty_messages() {
         .expect("curl models");
     assert!(models.status.success());
     let models_txt = String::from_utf8_lossy(&models.stdout);
-    let models_v: serde_json::Value =
-        serde_json::from_str(&models_txt).unwrap_or_else(|e| panic!("models json: {e}: {models_txt}"));
+    let models_v: serde_json::Value = serde_json::from_str(&models_txt)
+        .unwrap_or_else(|e| panic!("models json: {e}: {models_txt}"));
     assert_eq!(models_v["object"], "list");
     assert_eq!(models_v["data"][0]["id"], "qwen-test");
     assert_eq!(models_v["data"][0]["object"], "model");
@@ -211,8 +211,8 @@ async fn openai_sse_json_and_empty_messages() {
         .expect("curl /models");
     assert!(models_alias.status.success());
     let alias_txt = String::from_utf8_lossy(&models_alias.stdout);
-    let alias_v: serde_json::Value =
-        serde_json::from_str(&alias_txt).unwrap_or_else(|e| panic!("/models json: {e}: {alias_txt}"));
+    let alias_v: serde_json::Value = serde_json::from_str(&alias_txt)
+        .unwrap_or_else(|e| panic!("/models json: {e}: {alias_txt}"));
     assert_eq!(alias_v["data"][0]["id"], "qwen-test");
 }
 

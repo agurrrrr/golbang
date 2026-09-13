@@ -1,35 +1,57 @@
 # golbang
 
-> gfx906(AMD MI50)용 GGUF LLM 추론 서버 (서빙 표면은 OpenAI 채팅 API 한 개).
-> 서빙·스케줄·배칭은 Rust, GPU 수학은 SHA 고정 `ggml-hip`을 C ABI로 호출한다.
+> **골뱅이** — gfx906(AMD MI50)에서도 도는 GGUF LLM 추론 서버.
+> 서빙·스케줄·배칭은 Rust, GPU 수학은 SHA 고정된 llama.cpp(ggml)을 C ABI로 호출한다.
+> 서빙 표면은 OpenAI 호환 채팅 API 한 개로 최소한에 집중한다.
 
-llama-server와 **같은 HIP 커널**을 쓴다. 이기는 지점은 처리량이 아니라
-스케줄 정책·취소·즉시 503·경량 제어면이다.
+*OpenAI-compatible GGUF inference server. Rust orchestration (axum + tokio) on top of
+SHA-pinned llama.cpp backends (HIP / CUDA / Vulkan), built for aging hardware like
+gfx906 that mainstream stacks are leaving behind. Single binary, no Python.*
+
+![Rust](https://img.shields.io/badge/Rust-edition%202024-dea584?logo=rust&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![API](https://img.shields.io/badge/API-OpenAI%20chat%20completions-6e56cf)
+![GPU](https://img.shields.io/badge/backends-HIP%20%C2%B7%20CUDA%20%C2%B7%20Vulkan-orange)
+
+llama-server와 **같은 GPU 커널**을 쓴다. 그래서 decode 속도는 대체로 동률이다.
+golbang이 노리는 지점은 처리량이 아니라 **스케줄 정책·취소·즉시 503·경량 제어면**이고,
+주 무대는 지원이 얇아지는 **gfx906 같은 오래된 카드**다.
+실측은 [한계](#한계)와 [`docs/bench/`](docs/bench/)에 좋은 숫자만 골라 쓰지 않고 있는 그대로 적어뒀다.
 
 ## 목차
 
-- [한 줄](#한-줄)
-- [크레이트](#크레이트)
-- [요청이 도는 길](#요청이-도는-길)
-- [동시성](#동시성)
-- [KV와 prefix cache](#kv와-prefix-cache)
-- [채팅 표면](#채팅-표면)
-- [컴퓨트 FFI](#컴퓨트-ffi)
-- [주요 기능](#주요-기능)
-- [빌드](#빌드)
-- [실행](#실행)
+- [왜 만들었나](#왜-만들었나)
+- [한눈에](#한눈에)
+- [빠른 시작](#빠른-시작)
+- [기능](#기능)
 - [설정](#설정)
-- [배포](#배포)
-- [로드맵](#로드맵)
+- [빌드 (백엔드별)](#빌드-백엔드별)
+- [배포 예시](#배포-예시)
+- [벤치마크 요약](#벤치마크-요약)
+- [아키텍처](#아키텍처)
 - [한계](#한계)
 - [문서](#문서)
+- [기여](#기여)
 - [라이선스](#라이선스)
 
-## 한 줄
+## 왜 만들었나
 
-요구는 다섯 가지였다. ① Rust ② GGUF ③ llama.cpp보다 다루기 쉬운 동시성
-④ gfx906 ⑤ 단일 바이너리. 순수 Rust GPU 커널은 gfx906에서 검증되지 않아
-**하이브리드**로 확정했다 (2026-08-13, ADR `architecture-decision`).
+요구는 다섯 가지였다.
+
+1. **Rust** — 오케스트레이션을 Rust로 소유하고 싶다.
+2. **GGUF** — 기존 모델 생태계를 그대로 쓴다.
+3. **llama.cpp보다 다루기 쉬운 동시성** — join/evict/우선순위를 iteration 경계에서
+   교체 가능한 정책으로 만들고, 과부하에는 대기 없이 즉시 503을 낸다.
+4. **gfx906 (MI50)** — ROCm 지원이 줄어드는 카드에서도 돌아야 한다.
+5. **단일 바이너리** — 파이썬/런처 없이.
+
+순수 Rust GPU 커널은 gfx906에서 검증할 방법이 없어 **하이브리드**로 확정했다.
+Rust가 요청 수명·슬롯·정책·샘플링·템플릿·reasoning/tool 파서를 100% 소유하고,
+GPU 연산만 SHA 고정된 `libllama`/`libggml-*`를 unsafe FFI로 호출한다.
+같은 커널을 Rust로 다시 써도 decode는 빨라지지 않는다는 것은
+[rocprof 실측](docs/bench/p6.md)으로 확인했고, 그래서 커널 재작성 단계는 닫았다.
+
+## 한눈에
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -37,415 +59,237 @@ llama-server와 **같은 HIP 커널**을 쓴다. 이기는 지점은 처리량�
 │                                                          │
 │  HTTP /v1/chat/completions                               │
 │    → ChatML 또는 minijinja                               │
-│    → bounded 큐 (가득 차면 즉시 503)                     │
+│    → bounded 큐 (가득 차면 즉시 503 + Retry-After)        │
 │    → Scheduler  (join / evict / chunked prefill)         │
-│         │                                                │
 │         │  iteration 경계에서만 슬롯 변경                 │
 │         ▼                                                │
 │  Engine (Mutex<Model>, spawn_blocking)                   │
 │    tokenize · llama_decode · sample · MTP · vision       │
 │         │  unsafe FFI                                    │
 │         ▼                                                │
-│  golbang-sys  →  libllama.so + libggml-hip.so (gfx906)   │
+│  golbang-sys  →  libllama.so + libggml-{hip,cuda,vulkan} │
 └──────────────────────────────────────────────────────────┘
 ```
 
 - **오케스트레이션 = 100% Rust.** HTTP, 슬롯, 정책, 샘플링, 템플릿, reasoning/tool 파서.
-- **GPU 커널 = 검증된 HIP.** Rust가 소유·호출하되 수식은 `ggml-hip`이다.
-- **산출물 = 파이썬/Go 없는 한 개의 바이너리.** `.so`는 같은 프로세스에 링크한다.
+- **GPU 커널 = 검증된 llama.cpp.** Rust가 소유·호출하되 수식은 `ggml`이다.
+- **산출물 = 바이너리 하나.** `.so`는 같은 프로세스에 링크한다.
 
-같은 커널을 Rust로 다시 써도 decode는 안 빨라진다. P6 rocprof에서
-DSV4 decode wall의 ~2/3는 `n_cpu_moe=32` CPU expert였다. 상세는
-위키 `n-cpu-moe-vram`, `p6-rocprof-notes`.
+## 빠른 시작
 
-## 크레이트
+### 준비물
 
-워크스페이스 멤버 세 개. unsafe는 `golbang-sys`와 `golbang-core`의 FFI 호출에만 둔다.
+| 항목 | 값 |
+|------|-----|
+| Rust | edition 2024 (1.85+ 권장) |
+| llama.cpp | 아래 [빌드](#빌드-백엔드별)의 핀된 SHA로 직접 빌드 |
+| GPU (HIP) | gfx906 (MI50) + ROCm. `HSA_OVERRIDE_GFX_VERSION=9.0.6` |
+| GPU (CUDA) | sm_70+ (V100은 CUDA 12.8 — CUDA 13은 compute_70 미지원) |
+| GPU (Vulkan) | Any Vulkan device. `GGML_VULKAN=ON` cmake dir |
 
-| 크레이트 | 역할 | 공개 표면 |
-|----------|------|-----------|
-| **golbang-server** | axum HTTP, SSE/JSON, `/v1/models`, `/metrics`, API 키 | `golbang-server` 바이너리 |
-| **golbang-core** | 스케줄러, 슬롯, 정책, 엔진, 템플릿, 샘플러, prefix, spec, vision, tools | RAII + async API |
-| **golbang-sys** | `llama.h` / `mtmd.h` / `llama-ext.h` bindgen + C++ 심볼 심 | C ABI만. safe wrapper 없음 |
+`golbang-sys/build.rs`가 llama.cpp 트리의 **git SHA와 `.so` 바이트를 검사**한다.
+핀과 다른 헤더/라이브러리를 섞으면 조용히 깨지는 대신 빌드가 **hard error**로 실패한다.
+트리 경로는 `GOLBANG_LLAMA_DIR`, cmake 산출물 경로는 `GOLBANG_LLAMA_BIN_DIR`으로 지정한다.
 
-```
-golbang-server/src
-  main.rs      CLI → Model::load → spawn_scheduler → axum::serve
-  lib.rs       AppState, ChatRuntime, API 키 미들웨어
-  routes.rs    POST /v1/chat/completions, GET /v1/models, GET /models
-  sse.rs       템플릿 적용, Job 제출, SSE / 비스트리밍
-  types.rs     OpenAI 요청/응답, image_url, tools, reasoning_effort
-  metrics.rs   Prometheus 텍스트
-
-golbang-core/src
-  scheduler.rs iteration 루프. join/evict는 decode 반환 직후
-  policy.rs    SchedulePolicy (지금 FifoPolicy만)
-  slot.rs      Empty / Prefilling / Decoding + SlotEvent
-  batch.rs     통합 llama_batch. decode 슬롯 먼저, 남는 칸에 prefill
-  engine.rs    Mutex<Model>. GPU는 이 락 한 줄
-  model.rs     llama_model + context + MTP context + mmproj
-  prefix_cache.rs  슬롯 로컬 LCP (크로스 슬롯 복사 없음)
-  chat.rs      ChatML 하드코딩 + minijinja
-  reasoning.rs <think> → reasoning_content
-  tools.rs     DSML / Qwen / Hermes tool_calls
-  speculative.rs draft-mtp + ngram-mod
-  vision.rs    libmtmd, 마커 <__media__>
-  sampler.rs   temperature / top-k / top-p (순수 Rust)
-
-golbang-sys
-  build.rs     SHA 핀 검사, gfx906 .so 확인, bindgen
-  llama_ext_shim.cpp  MTP nextn 심볼 (C ABI)
-```
-
-핀은 `golbang-sys/build.rs`의 `EXPECTED_SHA`가 진실이다.
-지금 **`367ebbc20c2b20db411d5acf72b88d26a7c13d70`**
-(`/home/agurrrrr/code/local-llm/llama.cpp-glm5next`, `llama.h` 1638줄).
-롤백 핀은 `3ac5658c7` / `llama.cpp-upgrade` (남겨둔다).
-형제 트리(`llama.cpp`, `-cuda`, `-dflash2`)는 HEAD가 다르다. 섞지 않는다.
-
-## 요청이 도는 길
-
-한 건의 `POST /v1/chat/completions`는 대략 이렇게 흐른다.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant H as axum
-    participant S as Scheduler
-    participant E as Engine (blocking)
-    participant G as ggml-hip
-
-    C->>H: JSON (messages, tools, stream)
-    H->>H: ChatML 또는 jinja → prompt
-    H->>S: try_submit(Job)
-    alt 큐 가득
-        S-->>C: 503 Retry-After: 1
-    end
-    Note over S: 다음 llama_decode 반환 후
-    S->>S: policy.join → bind_slot (prefix LCP)
-    S->>E: spawn_blocking decode_and_sample
-    E->>G: llama_decode
-    G-->>E: logits
-    E->>E: Sampler + MTP draft
-    E-->>S: SlotEvent::Token / Finished
-    S-->>H: mpsc
-    H-->>C: SSE delta 또는 JSON
-```
-
-1. **HTTP** (`routes` → `sse`). `messages`를 검사하고 템플릿을 입힌다.
-   `image_url`은 `<__media__>` 마커 + 바이트로 바뀐다.
-2. **제출.** `SchedulerHandle::try_submit`은 non-blocking이다.
-   큐가 가득이면 핸들러가 decode를 기다리지 않고 503을 낸다.
-3. **join.** 빈 슬롯이 있을 때만, **이번 decode가 끝난 뒤** `SchedulePolicy::join`.
-4. **bind.** 프롬프트를 토큰화하고 슬롯 prefix와 LCP를 잰다.
-   재사용 구간은 prefill하지 않는다. 이미지는 prefix를 쓰지 않고 `mtmd`로 한 번에 eval.
-5. **plan.** `BatchBuilder`는 decoding 슬롯을 먼저 넣는다 (`decode_max`는 **슬롯 수**).
-   디코드가 있으면 큰 prefill을 같은 `llama_decode`에 넣지 않는다
-   (`mixed_prefill_max`, 기본 0 = decode-only). 대신 `prefill_yield_every`마다
-   프리필 전용 이터레이션을 넣어 접미가 생성에 굶지 않게 한다. 전부 Prefilling이면
-   남은 `n_batch`를 슬롯 수로 나눈다.
-6. **GPU.** `spawn_blocking` 한 워커에서 decode → 제자리 샘플 → MTP `process` → draft.
-   Qwen3.8 vocab 248k logits를 async 쪽으로 복사하지 않는다.
-7. **방출.** `SlotEvent`를 HTTP가 SSE `choices[].delta` 또는 JSON으로 바꾼다.
-   `ReasoningParser` / `ToolCallParser`가 태그 단위로 자른다.
-
-취소(`CancellationToken`)와 타임아웃도 **decode 1회가 하한**이다.
-llama-server와 같다. decode 도중에 토큰을 끼워 넣지 않는다.
-
-## 동시성
-
-llama-server도 continuous batching이 기본이다. golbang이 다시 만드는 이유는
-“CB가 없어서”가 아니다. 스케줄 루프가 `llama_decode`에 묶여 있으면
-join/evict/chunk/우선순위를 바꾸기 어렵기 때문이다.
-
-| 장치 | 하는 일 |
-|------|---------|
-| tokio HTTP | 수신, 503, SSE. GPU를 기다리지 않음 |
-| Scheduler 태스크 | 큐 drain, 정책, 배치 계획, 이벤트 전달 |
-| `spawn_blocking` | 유일한 HIP 진입. `Engine`의 `Mutex<Model>`이 직렬화 |
-| `SchedulePolicy` | `join` / `evict` / `rank` / `budget`. P2는 `fifo`만 |
-| `IterationBudget` | `n_parallel==1`이면 `prefill_max=n_batch`, 아니면 `n_ubatch`. `decode_max=n_parallel`. `mixed_prefill_max=0` (디코드와 큰 prefill을 한 `llama_decode`에 안 섞음). `n_parallel>1`이면 `prefill_yield_every=16` / `prefill_yield_max=256`으로 프리필 전용 이터레이션 |
-
-`--n-ctx`는 **슬롯당 기본 몫**이다. 총 KV 풀은 `n_ctx * n_parallel`.
-`--n-parallel`은 슬롯 수이자 `llama n_seq_max`이다.
-혼자일 때는 `--single-max-ctx`(기본=풀 전체)까지 자란다. 두 번째 슬롯이
-붙으면 `min(single_max, max(used, 풀/활성수))`로 다시 나눈다. 이미 쓴
-셀은 줄이지 않고, 남은 셀만 신규 슬롯에 준다.
-
-llama 기본은 `kv_unified=false`라 시퀀스마다 독립 스트림이고, 한 슬롯은
-`n_ctx_seq ≈ n_ctx`를 넘지 못한다. 스케줄러가 풀 전체를 주려면
-`--kv-unified`가 필요하다 (Qwen3.8 생산 유닛).
-
-과부하 계약: bounded mpsc가 가득이면 **즉시** `503` + `Retry-After: 1`.
-llama-server는 같은 상황에서 대기할 수 있다. 이건 버그가 아니라 선택이다.
-
-## KV와 prefix cache
-
-P3는 `llama_memory_seq_*` 스파이크 뒤 **슬롯 로컬 재사용**을 골랐다.
-P5는 Stop/Length/Cancel 뒤에도 그 KV를 지우지 않는다.
-
-- `SlotPrefixCache`가 직전 프롬프트+생성 토큰을 기억한다.
-- 다음 bind에서 LCP만큼 `n_past`, suffix만 `llama_memory_seq_rm`.
-- 마지막 프롬프트 토큰 하나는 항상 prefill한다 (logits 셀).
-- DSV4는 suffix `seq_rm`이 약해서 prefill 체크포인트 + `--n-rs-seq 1`이 필요하다.
-- MTP가 켜지면 `n_rs_seq`를 `--spec-draft-n-max`까지 올린다.
-  거부된 draft를 150 MiB state 복사 없이 `seq_rm`하기 위해서다.
-
-`PrefixStore`는 슬롯 간 `llama_memory_seq_cp`가 아니라 호스트 `seq_state` 덤프
-맵이다. 빈 슬롯 bind가 새 프롬프트로 최장 일치 접두(도구/시스템 head, 생산
-실측 약 12545·ubatch 경계 12288)를 복원하고 접미만 프리필한다.
-비전 슬롯은 bind 때 `clear_seq`한다. 이미지 턴은 prefix hit가 없다.
-
-## 채팅 표면
-
-| 경로 | 언제 | 비고 |
-|------|------|------|
-| Qwen ChatML | 기본. `--jinja` 없거나 jinja 실패 | `<\|im_start\|>` 하드코딩 |
-| minijinja | `--jinja` + GGUF `tokenizer.chat_template` 또는 `--chat-template-file` | `llama_chat_apply_template`는 jinja가 아님 |
-| reasoning | `--reasoning-format deepseek\|auto` | `<think>` → `reasoning_content`. 시작 태그는 `trim_end()` 후 매칭 |
-| `reasoning_effort` | CLI + 요청 필드 | jinja `None`은 `UNDEFINED`로 넘겨야 `default('xhigh')`가 산다 |
-| tools | 요청 `tools` | 템플릿에 주입. 출력은 DSML/Qwen/Hermes를 OpenAI `tool_calls`로 |
-| vision | `--mmproj` | `image_url` / `input_image`. 마커 `<__media__>` |
-| spec | `--spec-type draft-mtp,ngram-mod` | 타깃에서 `[sampled, draft…]` 검증. 불일치·보너스가 다음 pending |
-
-thinking off 템플릿(`<think>\n\n</think>\n\n`)은 content를 유지한다.
-
-## 컴퓨트 FFI
-
-`golbang-sys`는 헤더를 그 자리에서 읽지 않는다. SHA를 검사하고
-`llama.h` 줄 수(1629)와 `libggml-hip.so` 안의 `gfx906` 바이트를 확인한 뒤에만 링크한다.
-
-쓰는 C API (현행 이름):
-
-- 로드: `llama_model_load_from_file` / `llama_init_from_model` / `llama_model_free`
-- 추론: `llama_decode` / `llama_get_logits` / `llama_memory_seq_*`
-- 비전: `mtmd_init_from_file` / `mtmd_helper_bitmap_init_from_buf`
-- MTP: `llama_model_n_layer_nextn` + `golbang_llama_*` 심 (`llama-ext.h`)
-
-`--n-cpu-moe N`은 `blk.{0..N-1}.ffn_(up\|down\|gate\|gate_up)_(ch\|)exps`만
-CPU buffer에 고정한다. 스레드 수도, 활성 expert 수도 아니다.
-32 GiB MI50에 DSV4 IQ2_M(~85 GiB)을 올리려면 `N=32`가 입장료다.
-
-`--no-mmap` → `LLAMA_LOAD_MODE_NONE`. 생산 Qwen 유닛과 같다.
-
-## 주요 기능
-
-- OpenAI `POST /v1/chat/completions` — `stream:true` SSE, `stream:false` JSON
-- OpenAI `GET /v1/models` (별칭 `GET /models`) — 로드된 모델 한 개. llama-server와 같은 `meta` 키
-- 슬롯 풀 + 교체 가능한 `SchedulePolicy` + chunked prefill
-- 다턴 slot-local prefix cache (`cache_n`, timings에 포함)
-- Qwen ChatML / GGUF jinja / `--chat-template-file`
-- `<think>` reasoning, tool call 파서
-- MTP speculative + ngram-mod
-- `--mmproj` 비전
-- `/metrics` (토큰, TTFT/ITL, draft accept, 503)
-- `--prompt-progress` (기본 on): SSE `prompt_progress`로 긴 프리필 동안 연결 유지
-- `--api-key` (`Authorization: Bearer` 또는 `X-Api-Key`)
-- `--alias` (llama-server `-a`)
-- `--rpc` / `--tensor-split` (llama-server와 동일. HIP 메인 + `ggml-rpc-server`. 생산 HIP `build/`에는 RPC를 섞지 않고 같은 SHA의 `build-rpc-hip`을 `GOLBANG_LLAMA_BIN_DIR`로 링크)
-
-없는 것: embeddings, rerank, 크로스 슬롯 prefix 복사, `fifo` 이외 정책,
-순수 Rust GPU 커널(P4는 P6 gate 실패로 열지 않음).
-
-## 빌드
-
-**CUDA와 HIP은 각각 빌드한다 — 통합 빌드는 하지 않는다.**
-`GOLBANG_GPU` env가 llama.cpp 트리·SHA pin·링크 라이브러리를 결정하고,
-`CARGO_TARGET_DIR`으로 타겟 디렉토리를 분리한다. 하나의 바이너리가 두 GPU를
-모두 지원하는 단일(통합) 빌드/`--gpu` 런타임 플래그는 **없다** (2026-08-29 결정,
-위키 `cuda-hip-separate-builds`).
-
-| GPU | env | 타겟 디렉터리 | llama.cpp 트리 | SHA pin |
-|-----|-----|---------------|----------------|---------|
-| HIP (MI50 gfx906) | `GOLBANG_GPU=hip` (기본) | `target-hip` | `llama.cpp-glm5next` | `367ebbc20` |
-| CUDA (V100 sm_70) | `GOLBANG_GPU=cuda` | `target-cuda` | `llama.cpp-cuda-upstream` (`origin/master`) | `c069aa7f5` |
-| DSV4.1 HIP (MI50) | `GOLBANG_GPU=ds41` | `target-ds41` | `llama.cpp-ds41` (vcruz305 `runtime/deepseek41`) | `24032ea2b` |
-| DSV4.1 CUDA (V100) | `GOLBANG_GPU=ds41-cuda` | `target-ds41-cuda` | `llama.cpp-ds41` (`build-cuda`) | `24032ea2b` |
-
-`ds41`/`ds41-cuda`는 HIP/CUDA 링크 레시피를 그대로 쓰되 DSV4.1 네이티브 런타임
-트리(`deepseek41`; glm5next 없음)를 가리킨다. 따라서 별도 바이너리이고 `hip`/`cuda`
-핀을 대체하지 않는다 (위키 `golbang-as-dsv41-runtime`).
-
-서비스는 GPU별 바이너리를 각각 실행한다: MI50 서비스는
-`target-hip/release/golbang-server`, V100 서비스는
-`target-cuda/release/golbang-server`, DSV4.1 서비스는 각각
-`target-ds41/release/golbang-server`(HIP)와
-`target-ds41-cuda/release/golbang-server`(CUDA) (유닛은 `deploy/`).
-
-필요: Rust 1.97+ (`~/.cargo/bin`), ROCm 7.2 (HIP) / CUDA 12.8 toolkit
-(`/opt/cuda-12.8`, V100/Volta. CUDA 13은 compute_70을 지원하지 않음),
-핀된 llama.cpp 트리와 그 SHA의 `.so`.
+### 빌드와 실행
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-export GOLBANG_TEST_MODEL=/home/agurrrrr/models/Qwen3-0.6B-Q4_K_M.gguf
+# 1) 핀된 llama.cpp을 백엔드별로 빌드해둔다 (예: HIP)
+git -C "$GOLBANG_LLAMA_DIR" checkout <핀 SHA>
+cmake -B build -DGGML_HIP=ON && cmake --build build --config Release
 
-# HIP (MI50) 빌드
-CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo build -p golbang-server --release
+# 2) golbang 빌드 (백엔드는 GOLBANG_GPU 빌드 타임 결정. 런타임 스위치 없음)
+CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip \
+  cargo build -p golbang-server --release
 
-# CUDA (V100, CUDA 12.8)
-CARGO_TARGET_DIR=target-cuda GOLBANG_GPU=cuda cargo build -p golbang-server --release
-
-# DSV4.1 네이티브 런타임, MI50 HIP (llama.cpp-ds41/build/bin)
-CARGO_TARGET_DIR=target-ds41 GOLBANG_GPU=ds41 cargo build -p golbang-server --release
-
-# DSV4.1 네이티브 런타임, 2×V100 CUDA (llama.cpp-ds41/build-cuda/bin)
-CARGO_TARGET_DIR=target-ds41-cuda GOLBANG_GPU=ds41-cuda cargo build -p golbang-server --release
-
-# 테스트 (GOLBANG_GPU로 백엔드 선택, 기본 hip)
-CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip cargo test -p golbang-sys -- --nocapture
-```
-
-`cargo test --workspace`는 `GOLBANG_TEST_MODEL`이 있을 때
-SSE / JSON / 빈 messages 4xx / decode 중 503까지 돈다.
-
-릴리스 프로필: `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`.
-
-## 실행
-
-기본 포트 **8088** (`:8080` llama-server와 겹치지 않게).
-
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# 소형 스모크
-cargo run -p golbang-server --release -- \
-  --model "$GOLBANG_TEST_MODEL" --port 8088 \
+# 3) 소형 모델 스모크
+./target-hip/release/golbang-server \
+  --model /path/to/Qwen3-0.6B-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8088 \
   --n-parallel 2 --queue-size 2 --policy fifo
+```
 
+```bash
 # 스트리밍
 curl -N -X POST http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":true,"max_tokens":32}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],
+       "stream":true,"max_tokens":32}'
 
 # 비스트리밍
 curl -sS -X POST http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"안녕"}],"stream":false,"max_tokens":32}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],
+       "stream":false,"max_tokens":32}'
+
+# 모델 카드 / 메트릭
+curl -s http://127.0.0.1:8088/v1/models
+curl -s http://127.0.0.1:8088/metrics | head
 ```
 
-생산에 가까운 기동 예 (Qwen3.8 27B UD-Q4_K_XL, 텍스트만. 유닛 파일은 `deploy/`):
+기본 바인드는 `127.0.0.1`이다. 외부에 열 때는 `--host 0.0.0.0`과 함께
+**`--api-key`를 반드시 걸고**(미들웨어가 `Authorization: Bearer` / `X-Api-Key`를 검사),
+TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인스턴스는 LAN 전용으로 두자.
 
-```bash
-./target/release/golbang-server \
-  --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf \
-  --alias qwen3.8-27b-q6 \
-  --host 127.0.0.1 --port 8083 \
-  --n-gpu-layers 99 --flash-attn on \
-  --n-ctx 70000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 \
-  --n-parallel 2 --queue-size 2 --single-max-ctx 128000 --kv-unified \
-  --no-mmap --jinja --reasoning-format deepseek \
-  --spec-type draft-mtp,ngram-mod \
-  --spec-draft-n-max 3 --spec-draft-p-min 0.90
-```
+## 기능
 
-DSV4 IQ2_M은 `--n-cpu-moe 32 --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-rs-seq 1`가
-32 GiB VRAM 장부다. `n-ubatch 5800`은 이 SHA에서 compute ~5 GiB → OOM.
+- OpenAI `POST /v1/chat/completions` — `stream:true` SSE, `stream:false` JSON
+- OpenAI `GET /v1/models` (별칭 `GET /models`) — 로드된 모델 한 개, llama-server 호환 `meta`
+- **continuous batching** — 슬롯 풀 + 교체 가능한 `SchedulePolicy` + chunked prefill.
+  join/evict/cancel은 `llama_decode` 반환 직후 **iteration 경계에서만** 일어난다
+- **과부하 계약** — bounded 큐가 가득이면 decode를 기다리지 않고 **즉시 503 + `Retry-After: 1`**
+  (llama-server는 같은 상황에서 대기할 수 있다. 버그가 아니라 선택이다)
+- **다턴 prefix cache** — 슬롯 로컬 LCP 재사용 + 크로스 슬롯 접두 스냅샷.
+  3k 토큰 대화의 2턴째 prefill이 수 토큰으로 줄어든다 ([P5 기록](docs/bench/p5.md))
+- 채팅 템플릿 — Qwen ChatML 하드코딩(기본) / GGUF `tokenizer.chat_template`을 minijinja로(`--jinja`) /
+  `--chat-template-file` 재정의
+- **reasoning** — `--reasoning-format deepseek|auto`로 think 태그를 OpenAI `reasoning_content`로 분리.
+  `reasoning_effort`(CLI + 요청 필드)와 `--reasoning-budget`(초과 시 think 종료 강제) 지원
+- **tool calls** — 요청 `tools`를 템플릿에 주입, DSML/Qwen/Hermes 출력을 OpenAI `tool_calls`로 재파싱
+- **vision** — `--mmproj`로 `image_url` / `input_image` (`mtmd`)
+- **speculative decoding** — `--spec-type draft-mtp,ngram-mod`. 타깃에서 `[sampled, draft…]` 검증
+- `/metrics` — Prometheus. 토큰, TTFT/ITL 히스토그램, draft accept, 슬롯 점유, 503
+- `--prompt-progress`(기본 on) — SSE에 llama-server식 `prompt_progress`를 실어 긴 프리필 동안 연결 유지
+- `--api-key` / `--alias` / `--rpc` / `--tensor-split` — llama-server와 같은 의미
 
+**없는 것:** embeddings, rerank, `fifo` 이외 스케줄 정책, 순수 Rust GPU 커널(P6 gate 실패로 닫힘).
 ## 설정
 
-대부분의 플래그는 `GOLBANG_*` 환경 변수와 같다.
+대부분의 플래그는 `GOLBANG_*` 환경 변수와 동일하다. `--help`가 최종 진실이고,
+아래는 자주 쓰는 것들의 요약이다.
 
 | 플래그 | 기본 | 의미 |
 |--------|------|------|
-| `--model` | `GOLBANG_MODEL` / `GOLBANG_TEST_MODEL` | GGUF 경로 |
-| `--host` / `--port` | `127.0.0.1` / `8088` | 바인드 |
-| `--n-ctx` | `256` | 슬롯당 기본 몫. 총 KV = n_ctx × n_parallel |
-| `--n-parallel` | `2` | 슬롯 수 / `n_seq_max` |
-| `--single-max-ctx` | `0` = 풀 전체 | 솔로 슬롯 상한. 0이면 `n_ctx × n_parallel` |
+| `--model` | `GOLBANG_MODEL` | GGUF 경로 (테스트용 `GOLBANG_TEST_MODEL` 폴백) |
+| `--host` / `--port` | `127.0.0.1` / `8088` | 바인드 (llama-server `:8080`와 겹치지 않는 기본값) |
+| `--n-ctx` | `256` | **슬롯당 기본 몫.** 총 KV 풀 = `n_ctx × n_parallel` |
+| `--n-parallel` | `2` | 슬롯 수이자 llama `n_seq_max` |
+| `--single-max-ctx` | `0` = 풀 전체 | 솔로 슬롯의 상한. 두 번째 슬롯이 붙으면 풀을 다시 나눈다 |
 | `--kv-unified` | off | llama 공유 KV 스트림. 솔로가 풀 전체를 쓰려면 필요 |
-| `--queue-size` | `2` | 대기 큐. 가득 → 503 |
-| `--n-gpu-layers` | `99` | GPU 오프로드 |
-| `--n-cpu-moe` | `0` | 앞 N층 expert를 CPU에 고정 |
-| `--n-batch` / `--n-ubatch` | `0` = n_ctx / n_batch | 논리 배치 / 물리 ubatch |
-| `--n-threads` | `0` | llama decode 스레드. 0 = 라이브러리 기본 |
-| `--n-rs-seq` | `1` | recurrent snapshot. MTP면 `n_max`로 상향 |
+| `--queue-size` | `2` | 대기 큐. 가득 차면 503 |
+| `--n-gpu-layers` | `99` | GPU 오프로드 레이어 |
+| `--n-cpu-moe` | `0` | 앞 N개 블록의 expert 가중치를 CPU에 고정 (MoE VRAM 배분) |
+| `--n-batch` / `--n-ubatch` | `0` = auto | 논리 배치 / 물리 ubatch |
+| `--n-threads` | `0` | llama decode 스레드 (0 = 라이브러리 기본) |
+| `--n-rs-seq` | `1` | recurrent snapshot 수. MTP 켜지면 자동 상향 |
 | `--flash-attn` | `auto` | `auto` \| `on` \| `off` |
 | `--no-mmap` | off | `LLAMA_LOAD_MODE_NONE` |
 | `--alias` | 파일명 | 응답 `model` 필드 |
-| `--jinja` | off | GGUF 템플릿을 minijinja로 |
+| `--jinja` | off | GGUF 템플릿을 minijinja로 적용 |
 | `--chat-template-file` | 없음 | GGUF 템플릿 재정의 |
 | `--reasoning-format` | `none` | `none` \| `deepseek` \| `deepseek-legacy` \| `auto` |
-| `--reasoning-effort` | 템플릿 기본 | `xhigh` \| `medium` \| `low` |
-| `--reasoning-budget` | `0` | think 토큰 상한. 0=무제한. 넘으면 `</think>` 강제 |
-| `--mmproj` | 없음 | CLIP/projector GGUF |
-| `--model-draft` | 없음 | 별도 MTP/draft GGUF (llama-server `-md`) |
+| `--reasoning-effort` / `--reasoning-budget` | 템플릿 기본 / 무제한 | think 제어 |
+| `--mmproj` | 없음 | CLIP/projector GGUF (vision) |
 | `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod` (콤마) |
-| `--spec-draft-n-max` | `3` | MTP draft 상한 |
-| `--spec-draft-p-min` | `0.90` | MTP 최소 확률 |
-| `--spec-draft-type-k/v` | `q8_0` | MTP KV 타입 |
-| `--load-mtp` | off | spec 없이도 MTP 텐서 로드 |
-| `--policy` | `fifo` | P2는 fifo만 |
-| `--timeout-secs` | 없음 | 요청 생성 제한 |
-| `--api-key` | 없음 | 반복 또는 콤마. `/metrics` `/models`는 제외 |
-| `--prompt-progress` | on | SSE에 llama-server `prompt_progress` (`total`/`cache`/`processed`/`time_ms`). 긴 프리필 동안 연결 유지. 요청 `return_progress`가 덮어씀 |
+| `--spec-draft-n-max` / `--spec-draft-p-min` | `3` / `0.90` | MTP draft 상한 / 최소 확률 |
+| `--policy` | `fifo` | 현재 `fifo`만 구현. trait은 교체 가능 |
+| `--timeout-secs` | 없음 | 요청 생성 시간 제한 |
+| `--api-key` | 없음 | 반복 또는 콤마. `/metrics` `/models`는 면제 |
+| `--prompt-progress` | on | SSE `prompt_progress` 이벤트 |
+| `--rpc` / `--tensor-split` | 없음 | llama-server와 동일 의미 (ggml-rpc 오프로드) |
 
-엔드포인트: `POST /v1/chat/completions`, `GET /v1/models`, `GET /models`, `GET /metrics`.
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,
-`tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget` (`reasoning_budget_tokens`),
-`image_url`, `return_progress`.
+`tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget`, `image_url`, `return_progress`.
 
-## 배포
+## 빌드 (백엔드별)
 
-systemd 유닛은 서로 `Conflicts`다. 한 장의 MI50에서 하나만 켠다.
+**CUDA와 HIP은 각각 빌드한다 — 통합 빌드는 하지 않는다.**
+`GOLBANG_GPU`가 llama.cpp 트리·SHA 핀·링크 라이브러리를 결정하고,
+`CARGO_TARGET_DIR`로 산출물을 분리한다. 하나의 바이너리가 두 GPU를 모두 보는
+`--gpu` 런타임 플래그는 **없다** (의도된 설계).
 
-| 유닛 | 모델 | 포트 |
+| 백엔드 | `GOLBANG_GPU` | 링크 대상 | 비고 |
+|--------|---------------|-----------|------|
+| HIP | `hip` (기본) | `libggml-hip.so` | gfx906 바이트 검사 포함 |
+| CUDA | `cuda` | `libggml-cuda.so` | V100은 CUDA 12.8 |
+| Vulkan | `vulkan` | `libggml-vulkan.so` | 같은 트리, `build-vulkan/` cmake dir |
+| DSV4.1 런타임 | `ds41` / `ds41-cuda` | 위와 동일 레시피 | DeepSeek-V4.1 네이티브 포인터 트리 별도 |
+
+`cargo test --workspace`는 `GOLBANG_TEST_MODEL`(소형 GGUF)이 있을 때
+SSE / JSON / 빈 messages 4xx / decode 중 503까지 돌고, 없으면 스킵한다.
+
+현재 pinned llama.cpp SHA는 `golbang-sys/build.rs`의 `EXPECTED_SHA_*` 상수가 진실이다.
+업스트림 따라잡기는 워크플로 일부다 — 핀을 올릴 때는 해당 SHA로 트리를 재빌드한 뒤
+상수만 바꾼다. 형제 트리(다른 브랜치/fork)의 헤더와 `.so`를 섞지 말 것.
+
+## 배포 예시
+
+`deploy/`에 systemd 유닛 예시가 있다. 실사용 환경 맞춤값(절대경로·모델명·키)은
+제거했으니 자기 환경에 맞게 채우면 된다.
+
+- 유닛들은 서로 `Conflicts=` — 한 장의 GPU에는 하나만
+- API 키는 `EnvironmentFile=-/etc/golbang/secrets.env`로 주입한다
+  (`deploy/secrets.env.example` 참고. **유닛 파일에 평문 키를 남기지 말 것**)
+- HIP 공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `LD_LIBRARY_PATH=<llama.cpp build/bin>`
+
+## 벤치마크 요약
+
+같은 커널을 쓰기 때문에 decode 단독으로는 llama-server를 이기지 않는다.
+측정을 숨기지 않고 전부 커밋한다. raw JSON은 `docs/bench/raw/`, 재현 스크립트는 `scripts/`다.
+
+| 비교 | 결과 | 문서 |
 |------|------|------|
-| `deploy/golbang-qwen38.service` | Qwen3.8-27B UD-Q4_K_XL + mmproj + MTP, KV 140k / solo 128k | 8083 |
-| `deploy/golbang-deepseek.service` | DSV4.1-Flash Q2_K (deepseek4), `n_cpu_moe=32`, alias `dsv41-flash-hip` | 8080 |
-| `deploy/golbang-cuda-qwen38.service` | Unsloth Qwen3.8-27B UD-Q4_K_XL + MTP, 2×V100 LAYER `--tensor-split 18,14`, ctx 10000×2 | 8084 |
-| `deploy/golbang-cuda-deepseek.service` | DSV4.1-Flash Q2_K (deepseek4), `n_cpu_moe=43` (expert 전량 CPU), 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-cuda` | 8086 |
-| `deploy/golbang-glm53flash.service` | GLM-5.3-Flash AJ-IQ2_XXS (MI50) | 8085 |
-| `deploy/llama-server-dsv41.service` | upstream llama.cpp `llama-server` (`llama.cpp-v41` = master `9cbf07987` + gfx906 포트 + DSV4.1 로더 패치), DSV4.1-Flash Q2_K, `n_cpu_moe=35`, alias `dsv41-flash-llama` | 8080 |
-| `deploy/llama-server-dsv41-native.service` | 네이티브 deepseek41 런타임 (`llama.cpp-ds41` = vcruz305 `runtime/deepseek41` + gfx906 포트, MI50 HIP), DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=35`, alias `dsv41-flash-native` | 8080 |
-| `deploy/llama-server-dsv41-native-cuda.service` | 위 트리의 CUDA(sm_70) 빌드 `build-cuda`, DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=39`, 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-native-cuda` | 8086 |
-| `deploy/golbang-server-ds41.service` | golbang-server + 네이티브 deepseek41 런타임 (`GOLBANG_GPU=ds41`, MI50 HIP), DSV4.1-Flash Q2_K-ds41, `n_cpu_moe=35`, alias `dsv41-flash-golbang` | 8087 |
-| `deploy/golbang-server-ds41-cuda.service` | 위의 CUDA 빌드 (`GOLBANG_GPU=ds41-cuda`, `build-cuda`), `n_cpu_moe=39`, 2×V100 LAYER `--tensor-split 16,16`, alias `dsv41-flash-golbang-cuda` | 8089 |
+| vs llama-server (MI50, DSV4-Flash IQ2_M) | decode ~8 t/s **동률**. 660토큰 prefill 동급, 2540토큰은 `-ub` 차이로 llama 우위. 과부하 4-way는 golbang 스위트 wall 6.4s vs llama 11.5s (503 즉시 거절) | [`golbang-vs-llama-server.md`](docs/bench/golbang-vs-llama-server.md) |
+| vs llama-server (RTX 3060) | decode **동률** 13.2–13.4 t/s, prefill은 golbang **1.4–1.7×** | [`golbang-vs-llama-cuda.md`](docs/bench/golbang-vs-llama-cuda.md) |
+| P7 Qwen3.8-27B decode 패리티 | 16/200토큰 밴드 충족, 84/장문 밴드는 ±3% 내외 | [`p7.md`](docs/bench/p7.md) |
+| 다턴 prefix cache | 2.5k 토큰 재요청 시 cache_n≈2540, wall 34s → 4s | [`p5.md`](docs/bench/p5.md) |
 
-공통 환경: `HSA_OVERRIDE_GFX_VERSION=9.0.6`, `ROCR_VISIBLE_DEVICES=0`,
-`ROCBLAS_USE_HIPBLASLT=0`,
-`LD_LIBRARY_PATH=…/llama.cpp-upgrade/build/bin`.
-실행 중 유닛은 롤백 핀(`llama.cpp-upgrade`)을 유지한다; 새 빌드 기본 트리는
-`llama.cpp-glm5next`이며 G3에서 GLM 전용 유닛이 생긴다.
+**llama-server를 그냥 쓰는 게 더 나을 수도 있다.** golbang은 GPU 커널 경쟁이 아니라
+Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수 llama.cpp 배포가 필요한
+사람에게 이 저장소는 대안이 아니다.
 
-## 로드맵
+## 아키텍처
 
-지시서는 `docs/work-orders/`, 요약은 `docs/ROADMAP.md`.
+워크스페이스는 세 크레이트. unsafe는 `golbang-sys`와 `golbang-core`의 FFI 호출에만 있다.
 
-| 단계 | 상태 | 산출 |
-|------|------|------|
-| P0 FFI | 완료 | SHA 핀 + Hello decode |
-| P1 E2E | 완료 | OpenAI SSE / JSON |
-| P2 동시성 | 완료 | 정책 루프 + 즉시 503 |
-| P3 성능 | 완료 | chunked prefill, `/metrics` |
-| P5 다턴 cache | 완료 | 2턴째 `cache_n > 0` |
-| P6 rocprof | 완료 | 커널 패치 0. 병목은 CPU MoE |
-| P7 Qwen3.8 decode | 진행 | llama-server #364 밴드별 패리티 |
-| P4 Rust 커널 | 닫힘 | P6가 특정 커널을 지목하지 않음 |
+| 크레이트 | 역할 |
+|----------|------|
+| **golbang-server** | axum HTTP, SSE/JSON, `/v1/models`, `/metrics`, API 키 미들웨어 |
+| **golbang-core** | 스케줄러, 슬롯, 정책, 엔진, 템플릿, 샘플러, prefix cache, speculative, vision, tools |
+| **golbang-sys** | `llama.h` / `mtmd.h` / `llama-ext.h` bindgen + C++ shim. C ABI만 노출 |
+
+한 요청의 경로:
+
+1. **HTTP** — `messages`를 검사하고 템플릿을 입힌다. `image_url`은 마커 + 바이트로 바뀐다.
+2. **제출** — `try_submit`은 non-blocking. 큐 가득지면 503.
+3. **join** — 빈 슬롯에, **이번 decode 반환 직후에만** 붙인다.
+4. **bind** — 토큰화 후 슬롯 prefix와 LCP 재사용. 재사용 구간은 prefill하지 않는다.
+5. **plan** — decoding 슬롯 우선, 남는 칸에 prefill. 큰 prefill과 decode를 한
+   `llama_decode`에 섞지 않는다 (`mixed_prefill_max`).
+6. **GPU** — `spawn_blocking` 단일 워커의 `Mutex<Model>`에서 decode → 샘플 → MTP draft.
+7. **방출** — SSE `delta` 또는 JSON. reasoning/tool 파서가 태그 단위로 자른다.
+
+상세 구현 메모는 [`docs/ROADMAP.md`](docs/ROADMAP.md)와 `docs/work-orders/`에 단계별로 있다.
 
 ## 한계
 
-- **같은 커널.** DSV4 decode ~8 tok/s는 golbang과 llama-server가 동률이다
-  (`docs/bench/golbang-vs-llama-server.md`). 천장는 `n_cpu_moe=32`.
-- **ubatch.** 32 GiB에서 DSV4는 `--n-ubatch 1024`. llama-server `-ub 5800`보다
-  긴 prefill이 느릴 수 있다.
-- **Qwen3.8 decode.** 생산 llama-server는 실사용 17–23 t/s.
-  golbang은 MTP를 켰지만 P7에서 아직 그 밴드를 넘기지 못했다 (`docs/bench/p7.md`).
-- **비전 prefix.** 이미지 요청은 슬롯 KV를 비운다.
-- **정책 하나.** `SchedulePolicy`는 교체 가능하지만 구현은 FIFO뿐이다.
+- **같은 커널, 같은 천장.** decode는 llama-server와 동률이다. MoE 모델의 병목은
+  커널이 아니라 CPU expert 오프로드(`n-cpu-moe`)다.
+- **장문 prefill 설정.** VRAM이 빠듯한 카드에서는 `--n-ubatch`를 낮춰야 해서
+  llama-server의 큰 `-ub`보다 긴 prefill이 느릴 수 있다.
+- **스케줄 정책은 FIFO뿐.** trait은 교체 가능하게 열어뒀지만 추가 구현이 없다.
+- **비전 prefix.** 이미지 요청은 슬롯 KV를 비운다 (prefix hit 없음).
+- **단일 모델.** 프로세스당 모델 하나. 멀티 모델 게이트웨이는 범위 밖이다.
+- **gfx906 실험실 산물.** MI50/V100 외 세대(3090, MI210 등)에서는 테스트가 부족하다.
 
 ## 문서
 
 | 위치 | 내용 |
 |------|------|
-| `docs/ROADMAP.md` | 단계와 완료 기준 |
-| `docs/work-orders/` | P0–P7 실행 지시서 |
-| `docs/bench/` | P2/P3/P5/P6/P7, vs llama-server |
-| 위키 `architecture-decision` | ADR과 개정 기록 |
-| 위키 `qwen38-on-golbang`, `dsv4-run-notes` | 모델별 기동 |
-| 위키 `n-cpu-moe-vram`, `p6-rocprof-notes` | 왜 커널이 병목이 아닌가 |
-| 위키 `p2-concurrency-notes` … `p5-prefix-cache-notes` | 단계별 구현 메모 |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | P0–P7 단계와 완료 기준 (체크박스) |
+| [`docs/work-orders/`](docs/work-orders/) | 단계별 실행 지시서 |
+| [`docs/bench/`](docs/bench/) | 성능 기록 + `raw/` 원본 JSON |
+| [`scripts/`](scripts/) | 벤치 재현 스크립트 (표준 라이브러리만 사용) |
+| [`deploy/`](deploy/) | systemd 유닛 예시 |
+
+## 기여
+
+Issue와 PR을 환영한다. Rust 코드는 `cargo fmt --all`과 `cargo clippy`를 통과해야 하고,
+FFI 경계를 건드리는 변경은 `golbang-sys/build.rs`의 SHA 핀 검사를 함께 설명해달라.
+새 기능보다 **먼저 issue**를 열어 방향을 맞추는 것을 권한다 — 이 프로젝트는
+서빙 표면을 좁게 유지하는 것을 명시적 목표로 한다.
 
 ## 라이선스
 
-MIT OR Apache-2.0 (`Cargo.toml` workspace).
+MIT OR Apache-2.0 (dual license, `Cargo.toml`의 workspace `license`와 동일).
+llama.cpp와 동일 라이선스 계열이라 GGUF 생태계 관행과 호환된다.

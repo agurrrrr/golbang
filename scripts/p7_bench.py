@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -15,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-API_KEY = "REDACTED_KEY1"
+API_KEY = os.environ.get("GOLBANG_API_KEY", "")
 
 PROMPTS = [
     {

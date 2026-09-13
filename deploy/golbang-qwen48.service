@@ -8,6 +8,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
 Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
@@ -29,7 +30,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --spec-draft-p-min 0.90 \
   --spec-draft-type-k q8_0 \
   --spec-draft-type-v q8_0 \
-  --api-key REDACTED_KEY1
+  --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300

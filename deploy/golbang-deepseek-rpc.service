@@ -11,6 +11,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
 Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
@@ -30,7 +31,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-hip-rpc/release/golbang-server \
   --n-parallel 1 --queue-size 1 \
   --jinja --reasoning-format deepseek \
   --rpc 127.0.0.1:50052 --tensor-split 32,16 \
-  --api-key REDACTED_KEY1
+  --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=600

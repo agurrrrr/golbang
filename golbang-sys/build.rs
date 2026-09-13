@@ -161,14 +161,24 @@ fn main() {
             let bytes = fs::read(&vk_so).unwrap_or_else(|e| {
                 panic!("failed to read {}: {e}", vk_so.display());
             });
-            if !bytes.windows(b"ggml_vulkan".len()).any(|w| w == b"ggml_vulkan") {
+            if !bytes
+                .windows(b"ggml_vulkan".len())
+                .any(|w| w == b"ggml_vulkan")
+            {
                 panic!(
                     "{} does not contain the ggml_vulkan marker. SHA/.so drift — rebuild build-vulkan.",
                     vk_so.display()
                 );
             }
             backend_so = vk_so;
-            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "ggml-vulkan", "mtmd"];
+            link_libs = &[
+                "llama",
+                "ggml",
+                "ggml-base",
+                "ggml-cpu",
+                "ggml-vulkan",
+                "mtmd",
+            ];
             // System loader finds libvulkan.so.1; no extra search path.
             link_search_extra = &[];
         }

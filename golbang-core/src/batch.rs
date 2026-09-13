@@ -555,10 +555,7 @@ mod tests {
     fn decide_mix_finishes_short_suffix_immediately() {
         // req 170: n_prompt=53446 reused=51111 remaining=2335 ≤ 2*2048.
         let budget = IterationBudget::for_context(2048, 2048, 2);
-        let slots = [
-            decode_slot(0, 42),
-            prefill_with_reuse(1, 53446, 51111),
-        ];
+        let slots = [decode_slot(0, 42), prefill_with_reuse(1, 53446, 51111)];
         assert_eq!(max_prefill_remaining(&slots), 2335);
         assert_eq!(
             decide_mix_mode(&slots, budget, 0),

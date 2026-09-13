@@ -8,6 +8,7 @@ Type=simple
 User=agurrrrr
 Group=agurrrrr
 WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
 Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
 Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
@@ -22,7 +23,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --n-ctx 65536 --n-batch 2048 --n-ubatch 512 --n-threads 32 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek --reasoning-effort max \
-  --api-key REDACTED_KEY2
+  --api-key "${GOLBANG_API_KEY_GLM53}"
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=600
