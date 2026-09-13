@@ -22,13 +22,18 @@ Environment=RUST_LOG=info
 # which a proportional tensor-split pushes onto one device and unbalances.
 # n-threads 32 beats 64 (SMT oversubscription).
 # Measured on 2x V100 + EPYC 7452: prefill ~17 tok/s warm, decode ~10 tok/s.
+# KV is 27 KiB/token (24 KiB attention K+V over the 12 full-attn layers +
+# 3 KiB indexer cache); the recurrent (GDN) state is fixed at ~225 MiB. At
+# n_ctx 100000 that is ~2.6 GiB KV and ~8.1 GiB total per V100. The native
+# ceiling n_ctx 262144 also loads (~6.9 GiB KV, ~12.8 GiB per V100), so the
+# real limit on long context is prefill time (~17 tok/s), not VRAM.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --alias qwen3.8-flash-next \
   --host 0.0.0.0 --port 8090 \
   --n-gpu-layers 99 --n-cpu-moe 48 --flash-attn on \
   --tensor-split 16,16 \
-  --n-ctx 16384 --n-batch 1024 --n-ubatch 512 --n-threads 32 --n-rs-seq 1 \
+  --n-ctx 100000 --n-batch 1024 --n-ubatch 512 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \
   --api-key REDACTED_KEY1
