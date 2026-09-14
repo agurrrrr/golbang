@@ -24,7 +24,7 @@ Environment=RUST_LOG=info
 # llama.cpp GGML_ABORTs on connect failure, so wait for :50052 first.
 ExecStartPre=/bin/bash -c 'for i in {1..90}; do (echo >/dev/tcp/127.0.0.1/50052) >/dev/null 2>&1 && exit 0; sleep 1; done; echo ggml-rpc-v100 not listening on 127.0.0.1:50052 >&2; exit 1'
 ExecStart=/home/agurrrrr/code/golbang/target-hip-rpc/release/golbang-server \
-  --model /home/agurrrrr/models/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  --model /home/agurrrrr/models-nas1/dsv4/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
   --n-gpu-layers 99 --n-cpu-moe 28 --flash-attn on \
   --n-ctx 60000 --n-batch 5800 --n-ubatch 1024 --n-threads 32 --n-rs-seq 1 \
