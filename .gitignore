@@ -13,6 +13,7 @@ Cargo.lock.bak
 
 #C/C++ tool build artifacts
 tools/moe-telemetry/moe-telemetry
+tools/q2k-panel-bench/q2k-panel-bench
 
 #python
 __pycache__/

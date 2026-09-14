@@ -1,0 +1,21 @@
+# host: Linux 7.1.5-1-cachyos x86_64, 64 threads
+# date: 2026-09-14T15:53:47+09:00
+# tree: 24032ea2b
+
+builder mapping mismatches: 0 / 256
+single-block ACCURACY max_abs=3.815e-06 max_rel=4.799e-06 -> PASS
+full-K       ACCURACY max_abs=3.624e-05 max_rel=1.944e-06 -> PASS
+
+weights: 236 MiB for 64 experts
+panel build: 1021.0 ms total (2.770 us / panel-superblock)
+
+n_tok=1   experts= 6 cols/expert=1
+  generic                2.498 ms    56.7 GFLOP/s
+  panel (prebuilt)       6.262 ms    22.6 GFLOP/s   speedup=0.40x
+  panel (incl.build)    66.781 ms     2.1 GFLOP/s   speedup=0.04x
+
+n_tok=64  experts=64 cols/expert=6
+  generic              147.643 ms    61.4 GFLOP/s
+  panel (prebuilt)     246.672 ms    36.7 GFLOP/s   speedup=0.60x
+  panel (incl.build)   881.221 ms    10.3 GFLOP/s   speedup=0.17x
+
