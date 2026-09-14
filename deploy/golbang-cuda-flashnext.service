@@ -18,23 +18,30 @@ Environment=RUST_LOG=info
 # mmap is mandatory: the PLE n-gram table (per_layer_token_embd, 27.4 GiB) is
 # TENSOR_READ_LAZY and is gathered from the mapping row by row. Do NOT pass
 # --no-mmap, or the whole 27.4 GiB table is loaded into RAM.
-# n-cpu-moe 48 keeps every expert on CPU. Moving the tail experts to the V100s
-# was slower (6.3 vs 9.1 tok/s): the 48-layer expert pool lands in layers N..47,
-# which a proportional tensor-split pushes onto one device and unbalances.
-# n-threads 32 beats 64 (SMT oversubscription).
-# Measured on 2x V100 + EPYC 7452: prefill ~17 tok/s warm, decode ~10 tok/s.
+# n-cpu-moe 42 with a *shifted* tensor-split (11,1) keeps experts of layers 42..47
+# on the V100s: the proportional split boundary lands at layer 44, so GPU0 carries
+# dense layers 0..43 and GPU1 carries the tail experts. Experts are the tail, so a
+# symmetric split (16,16) puts every GPU expert on one card and silently spills the
+# other. Load with 42/11,1 = GPU0 ~14.3 GiB, GPU1 ~9.4 GiB.
+# --n-ubatch 2048 is the prefill lever: 512 -> 1024 -> 2048 lifts 80k-token prefill
+# from 102 to 234 tok/s at identical decode. ub 4096 fails at load (`llama_init_from_model
+# returned null`), so 2048 is the ceiling on 2x16 GiB.
+# --spec-type ngram-mod is a loss here: acceptance ~0.20 and decode drops to 7-15 tok/s
+# because verifying a draft span activates the union of CPU experts. Leave it off.
+# n-threads 16 vs 32 is noise.
+# Measured on 2x V100 + EPYC 7452 (mmap, page cache warm):
+#   prefill 234 tok/s @ 80k prompt (258 tok/s @ 7k), decode ~22 tok/s short / ~15.4 tok/s @ 80k.
 # KV is 27 KiB/token (24 KiB attention K+V over the 12 full-attn layers +
 # 3 KiB indexer cache); the recurrent (GDN) state is fixed at ~225 MiB. At
-# n_ctx 100000 that is ~2.6 GiB KV and ~8.1 GiB total per V100. The native
-# ceiling n_ctx 262144 also loads (~6.9 GiB KV, ~12.8 GiB per V100), so the
-# real limit on long context is prefill time (~17 tok/s), not VRAM.
+# n_ctx 100000 that is ~2.6 GiB KV. The native ceiling n_ctx 262144 also loads,
+# so the real limit on long context is prefill time, not VRAM.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --alias qwen3.8-flash-next \
   --host 0.0.0.0 --port 8090 \
-  --n-gpu-layers 99 --n-cpu-moe 48 --flash-attn on \
-  --tensor-split 16,16 \
-  --n-ctx 100000 --n-batch 1024 --n-ubatch 512 --n-threads 32 --n-rs-seq 1 \
+  --n-gpu-layers 99 --n-cpu-moe 42 --flash-attn on \
+  --tensor-split 11,1 \
+  --n-ctx 100000 --n-batch 4096 --n-ubatch 2048 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \
   --api-key "${GOLBANG_API_KEY}"
