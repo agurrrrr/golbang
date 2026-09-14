@@ -11,6 +11,9 @@ Cargo.lock.bak
 .rocprofv3/
 *.csv
 
+#C/C++ tool build artifacts
+tools/moe-telemetry/moe-telemetry
+
 #python
 __pycache__/
 *.pyc
