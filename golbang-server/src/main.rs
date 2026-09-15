@@ -8,7 +8,8 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use golbang_core::{
     Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
-    SpecParams, SpecType, parse_ggml_type, parse_rpc_servers, parse_tensor_split, spawn_scheduler,
+    SpecParams, SpecType, parse_ggml_type, parse_rpc_servers, parse_tensor_overrides,
+    parse_tensor_split, spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -188,6 +189,13 @@ struct Args {
     #[arg(long, env = "GOLBANG_TENSOR_SPLIT")]
     tensor_split: Option<String>,
 
+    /// llama-server `-ot/--override-tensor`, e.g. `token_embd=ROCm0` or
+    /// `\.ffn_(up|down)_exps=CPU`. Comma-separated `pattern=buft` pairs; `buft`
+    /// is a backend buffer-type name (`CPU`, `ROCm0`, `CUDA0`, ...). Evaluated
+    /// before `--n-cpu-moe`; the first regex match wins.
+    #[arg(long, env = "GOLBANG_OVERRIDE_TENSOR")]
+    override_tensor: Option<String>,
+
     /// llama-server `return_progress`. SSE `data:` chunks include
     /// `prompt_progress` (`total`/`cache`/`processed`/`time_ms`) so a long
     /// prefill keeps HTTP idle timers from firing. Default on. Per-request
@@ -302,6 +310,18 @@ async fn main() -> Result<()> {
         Some(s) => parse_tensor_split(s).map_err(anyhow::Error::msg)?,
         None => Vec::new(),
     };
+    let tensor_overrides = match args
+        .override_tensor
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => parse_tensor_overrides(s).map_err(anyhow::Error::msg)?,
+        None => Vec::new(),
+    };
+    if !tensor_overrides.is_empty() {
+        tracing::info!(?tensor_overrides, "tensor buffer-type overrides");
+    }
     if !rpc_servers.is_empty() {
         tracing::info!(
             servers = ?rpc_servers,
@@ -331,6 +351,7 @@ async fn main() -> Result<()> {
             n_ctx: args.n_ctx,
             n_seq_max: n_parallel,
             n_cpu_moe: args.n_cpu_moe,
+            tensor_overrides,
             flash_attn,
             n_batch: args.n_batch,
             n_ubatch: args.n_ubatch,

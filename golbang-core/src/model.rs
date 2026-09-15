@@ -19,6 +19,14 @@ use crate::vision::{TokenizedVision, Vision};
 /// Matches llama.cpp `LLM_FFN_EXPS_REGEX` — expert tensors left on CPU by `-ncmoe`.
 const FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
+/// One llama-server `-ot/--override-tensor <pattern>=<buft>` entry. `buft` is a
+/// backend buffer-type name (`CPU`, `ROCm0`, `CUDA0`, ...) resolved at load time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorOverride {
+    pub pattern: String,
+    pub buft: String,
+}
+
 /// Load options. `n_ctx` is the **per-sequence fair share**. Total KV is
 /// `n_ctx * n_seq_max`. The scheduler may let a solo slot grow past `n_ctx`
 /// up to `--single-max-ctx` (default: the full pool). That only matches
@@ -36,6 +44,10 @@ pub struct LoadParams {
     pub n_seq_max: u32,
     /// First N MoE layers' expert tensors stay on CPU. 0 = off.
     pub n_cpu_moe: u32,
+    /// llama-server `-ot/--override-tensor` pairs. Evaluated before the
+    /// `n_cpu_moe` expert patterns (first regex match wins). Lets the caller
+    /// pin e.g. `token_embd=ROCm0`, which llama.cpp otherwise always keeps on CPU.
+    pub tensor_overrides: Vec<TensorOverride>,
     /// `LLAMA_FLASH_ATTN_TYPE_{AUTO,DISABLED,ENABLED}`.
     pub flash_attn: i32,
     /// Logical decode batch. 0 = `n_ctx`.
@@ -84,6 +96,7 @@ impl Default for LoadParams {
             n_ctx: 256,
             n_seq_max: 1,
             n_cpu_moe: 0,
+            tensor_overrides: Vec::new(),
             flash_attn: LLAMA_FLASH_ATTN_TYPE_AUTO,
             n_batch: 0,
             n_ubatch: 0,
@@ -245,8 +258,9 @@ impl Model {
         };
 
         // Patterns must stay alive until `llama_model_load_from_file` returns.
-        let cpu_moe = CpuMoeOverrides::new(params.n_cpu_moe);
-        if let Some(ptr) = cpu_moe.as_ptr() {
+        let tensor_overrides =
+            TensorBuftOverrides::new(params.n_cpu_moe, &params.tensor_overrides)?;
+        if let Some(ptr) = tensor_overrides.as_ptr() {
             mparams.tensor_buft_overrides = ptr;
         }
 
@@ -1562,6 +1576,42 @@ pub fn parse_tensor_split(s: &str) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// llama-server `--override-tensor`: comma-separated `pattern=buft` pairs, where
+/// `buft` is a backend buffer-type name (`CPU`, `ROCm0`, `CUDA0`, ...). Only the
+/// first `=` splits the pair, so a pattern may not contain a comma.
+pub fn parse_tensor_overrides(s: &str) -> Result<Vec<TensorOverride>> {
+    let mut out = Vec::new();
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (pattern, buft) = entry.split_once('=').ok_or_else(|| Error::Load {
+            path: PathBuf::from("--override-tensor"),
+            reason: format!("'{entry}' is not <pattern>=<buft>"),
+        })?;
+        let pattern = pattern.trim();
+        let buft = buft.trim();
+        if pattern.is_empty() || buft.is_empty() {
+            return Err(Error::Load {
+                path: PathBuf::from("--override-tensor"),
+                reason: format!("'{entry}' has an empty pattern or buffer type"),
+            });
+        }
+        out.push(TensorOverride {
+            pattern: pattern.to_string(),
+            buft: buft.to_string(),
+        });
+    }
+    if out.is_empty() {
+        return Err(Error::Load {
+            path: PathBuf::from("--override-tensor"),
+            reason: "empty".into(),
+        });
+    }
+    Ok(out)
+}
+
 unsafe extern "C" fn forward_llama_log(
     level: ggml_log_level,
     text: *const c_char,
@@ -1586,24 +1636,33 @@ unsafe extern "C" fn forward_llama_log(
     }
 }
 
-/// NULL-terminated `tensor_buft_overrides` that pin MoE expert tensors to CPU.
-/// Owns the CStrings so the pointers stay valid through `llama_model_load_from_file`.
-struct CpuMoeOverrides {
+/// NULL-terminated `tensor_buft_overrides` built from `--override-tensor`
+/// pairs and `--n-cpu-moe`. Owns the CStrings so the pointers stay valid
+/// through `llama_model_load_from_file`.
+struct TensorBuftOverrides {
     _patterns: Vec<CString>,
     overrides: Vec<llama_model_tensor_buft_override>,
 }
 
-impl CpuMoeOverrides {
-    fn new(n_cpu_moe: u32) -> Self {
-        if n_cpu_moe == 0 {
-            return Self {
-                _patterns: Vec::new(),
-                overrides: Vec::new(),
-            };
-        }
+impl TensorBuftOverrides {
+    fn new(n_cpu_moe: u32, user: &[TensorOverride]) -> Result<Self> {
         let cpu_buft = unsafe { ggml_backend_cpu_buffer_type() };
-        let mut patterns = Vec::with_capacity(n_cpu_moe as usize);
-        let mut overrides = Vec::with_capacity(n_cpu_moe as usize + 1);
+        let mut patterns = Vec::with_capacity(user.len() + n_cpu_moe as usize);
+        let mut overrides = Vec::with_capacity(user.len() + n_cpu_moe as usize + 1);
+
+        // llama.cpp scans overrides in order and stops at the first regex match,
+        // so explicit `-ot` entries must precede the `-ncmoe` expert patterns.
+        for ov in user {
+            let pat = CString::new(ov.pattern.as_str()).map_err(|_| Error::Load {
+                path: PathBuf::from(&ov.pattern),
+                reason: "override pattern contains interior NUL".into(),
+            })?;
+            overrides.push(llama_model_tensor_buft_override {
+                pattern: pat.as_ptr(),
+                buft: resolve_buft(&ov.buft)?,
+            });
+            patterns.push(pat);
+        }
         for i in 0..n_cpu_moe {
             let pat = CString::new(format!("blk\\.{i}{FFN_EXPS_REGEX}"))
                 .expect("MoE override pattern is ASCII");
@@ -1613,14 +1672,16 @@ impl CpuMoeOverrides {
             });
             patterns.push(pat);
         }
-        overrides.push(llama_model_tensor_buft_override {
-            pattern: ptr::null(),
-            buft: ptr::null_mut(),
-        });
-        Self {
+        if !overrides.is_empty() {
+            overrides.push(llama_model_tensor_buft_override {
+                pattern: ptr::null(),
+                buft: ptr::null_mut(),
+            });
+        }
+        Ok(Self {
             _patterns: patterns,
             overrides,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Option<*const llama_model_tensor_buft_override> {
@@ -1632,11 +1693,65 @@ impl CpuMoeOverrides {
     }
 }
 
+/// Resolve a `--override-tensor` buffer name to its ggml buffer type, mirroring
+/// llama.cpp `parse_tensor_buffer_overrides` (`CPU`, `ROCm0`, `CUDA0`, ...).
+fn resolve_buft(name: &str) -> Result<ggml_backend_buffer_type_t> {
+    let matches = |buft: ggml_backend_buffer_type_t| -> bool {
+        if buft.is_null() {
+            return false;
+        }
+        let n = unsafe { ggml_backend_buft_name(buft) };
+        !n.is_null() && unsafe { CStr::from_ptr(n) }.to_bytes() == name.as_bytes()
+    };
+
+    let cpu_buft = unsafe { ggml_backend_cpu_buffer_type() };
+    let mut available = vec![buft_label(cpu_buft)];
+    if matches(cpu_buft) {
+        return Ok(cpu_buft);
+    }
+    let n_dev = unsafe { ggml_backend_dev_count() };
+    for i in 0..n_dev {
+        let dev = unsafe { ggml_backend_dev_get(i) };
+        if dev.is_null() {
+            continue;
+        }
+        let buft = unsafe { ggml_backend_dev_buffer_type(dev) };
+        if matches(buft) {
+            return Ok(buft);
+        }
+        let label = buft_label(buft);
+        if !available.contains(&label) {
+            available.push(label);
+        }
+    }
+    Err(Error::Load {
+        path: PathBuf::from("--override-tensor"),
+        reason: format!(
+            "--override-tensor unknown buffer type '{name}' (available: {})",
+            available.join(", ")
+        ),
+    })
+}
+
+/// `ggml_backend_buft_name` as an owned String, or `"?"` when unset.
+fn buft_label(buft: ggml_backend_buffer_type_t) -> String {
+    if buft.is_null() {
+        return "?".into();
+    }
+    let n = unsafe { ggml_backend_buft_name(buft) };
+    if n.is_null() {
+        "?".into()
+    } else {
+        unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FFN_EXPS_REGEX, LoadParams, load_draft_model, mtp_n_outputs_max, mtp_process_items,
-        parse_rpc_servers, parse_tensor_split, wait_rpc_endpoints_until,
+        FFN_EXPS_REGEX, LoadParams, TensorOverride, load_draft_model, mtp_n_outputs_max,
+        mtp_process_items, parse_rpc_servers, parse_tensor_overrides, parse_tensor_split,
+        wait_rpc_endpoints_until,
     };
     use crate::batch::BatchToken;
     use std::net::TcpListener;
@@ -1724,5 +1839,31 @@ mod tests {
         assert_eq!(parse_tensor_split("32/16/16").unwrap(), [32.0, 16.0, 16.0]);
         assert!(parse_tensor_split("").is_err());
         assert!(parse_tensor_split("abc").is_err());
+    }
+
+    #[test]
+    fn parse_tensor_overrides_splits_pairs() {
+        let got = parse_tensor_overrides(r"token_embd=ROCm0, \.ffn_(up|down)_exps=CPU").unwrap();
+        assert_eq!(
+            got,
+            [
+                TensorOverride {
+                    pattern: "token_embd".into(),
+                    buft: "ROCm0".into(),
+                },
+                TensorOverride {
+                    pattern: r"\.ffn_(up|down)_exps".into(),
+                    buft: "CPU".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tensor_overrides_rejects_bad_entries() {
+        assert!(parse_tensor_overrides("token_embd").is_err());
+        assert!(parse_tensor_overrides("=ROCm0").is_err());
+        assert!(parse_tensor_overrides("token_embd=").is_err());
+        assert!(parse_tensor_overrides("").is_err());
     }
 }

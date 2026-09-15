@@ -311,6 +311,7 @@ fn main() {
         .allowlist_function("ggml_backend_dev_memory")
         .allowlist_function("ggml_backend_cpu_buffer_type")
         .allowlist_function("ggml_backend_dev_buffer_type")
+        .allowlist_function("ggml_backend_buft_name")
         .allowlist_type("ggml_log_level")
         .allowlist_type("ggml_backend_dev_type")
         .allowlist_var("GGML_LOG_.*")
