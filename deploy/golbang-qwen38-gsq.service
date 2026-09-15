@@ -24,10 +24,13 @@ Environment=RUST_LOG=info
 #   n-ubatch 2048: prefill 144 -> 154 t/s; decode unchanged. Kept.
 #   n-threads 8 beats 16 (idle-CPU contention): decode 15.7 -> 17.2 t/s. Kept at 8.
 #   draft-mtp acceptance 0.97-0.99, mean len ~3 -> n-max 3 is the right point.
-# Known ceiling: graph splits = 2 (token_embd IQ2_S + output stay on ROCm_Host,
-# so every decode syncs GPU<->CPU). Removing it needs a tensor_buft_override for
-# the embedding/output tensors in golbang-core (today only MoE-expert-to-CPU is
-# implemented), so it is a follow-up, not a runtime flag.
+# Known ceiling: IQ-series GEMV (issue #235). Same-size IQ3_S decodes 13.2 t/s
+# on MI50 while Q4_K_XL decodes 20.8 t/s, because gfx906's GCN repack
+# (repack-gcn.cu) only covers Q3_K..Q6_K. The old "graph splits = 2" hypothesis
+# was disproven in #234: `--override-tensor token_embd=ROCm0` (now supported)
+# collapses graph splits 2->1 and removes the 388 MiB ROCm_Host buffer, but it
+# is a no-op for throughput (llama-bench pp512 152.0 -> 152.4, tg128 13.68 ->
+# 13.67), so it is intentionally not set here.
 ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
 ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/ista-gsq-rco/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
