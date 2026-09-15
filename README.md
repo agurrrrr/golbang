@@ -94,6 +94,7 @@ GPU 연산만 SHA 고정된 `libllama`/`libggml-*`를 unsafe FFI로 호출한다
 | 모델 | 양자화·구성 | 유닛 |
 |------|-------------|------|
 | Qwen3.8-27B | UD-Q4_K_XL, 100k ctx, KV q8_0, MTP+ngram speculative | `golbang-qwen38` (HIP), `golbang-qwen38-vulkan` (Vulkan) |
+| Qwen3.8-27B | IST-DASLab GSQ-RCO IQ3_S(non-uniform, 11.8 GB)+MTP, 100k ctx, KV q8_0, `--n-ubatch 2048` | `golbang-qwen38-gsq` (:8084) |
 | DeepSeek-V4-Flash-0731 | UD-IQ2_M, `--n-cpu-moe 32` | `golbang-deepseek` |
 | GLM-5.3-Flash | AJ-IQ2_XXS, `--n-cpu-moe 42` | `golbang-glm53flash` |
 | Qwen3.8-27B Uncensored | Q6_K | `golbang-qwen48` |

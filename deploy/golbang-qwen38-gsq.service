@@ -1,0 +1,58 @@
+[Unit]
+Description=golbang OpenAI server - ISTA GSQ-RCO Qwen3.8-27B IQ3_S + MTP (MI50)
+After=network.target
+# MI50 is single-GPU: every other MI50 unit contends for the same card.
+# golbang-cuda-qwen38 shares port 8084 (it runs on the V100s), so keep it out too.
+Conflicts=llama-server.service qwen3.6-27b-q6.service qwen3.8-27b-q6.service golbang-deepseek.service golbang-qwen48.service golbang-glm53flash.service golbang-qwen38.service golbang-cuda-qwen38.service
+
+[Service]
+Type=simple
+User=agurrrrr
+Group=agurrrrr
+WorkingDirectory=/home/agurrrrr/code/golbang
+EnvironmentFile=-/etc/golbang/secrets.env
+Environment=HSA_OVERRIDE_GFX_VERSION=9.0.6
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=ROCBLAS_USE_HIPBLASLT=0
+Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build/bin
+Environment=RUST_LOG=info
+# IST-DASLab GSQ-RCO non-uniform IQ3_S (11.8 GB) of Qwen3.8-27B (arch qwen35),
+# same architecture as the UD-Q4_K_XL unit so the HIP binary loads it unchanged.
+# The -mtp build carries the nextn head, hence --spec-type draft-mtp.
+# IQ3_S is smaller than UD-Q4_K_XL, so the 100k q8_0 KV fits with more headroom.
+# Tuning (measured on this MI50, task #9580):
+#   n-ubatch 2048: prefill 144 -> 154 t/s; decode unchanged. Kept.
+#   n-threads 8 beats 16 (idle-CPU contention): decode 15.7 -> 17.2 t/s. Kept at 8.
+#   draft-mtp acceptance 0.97-0.99, mean len ~3 -> n-max 3 is the right point.
+# Known ceiling: graph splits = 2 (token_embd IQ2_S + output stay on ROCm_Host,
+# so every decode syncs GPU<->CPU). Removing it needs a tensor_buft_override for
+# the embedding/output tensors in golbang-core (today only MoE-expert-to-CPU is
+# implemented), so it is a follow-up, not a runtime flag.
+ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
+ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
+  --model /home/agurrrrr/models/qwen3.8/ista-gsq-rco/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+  --alias qwen3.8-27b-gsq \
+  --host 0.0.0.0 --port 8084 \
+  --n-gpu-layers 99 --flash-attn on \
+  --n-ctx 100000 --n-batch 2048 --n-ubatch 2048 --n-threads 8 --n-rs-seq 3 \
+  --n-parallel 2 --queue-size 2 --single-max-ctx 100000 --kv-unified \
+  --kv-type-k q8_0 --kv-type-v q8_0 \
+  --no-mmap --jinja --reasoning-format deepseek \
+  --reasoning-effort xhigh --reasoning-budget 4096 \
+  --mmproj /home/agurrrrr/models/qwen3.8/ista-gsq-rco/mmproj-Qwen3.8-27B-BF16.gguf \
+  --spec-type draft-mtp,ngram-mod \
+  --spec-draft-n-max 3 \
+  --spec-draft-p-min 0.9 \
+  --spec-draft-type-k q8_0 \
+  --spec-draft-type-v q8_0 \
+  --api-key "${GOLBANG_API_KEY}"
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+MemoryMax=120G
+MemoryHigh=110G
+
+[Install]
+WantedBy=default.target
