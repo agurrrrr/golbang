@@ -18,6 +18,7 @@ use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
     Delta, DeltaFunction, DeltaToolCall, OutgoingToolCall, PromptProgress, Timings, Usage,
+    effective_reasoning_budget,
 };
 
 pub fn completion_id() -> String {
@@ -54,28 +55,27 @@ pub fn generate_params(
         }
     }
     let extracts = state.chat.reasoning_format.extracts();
+    let enable_thinking = req.resolved_enable_thinking(state.chat.enable_thinking);
+    let thinking_on = extracts && enable_thinking;
+    let max_tokens = req.max_tokens.unwrap_or(256).max(1);
     GenerateParams {
-        max_tokens: req.max_tokens.unwrap_or(256).max(1),
+        max_tokens,
         temperature: req.temperature.unwrap_or(1.0).max(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(0),
         seed: req.seed.unwrap_or(0),
         stop,
-        reasoning_budget: if extracts {
-            resolve_reasoning_budget(req.reasoning_budget, state.chat.reasoning_budget)
+        reasoning_budget: if thinking_on {
+            effective_reasoning_budget(
+                max_tokens,
+                req.resolved_reasoning_budget(),
+                state.chat.reasoning_budget,
+            )
         } else {
             0
         },
-        start_in_think: extracts && prompt_opens_think(prompt),
+        start_in_think: thinking_on && prompt_opens_think(prompt),
         dsml_force_invoke_name: req.tools_enabled(),
-    }
-}
-
-fn resolve_reasoning_budget(req: Option<i32>, server: u32) -> u32 {
-    match req {
-        None => server,
-        Some(n) if n <= 0 => 0,
-        Some(n) => n as u32,
     }
 }
 
@@ -150,10 +150,9 @@ fn prompt_from(req: &ChatCompletionRequest, state: &AppState) -> String {
             jinja: state.chat.use_jinja,
             template: state.chat.template.clone(),
             bos_token: state.chat.bos_token.clone(),
-            enable_thinking: state.chat.enable_thinking,
+            enable_thinking: req.resolved_enable_thinking(state.chat.enable_thinking),
             reasoning_effort: req
-                .reasoning_effort
-                .clone()
+                .resolved_reasoning_effort()
                 .or_else(|| state.chat.reasoning_effort.clone()),
             // Chat default per the GLM-5.3 card: drop previous-turn thinking.
             // The request field overrides; Qwen/DSV4 templates ignore the var.

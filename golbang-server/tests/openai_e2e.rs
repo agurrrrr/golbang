@@ -8,7 +8,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use golbang_core::{Engine, FifoPolicy, LoadParams, Model, SchedulerConfig, spawn_scheduler};
+use golbang_core::{
+    Engine, FifoPolicy, LoadParams, Model, ReasoningFormat, SchedulerConfig, spawn_scheduler,
+};
 use golbang_server::{AppState, ChatRuntime, router};
 use tokio::net::TcpListener;
 
@@ -35,6 +37,10 @@ fn test_model() -> Option<String> {
 }
 
 async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
+    serve_with(model, n_parallel, queue_size, ChatRuntime::default()).await
+}
+
+async fn serve_with(model: Model, n_parallel: u32, queue_size: usize, chat: ChatRuntime) -> u16 {
     let model_card = model.card().clone();
     let vision = model.vision_enabled();
     let engine = Arc::new(Engine::new(model));
@@ -51,7 +57,7 @@ async fn serve(model: Model, n_parallel: u32, queue_size: usize) -> u16 {
         scheduler: spawned.handle,
         model_name: "qwen-test".into(),
         default_timeout: None,
-        chat: ChatRuntime::default(),
+        chat,
         api_keys: Vec::new(),
         vision,
         model_card,
@@ -329,4 +335,87 @@ async fn decode_busy_returns_503_immediately() {
                 || b.contains("HTTP_STATUS:503")),
         "503 body should be a busy signal: {results:?}"
     );
+}
+
+/// halogen answer room (§5.1): with thinking on and a small `max_tokens`, the
+/// think budget must reserve answer space instead of ending on empty `content`.
+#[tokio::test(flavor = "multi_thread")]
+async fn thinking_small_max_tokens_keeps_answer_content() {
+    let Some(path) = test_model() else {
+        return;
+    };
+    let _lock = lock_gpu();
+
+    let model = tokio::task::spawn_blocking(move || {
+        Model::load(
+            path,
+            LoadParams {
+                n_ctx: 256,
+                n_gpu_layers: 99,
+                n_seq_max: 1,
+                ..Default::default()
+            },
+        )
+    })
+    .await
+    .expect("join")
+    .expect("load");
+
+    // A minimal jinja template that ends on an open `<think>` so the budget
+    // arms even on a smoke model with no native thinking tags.
+    let chat = ChatRuntime {
+        use_jinja: true,
+        template: Some("<|im_start|>assistant\n<think>\n".to_string()),
+        reasoning_format: ReasoningFormat::Deepseek,
+        enable_thinking: true,
+        ..ChatRuntime::default()
+    };
+    let port = serve_with(model, 1, 1, chat).await;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+
+    let json = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            &url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"model":"qwen","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":24,"temperature":0}"#,
+        ])
+        .output()
+        .expect("curl json");
+    assert!(json.status.success());
+    let txt = String::from_utf8_lossy(&json.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).unwrap_or_else(|e| panic!("json: {e}: {txt}"));
+    assert_eq!(v["object"], "chat.completion");
+    // The forced `</think>` must leave room for the answer, so content is not
+    // empty even though the think block was cut short.
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "answer room must leave non-empty content:\n{txt}"
+    );
+
+    // `enable_thinking:false` disables the forced close entirely.
+    let json = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            &url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"model":"qwen","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":24,"temperature":0,"enable_thinking":false}"#,
+        ])
+        .output()
+        .expect("curl json off");
+    assert!(json.status.success());
+    let off_txt = String::from_utf8_lossy(&json.stdout);
+    let off: serde_json::Value =
+        serde_json::from_str(&off_txt).unwrap_or_else(|e| panic!("json off: {e}: {off_txt}"));
+    assert_eq!(off["object"], "chat.completion");
 }

@@ -27,9 +27,32 @@ pub struct ChatCompletionRequest {
     pub clear_thinking: Option<bool>,
     /// Max tokens inside `<think>` before `</think>` is forced.
     /// `None` = server default. `0` / negative = unlimited.
-    /// Alias matches llama-server `reasoning_budget_tokens`.
-    #[serde(default, alias = "reasoning_budget_tokens")]
+    /// Flat aliases match llama-server (`reasoning_budget_tokens`) and the
+    /// harness/OpenRouter/Anthropic names halogen reads.
+    #[serde(
+        default,
+        alias = "reasoning_budget_tokens",
+        alias = "max_thinking_tokens",
+        alias = "thinking_budget_tokens",
+        alias = "thinking_budget",
+        alias = "thinking_token_budget"
+    )]
     pub reasoning_budget: Option<i32>,
+    /// Turn thinking off for this request (`false` = no think, no forced close).
+    /// Overrides the server/template default.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Nested thinking-control containers halogen also reads. Kept as raw JSON
+    /// so one untyped object can carry several aliases without a bespoke
+    /// Deserialize (`chat_template_kwargs.reasoning_effort`).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// OpenRouter-style `reasoning.effort` / `reasoning.max_tokens`.
+    #[serde(default)]
+    pub reasoning: Option<serde_json::Value>,
+    /// Anthropic-style `thinking.budget_tokens`.
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
     /// llama-server `return_progress`. `None` uses `--prompt-progress`.
     #[serde(default)]
     pub return_progress: Option<bool>,
@@ -43,6 +66,116 @@ impl ChatCompletionRequest {
         match &self.tool_choice {
             Some(v) if v.as_str() == Some("none") => false,
             _ => true,
+        }
+    }
+
+    /// Thinking budget with priority: explicit flat `reasoning_budget`
+    /// (incl. flat aliases) > nested `thinking.budget_tokens` >
+    /// `reasoning.max_tokens` > nested `chat_template_kwargs` budget names.
+    /// `None` means the caller falls back to the server default and then to the
+    /// answer-room policy.
+    pub fn resolved_reasoning_budget(&self) -> Option<i32> {
+        self.reasoning_budget
+            .or_else(|| json_i32(self.thinking.as_ref(), &["budget_tokens"]))
+            .or_else(|| json_i32(self.reasoning.as_ref(), &["max_tokens"]))
+            .or_else(|| {
+                json_i32(
+                    self.chat_template_kwargs.as_ref(),
+                    &[
+                        "thinking_budget_tokens",
+                        "max_thinking_tokens",
+                        "thinking_budget",
+                        "thinking_token_budget",
+                    ],
+                )
+            })
+    }
+
+    /// `reasoning_effort` with priority: flat field >
+    /// `chat_template_kwargs.reasoning_effort` > `reasoning.effort`.
+    pub fn resolved_reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort
+            .clone()
+            .or_else(|| json_string(self.chat_template_kwargs.as_ref(), &["reasoning_effort"]))
+            .or_else(|| json_string(self.reasoning.as_ref(), &["effort"]))
+    }
+
+    /// Whether thinking is on for this request. `enable_thinking=false` wins
+    /// over `default`; `chat_template_kwargs.enable_thinking` is also read.
+    pub fn resolved_enable_thinking(&self, default: bool) -> bool {
+        self.enable_thinking
+            .or_else(|| json_bool(self.chat_template_kwargs.as_ref(), &["enable_thinking"]))
+            .unwrap_or(default)
+    }
+}
+
+fn json_i32(v: Option<&serde_json::Value>, keys: &[&str]) -> Option<i32> {
+    let v = v?;
+    for key in keys {
+        if let Some(n) = v.get(*key).and_then(|x| x.as_i64()) {
+            return Some(n as i32);
+        }
+        if let Some(s) = v.get(*key).and_then(|x| x.as_str())
+            && let Ok(n) = s.trim().parse::<i32>()
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn json_string(v: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    let v = v?;
+    for key in keys {
+        if let Some(s) = v.get(*key).and_then(|x| x.as_str())
+            && !s.trim().is_empty()
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn json_bool(v: Option<&serde_json::Value>, keys: &[&str]) -> Option<bool> {
+    let v = v?;
+    for key in keys {
+        if let Some(b) = v.get(*key).and_then(|x| x.as_bool()) {
+            return Some(b);
+        }
+    }
+    None
+}
+
+/// Answer-room policy (halogen-flash-server `halogen-borrowable-techniques`
+/// §5.1). When the request gives no thinking budget, reserve
+/// `max(1024, 15% of max_tokens)` tokens for the answer and cap thinking at the
+/// rest. An explicit request budget always wins (`0`/negative = unlimited).
+/// If `max_tokens` is no larger than the answer room, allow a single think token
+/// so the forced `</think>` still leaves room for a non-empty answer.
+pub fn answer_room_budget(max_tokens: u32, requested: Option<i32>) -> u32 {
+    match requested {
+        Some(n) if n <= 0 => 0,
+        Some(n) => n as u32,
+        None => {
+            let reserved = (u64::from(max_tokens) * 15 / 100) as u32;
+            max_tokens.saturating_sub(reserved.max(1024)).max(1)
+        }
+    }
+}
+
+/// Compose the effective think cap: an explicit request budget wins verbatim;
+/// otherwise the answer-room budget applies and the server default only lowers
+/// it (so a `--reasoning-budget` unit still cannot starve the answer).
+pub fn effective_reasoning_budget(max_tokens: u32, requested: Option<i32>, server: u32) -> u32 {
+    match requested {
+        Some(n) => answer_room_budget(max_tokens, Some(n)),
+        None => {
+            let automatic = answer_room_budget(max_tokens, None);
+            if server == 0 {
+                automatic
+            } else {
+                server.min(automatic)
+            }
         }
     }
 }
@@ -394,6 +527,10 @@ mod tests {
             reasoning_effort: None,
             clear_thinking: None,
             reasoning_budget: None,
+            enable_thinking: None,
+            chat_template_kwargs: None,
+            reasoning: None,
+            thinking: None,
             return_progress: None,
         };
         assert_eq!(
@@ -426,6 +563,10 @@ mod tests {
             reasoning_effort: None,
             clear_thinking: None,
             reasoning_budget: None,
+            enable_thinking: None,
+            chat_template_kwargs: None,
+            reasoning: None,
+            thinking: None,
             return_progress: None,
         };
         assert!(validate_request(&req).is_ok());
@@ -443,6 +584,139 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req2.reasoning_budget, Some(0));
+    }
+
+    #[test]
+    fn flat_thinking_budget_aliases_map_to_budget() {
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget_tokens":2048}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_thinking_tokens":2048}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking_budget_tokens":2048}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking_budget":2048}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking_token_budget":2048}"#,
+        ] {
+            let req: ChatCompletionRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(req.resolved_reasoning_budget(), Some(2048), "{body}");
+        }
+    }
+
+    #[test]
+    fn nested_thinking_budget_map_to_budget() {
+        let anthropic: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(anthropic.resolved_reasoning_budget(), Some(4096));
+
+        let openrouter: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning":{"max_tokens":1234,"effort":"low"}}"#,
+        )
+        .unwrap();
+        assert_eq!(openrouter.resolved_reasoning_budget(), Some(1234));
+        assert_eq!(
+            openrouter.resolved_reasoning_effort().as_deref(),
+            Some("low")
+        );
+
+        let ctk: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"thinking_budget_tokens":777}}"#,
+        )
+        .unwrap();
+        assert_eq!(ctk.resolved_reasoning_budget(), Some(777));
+    }
+
+    #[test]
+    fn explicit_budget_and_effort_beat_nested() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_budget":64,"thinking":{"budget_tokens":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.resolved_reasoning_budget(), Some(64));
+
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","chat_template_kwargs":{"reasoning_effort":"high"},"reasoning":{"effort":"medium"}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.resolved_reasoning_effort().as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn nested_reasoning_effort_fallback_order() {
+        let ctk: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"reasoning_effort":"high"}}"#,
+        )
+        .unwrap();
+        assert_eq!(ctk.resolved_reasoning_effort().as_deref(), Some("high"));
+
+        let openrouter: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            openrouter.resolved_reasoning_effort().as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn enable_thinking_false_disables() {
+        let flat: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"enable_thinking":false}"#,
+        )
+        .unwrap();
+        assert!(!flat.resolved_enable_thinking(true));
+
+        let nested: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false}}"#,
+        )
+        .unwrap();
+        assert!(!nested.resolved_enable_thinking(true));
+
+        let default_on: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(default_on.resolved_enable_thinking(true));
+    }
+
+    #[test]
+    fn answer_room_budget_reserves_answer_space() {
+        // max_tokens 100: answer room (1024) exceeds max_tokens → one think token.
+        assert_eq!(answer_room_budget(100, None), 1);
+        // max_tokens 1024 == answer room → still one think token.
+        assert_eq!(answer_room_budget(1024, None), 1);
+        // 8192 * 15% = 1228 → 8192 - 1228 = 6964.
+        assert_eq!(answer_room_budget(8192, None), 6964);
+        // Above 6827 the 15% term dominates the 1024 floor.
+        assert_eq!(answer_room_budget(10000, None), 8500);
+    }
+
+    #[test]
+    fn answer_room_budget_explicit_request_wins() {
+        for max_tokens in [100, 1024, 8192] {
+            assert_eq!(answer_room_budget(max_tokens, Some(0)), 0, "unlimited");
+            assert_eq!(
+                answer_room_budget(max_tokens, Some(-1)),
+                0,
+                "negative unlimited"
+            );
+            assert_eq!(
+                answer_room_budget(max_tokens, Some(777)),
+                777,
+                "explicit cap"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_budget_server_default_cannot_starve_answer() {
+        // No request budget + server default: answer room lowers the cap.
+        assert_eq!(effective_reasoning_budget(256, None, 4096), 1);
+        assert_eq!(effective_reasoning_budget(8192, None, 4096), 4096);
+        // Server default below the answer-room budget is kept as-is.
+        assert_eq!(effective_reasoning_budget(8192, None, 100), 100);
+        // No server default → pure answer room.
+        assert_eq!(effective_reasoning_budget(8192, None, 0), 6964);
+        // Explicit request budget bypasses the server cap.
+        assert_eq!(effective_reasoning_budget(8192, Some(9999), 4096), 9999);
     }
 
     #[test]

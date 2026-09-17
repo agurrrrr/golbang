@@ -181,7 +181,12 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
 - 채팅 템플릿 — Qwen ChatML 하드코딩(기본) / GGUF `tokenizer.chat_template`을 minijinja로(`--jinja`) /
   `--chat-template-file` 재정의
 - **reasoning** — `--reasoning-format deepseek|auto`로 think 태그를 OpenAI `reasoning_content`로 분리.
-  `reasoning_effort`(CLI + 요청 필드)와 `--reasoning-budget`(초과 시 think 종료 강제) 지원
+  요청이 thinking budget을 주지 않으면 `max(1024, max_tokens의 15%)`를 답변용으로 남기고
+  think를 강제 종료한다(halogen answer room). 그래서 작은 `max_tokens`에서도 빈 `content`로
+  끝나지 않는다. 요청 필드 `reasoning_budget`·`reasoning_effort`·`enable_thinking`과
+  thinking budget 별칭(`reasoning_budget_tokens`, `max_thinking_tokens`, `thinking_budget[_tokens]`,
+  `thinking_token_budget`, `thinking.budget_tokens`, `reasoning.max_tokens`,
+  `chat_template_kwargs.*`)을 읽는다
 - **tool calls** — 요청 `tools`를 템플릿에 주입, DSML/Qwen/Hermes 출력을 OpenAI `tool_calls`로 재파싱
 - **vision** — `--mmproj`로 `image_url` / `input_image` (`mtmd`)
 - **speculative decoding** — `--spec-type draft-mtp,ngram-mod`. 타깃에서 `[sampled, draft…]` 검증
@@ -246,7 +251,7 @@ prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬
 | `--jinja` | off | GGUF 템플릿을 minijinja로 적용 |
 | `--chat-template-file` | 없음 | GGUF 템플릿 재정의 |
 | `--reasoning-format` | `none` | `none` \| `deepseek` \| `deepseek-legacy` \| `auto` |
-| `--reasoning-effort` / `--reasoning-budget` | 템플릿 기본 / 무제한 | think 제어 |
+| `--reasoning-effort` / `--reasoning-budget` | 템플릿 기본 / answer room | think 제어. 요청이 budget을 명시하지 않으면 `max(1024, 15%)`를 답변용으로 남긴다 |
 | `--mmproj` | 없음 | CLIP/projector GGUF (vision) |
 | `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod` (콤마) |
 | `--spec-draft-n-max` / `--spec-draft-p-min` | `3` / `0.90` | MTP draft 상한 / 최소 확률 |
@@ -257,7 +262,9 @@ prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬
 | `--rpc` / `--tensor-split` | 없음 | llama-server와 동일 의미 (ggml-rpc 오프로드) |
 
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,
-`tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget`, `image_url`, `return_progress`.
+`tools`, `tool_choice`, `reasoning_effort`, `reasoning_budget`, `enable_thinking`,
+`image_url`, `return_progress`. thinking budget은 위 별칭과 중첩 객체(`thinking`,
+`reasoning`, `chat_template_kwargs`)로도 받는다.
 
 ## 빌드 (백엔드별)
 
@@ -342,6 +349,10 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
   prefill이 스텁 창 경계에 착지해야 남으며, `tools`를 빼면 공통 접두가 창 밖으로
   떨어져 전량으로 다시 돈다. 세부와 미확인 조건은 [P8](#프리필-단축-호스트-접두-스냅샷-p8) 참조.
 - **스케줄 정책은 FIFO뿐.** trait은 교체 가능하게 열어뒀지만 추가 구현이 없다.
+- **reasoning 출력 등급은 NUMERIC.** answer room과 think budget 강제 종료는 `</think>`가
+  닫히는 시점(=출력 분기)을 바꾸므로 serial greedy와 **byte-identical이 아니다**. 요청이
+  budget을 명시하면 그 값이 우선하고, 작은 `max_tokens`에서는 think를 1토큰으로 줄인 뒤
+  답변 공간을 남긴다.
 - **비전 prefix.** 이미지 요청은 슬롯 KV를 비운다 (prefix hit 없음).
 - **단일 모델.** 프로세스당 모델 하나. 멀티 모델 게이트웨이는 범위 밖이다.
 - **gfx906 실험실 산물.** MI50/V100 외 세대(3090, MI210 등)에서는 테스트가 부족하다.
