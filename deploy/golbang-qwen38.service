@@ -14,6 +14,10 @@ Environment=ROCR_VISIBLE_DEVICES=0
 Environment=ROCBLAS_USE_HIPBLASLT=0
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-glm5next/build/bin
 Environment=RUST_LOG=info
+# Sampling: Qwen3.8-27B thinking-mode card (temperature 1.0 / top_p 0.95 / top_k 20).
+# The model runs thinking-first here (--reasoning-effort xhigh), and the web UI
+# omits sampling fields, so these server defaults are what chat clients get.
+# Clients may still override each field per request.
 ExecStartPre=/usr/bin/sudo /home/agurrrrr/code/local-llm/set_gpu_clocks.sh
 ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf \
@@ -25,6 +29,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-hip/release/golbang-server \
   --kv-type-k q8_0 --kv-type-v q8_0 \
   --no-mmap --jinja --reasoning-format deepseek \
   --reasoning-effort xhigh --reasoning-budget 4096 \
+  --temperature 1.0 --top-p 0.95 --top-k 20 \
   --mmproj /home/agurrrrr/models/qwen3.8/mmproj-F16.gguf \
   --spec-type draft-mtp,ngram-mod \
   --spec-draft-n-max 3 \
