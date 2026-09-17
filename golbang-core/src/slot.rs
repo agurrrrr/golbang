@@ -303,6 +303,13 @@ impl ActiveJob {
             .saturating_sub(self.prefill_cursor())
     }
 
+    /// KV cells this job reserved at admission (HAL-5 #249): the full prompt
+    /// plus its original generation budget. `max_tokens_req`, not the clamped
+    /// `max_tokens`, so a later neighbor cannot silently shorten it.
+    pub fn reserved_cells(&self) -> u32 {
+        self.n_prompt.saturating_add(self.max_tokens_req.max(1))
+    }
+
     /// True once the full prompt is resident, including a reused prefix.
     /// `prompt_pos >= prompt_tokens.len()` is wrong when `prompt_offset > 0`.
     pub fn prefill_done(&self) -> bool {

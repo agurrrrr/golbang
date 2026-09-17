@@ -257,6 +257,29 @@ P8의 스냅샷은 전부 호스트 RAM이라 프로세스가 재시작하면 �
 갈렸습니다. 그래서 생산 유닛에는 켜지 않고 opt-in으로 둡니다. MTP draft context까지
 저장하는 후속이 필요합니다. 전체 근거는 위키 `p8-host-prefix-snapshots`에 있다.
 
+### KV admission 예약 + pool-fit (HAL-5 #249)
+
+halogen은 공유 KV 풀에서 요청 admission 시 **prompt + max_tokens position을 예약**하고,
+감당 못 하면 도착 순서로 대기시킨다. golbang은 `used`만 세서 긴 생성을 시작한 요청이
+도중에 풀 천장을 만나 mid-generation 실패를 낼 수 있었다.
+
+- **예약:** `cap_for_join`이 준 cap이 `prompt + max_tokens`를 담지 못하면 슬롯에 붙이지
+  않고 waiting 앞쪽(도착 순서)에 남긴다. `prompt + max_tokens`가 어떤 cap으로도 못
+  들어가는(풀보다 큰) 요청은 기아를 막기 위해 기존처럼 클램프해 진행한다. 대기 중
+  타임아웃(`--timeout-secs`)이 지나면 `Timeout`으로 실패시킨다.
+- **pool-fit:** `--kv-pool-fit`이면 로드 실패(`llama_init_from_model returned null`) 시
+  `n_ubatch`를 절반씩 낮춰 재시도하고, 그래도 실패하면 `n_ctx`를 낮춘다. 낮춘 값은
+  로그와 `/metrics`의 `golbang_pool_*` 게이지로 남긴다. 미지정이면 명확한 기동 에러다.
+- 관측: `golbang_joins_deferred_total`, `golbang_joins_clamped_total`,
+  `golbang_queue_timeouts_total`, `golbang_pool_ctx_effective`, `golbang_pool_ubatch_effective`,
+  `golbang_pool_fit_downgrades_total`.
+
+Flash-Next 실측(2x V100, MTP, `--kv-unified`, n_parallel 2): 긴 생성 2개(각 prompt 6052,
+completion 1500)가 동시에 HTTP 200으로 완주했고 `failed to find a memory slot`이 없었다.
+예약이 걸리는 두 번째 요청은 `joins_deferred_total`이 증가하고 `requests_deferred 1`로
+대기했다. pool-fit은 `--n-ubatch 4096` 로드 실패 후 `(100000,2048)`로 하향해 기동했다.
+전체 근거는 위키 `hal5-kv-admission-poolfit`에 있다.
+
 ## 설정
 
 대부분의 플래그는 `GOLBANG_*` 환경 변수와 동일하다. `--help`가 최종 진실이고,
@@ -293,6 +316,7 @@ P8의 스냅샷은 전부 호스트 RAM이라 프로세스가 재시작하면 �
 | `--prompt-progress` | on | SSE `prompt_progress` 이벤트 |
 | `--prefix-cache-dir` | 없음 | prefix 스냅샷 디스크 tier. 재시작 후 세션 복원 (HAL-4 #248) |
 | `--prefix-cache-disk-gib` | `64` | 디스크 tier LRU 상한 (GiB). `0`이면 비활성 |
+| `--kv-pool-fit` | off | 로드 실패 시 `n_ubatch`→`n_ctx` 순으로 절반씩 낮춰 재시도 (HAL-5 #249) |
 | `--rpc` / `--tensor-split` | 없음 | llama-server와 동일 의미 (ggml-rpc 오프로드) |
 
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,

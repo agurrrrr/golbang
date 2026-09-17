@@ -86,6 +86,106 @@ pub fn cap_for_join(
     effective_cap(policy, 0, pool, others_used, spec_n_max, n_active_after)
 }
 
+/// Admission outcome for a request that already has a candidate `cap`.
+///
+/// HAL-5 #249: halogen reserves `prompt + max_tokens` positions before a
+/// conversation joins. golbang only tracked `used`, so a request could bind
+/// with a cap smaller than its generation budget and then be clamped (or hit
+/// the pool ceiling) mid-generation. [`admission_decision`] gates the join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinDecision {
+    /// `cap >= prompt + max_tokens`: the request can finish on its own cap.
+    Admit(u32),
+    /// `prompt + max_tokens` fits the pool but not the current free room.
+    /// Keep the request waiting in arrival order instead of binding it short.
+    Defer,
+    /// The reservation is larger than any cap this request could ever get
+    /// (it is bigger than the whole pool / solo cap). Waiting would starve
+    /// it, so fall back to the legacy behaviour: bind and let `bind_slot`
+    /// report `ContextFull` when even the prompt does not fit.
+    Clamp(u32),
+}
+
+/// Admission reservation: only admit a joiner whose `prompt + max_tokens`
+/// fits the cap it would receive. `solo` is the best cap any request could
+/// get (empty pool, one active slot); `need > solo` means no amount of
+/// waiting helps, so the request is clamped rather than starved.
+pub fn admission_decision(
+    cap: u32,
+    prompt_len: u32,
+    max_tokens_req: u32,
+    pool: u32,
+    single_max: u32,
+    spec_n_max: u32,
+) -> JoinDecision {
+    let need = prompt_len.saturating_add(max_tokens_req.max(1));
+    if cap >= need {
+        return JoinDecision::Admit(cap);
+    }
+    let solo = cap_for_join(0, 1, pool, single_max, spec_n_max);
+    if need > solo {
+        return JoinDecision::Clamp(cap);
+    }
+    JoinDecision::Defer
+}
+
+/// Effective KV pool after the startup pool-fit retry (HAL-5 #249 item 2).
+/// `requested_*` echo the CLI values; `effective_*` are what actually loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolFit {
+    pub requested_ctx: u32,
+    pub requested_ubatch: u32,
+    pub effective_ctx: u32,
+    pub effective_ubatch: u32,
+    /// Number of load retries; `0` means the requested values loaded first try.
+    pub downgrades: u32,
+}
+
+impl PoolFit {
+    pub fn lowered(&self) -> bool {
+        self.downgrades > 0
+    }
+}
+
+/// Successive `(n_ctx_seq, n_ubatch)` candidates tried when a load fails.
+///
+/// The first entry is always the requested pair. Odd steps halve `n_ubatch`,
+/// even steps halve `n_ctx_seq`, so the least disruptive fix (the common
+/// 2×V100 `llama_init_from_model returned null` with `--n-ubatch 4096`) is
+/// tried first and context is only given up if the ubatch halving did not
+/// help. Both knobs stop at a floor and the list is bounded by `MAX_STEPS`,
+/// so a hopeless load still exits quickly with a clear error.
+pub fn pool_fit_ladder(n_ctx: u32, n_ubatch: u32) -> Vec<(u32, u32)> {
+    const MIN_CTX: u32 = 4_096;
+    const MIN_UBATCH: u32 = 256;
+    const MAX_STEPS: usize = 6;
+    let mut ctx = n_ctx.max(1);
+    let mut ub = n_ubatch.max(1);
+    let mut out = vec![(ctx, ub)];
+    for step in 1..MAX_STEPS {
+        if step % 2 == 1 {
+            if ub > MIN_UBATCH {
+                ub = (ub / 2).max(MIN_UBATCH);
+            } else if ctx > MIN_CTX {
+                ctx = (ctx / 2).max(MIN_CTX);
+            } else {
+                break;
+            }
+        } else if ctx > MIN_CTX {
+            ctx = (ctx / 2).max(MIN_CTX);
+        } else if ub > MIN_UBATCH {
+            ub = (ub / 2).max(MIN_UBATCH);
+        } else {
+            break;
+        }
+        let cand = (ctx, ub);
+        if out.last() != Some(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +339,122 @@ mod tests {
         let join = cap_for_join(70_000, 2, POOL, SOLO, SPEC);
         assert!(join < 70_000, "join cap {join} should reject a 70k prompt");
         assert_eq!(join, POOL - 70_000 - spec_reserve(SPEC, 2));
+    }
+
+    // ── HAL-5 #249: admission reservation ─────────────────────────────────
+
+    #[test]
+    fn admission_admits_when_prompt_plus_max_fits_cap() {
+        // others_used 70000, n_active 2 → policy 40000, physical 10000.
+        let cap = cap_for_join(70_000, 2, T, 0, OFF);
+        assert_eq!(cap, 10_000);
+        assert_eq!(
+            admission_decision(cap, 4_000, 5_000, T, 0, OFF),
+            JoinDecision::Admit(10_000)
+        );
+        // exact fit is admitted (need == cap)
+        assert_eq!(
+            admission_decision(cap, 6_000, 4_000, T, 0, OFF),
+            JoinDecision::Admit(10_000)
+        );
+    }
+
+    #[test]
+    fn admission_defers_when_reservation_exceeds_free_room() {
+        let cap = cap_for_join(70_000, 2, T, 0, OFF);
+        // need 13000 > cap 10000, but 13000 <= solo pool 80000: wait.
+        assert_eq!(
+            admission_decision(cap, 8_000, 5_000, T, 0, OFF),
+            JoinDecision::Defer
+        );
+    }
+
+    #[test]
+    fn admission_respects_solo_cap_not_whole_pool() {
+        // single_max 60000: solo cap is S, so a 70000 reservation can never fit
+        // even though the raw pool is 80000 → clamp, do not wait forever.
+        assert_eq!(cap_for_join(0, 1, T, S, OFF), S);
+        assert_eq!(
+            admission_decision(10_000, 60_000, 10_000, T, S, OFF),
+            JoinDecision::Clamp(10_000)
+        );
+        // 59000 + 1 <= S: still fits solo → defer while room is short.
+        assert_eq!(
+            admission_decision(10_000, 59_000, 1, T, S, OFF),
+            JoinDecision::Defer
+        );
+    }
+
+    #[test]
+    fn admission_clamps_request_larger_than_pool() {
+        // Prompt alone exceeds the pool: no amount of waiting helps.
+        assert_eq!(
+            admission_decision(0, 90_000, 1, T, 0, OFF),
+            JoinDecision::Clamp(0)
+        );
+        // Prompt fits but generation budget cannot: still larger than solo.
+        assert_eq!(
+            admission_decision(5_000, 70_000, 20_000, T, 0, OFF),
+            JoinDecision::Clamp(5_000)
+        );
+    }
+
+    #[test]
+    fn admission_zero_max_tokens_still_needs_one_cell() {
+        // max_tokens 0 is normalised to 1 (a job always samples one token).
+        assert_eq!(
+            admission_decision(5_000, 5_000, 0, T, 0, OFF),
+            JoinDecision::Defer,
+            "prompt == cap leaves no room for the first token"
+        );
+        assert_eq!(
+            admission_decision(5_001, 5_000, 0, T, 0, OFF),
+            JoinDecision::Admit(5_001)
+        );
+    }
+
+    #[test]
+    fn admission_spec_reserve_shrinks_the_room() {
+        // 64-cell spec reserve tightens both the solo cap and the join cap.
+        let cap = cap_for_join(35_000, 2, T, S, 64);
+        assert_eq!(cap, 39_935);
+        // need 39936 > cap 39935 and > solo (S - 65 = 59935)? no, <= solo → defer
+        assert_eq!(
+            admission_decision(cap, 35_000, 4_936, T, S, 64),
+            JoinDecision::Defer
+        );
+        // need 39936 > solo 59935 is false, so only the exact boundary matters.
+        assert_eq!(
+            admission_decision(cap, 35_000, 4_935, T, S, 64),
+            JoinDecision::Admit(39_935)
+        );
+    }
+
+    #[test]
+    fn pool_fit_ladder_halves_ubatch_before_ctx() {
+        let ladder = pool_fit_ladder(100_000, 4_096);
+        assert_eq!(ladder[0], (100_000, 4_096), "requested pair first");
+        assert_eq!(ladder[1], (100_000, 2_048), "ubatch is the known failure");
+        assert!(
+            ladder.iter().any(|&(c, _)| c < 100_000),
+            "ctx eventually drops"
+        );
+        assert!(ladder.len() <= 6, "bounded: {}", ladder.len());
+        // monotonic non-increasing on both axes
+        for pair in ladder.windows(2) {
+            assert!(pair[1].0 <= pair[0].0 && pair[1].1 <= pair[0].1);
+        }
+    }
+
+    #[test]
+    fn pool_fit_ladder_small_request_is_single_step() {
+        assert_eq!(pool_fit_ladder(256, 0), vec![(256, 1)]);
+    }
+
+    #[test]
+    fn pool_fit_ladder_floors_ctx_and_ubatch() {
+        let ladder = pool_fit_ladder(8_192, 1_024);
+        let last = *ladder.last().unwrap();
+        assert_eq!(last, (4_096, 256), "both floors reached");
     }
 }

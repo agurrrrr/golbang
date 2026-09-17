@@ -191,6 +191,53 @@ pub fn render_metrics(m: &SchedulerMetrics) -> String {
     out.push_str("# TYPE llamacpp:requests_deferred gauge\n");
     out.push_str(&format!("llamacpp:requests_deferred {req_waiting}\n"));
 
+    // HAL-5 #249: KV admission + startup pool-fit.
+    let ctx_req = load(&m.pool_ctx_requested);
+    let ctx_eff = load(&m.pool_ctx_effective);
+    let ub_eff = load(&m.pool_ubatch_effective);
+    out.push_str("# HELP golbang_pool_ctx_requested Requested n_ctx before startup pool-fit.\n");
+    out.push_str("# TYPE golbang_pool_ctx_requested gauge\n");
+    out.push_str(&format!("golbang_pool_ctx_requested {ctx_req}\n"));
+    out.push_str("# HELP golbang_pool_ctx_effective Effective n_ctx after startup pool-fit.\n");
+    out.push_str("# TYPE golbang_pool_ctx_effective gauge\n");
+    out.push_str(&format!("golbang_pool_ctx_effective {ctx_eff}\n"));
+    out.push_str(
+        "# HELP golbang_pool_ubatch_effective Effective n_ubatch after startup pool-fit.\n",
+    );
+    out.push_str("# TYPE golbang_pool_ubatch_effective gauge\n");
+    out.push_str(&format!("golbang_pool_ubatch_effective {ub_eff}\n"));
+    out.push_str("# HELP golbang_pool_fit_downgrades_total Pool-fit load retries.\n");
+    out.push_str("# TYPE golbang_pool_fit_downgrades_total counter\n");
+    out.push_str(&format!(
+        "golbang_pool_fit_downgrades_total {}\n",
+        load(&m.pool_fit_downgrades)
+    ));
+
+    out.push_str(
+        "# HELP golbang_joins_deferred_total Joins kept waiting by the admission reservation.\n",
+    );
+    out.push_str("# TYPE golbang_joins_deferred_total counter\n");
+    out.push_str(&format!(
+        "golbang_joins_deferred_total {}\n",
+        load(&m.joins_deferred)
+    ));
+    out.push_str(
+        "# HELP golbang_joins_clamped_total Joins force-run because the request exceeded the pool.\n",
+    );
+    out.push_str("# TYPE golbang_joins_clamped_total counter\n");
+    out.push_str(&format!(
+        "golbang_joins_clamped_total {}\n",
+        load(&m.joins_clamped)
+    ));
+    out.push_str(
+        "# HELP golbang_queue_timeouts_total Deferred requests failed by timeout while queued.\n",
+    );
+    out.push_str("# TYPE golbang_queue_timeouts_total counter\n");
+    out.push_str(&format!(
+        "golbang_queue_timeouts_total {}\n",
+        load(&m.queue_timeouts)
+    ));
+
     out
 }
 
@@ -255,5 +302,25 @@ mod tests {
         assert!(out.contains("golbang_tokens_generated_total 250\n"));
         assert!(out.contains("golbang_prompt_seconds_total 2.000000\n"));
         assert!(out.contains("golbang_predicted_seconds_total 0.500000\n"));
+    }
+
+    #[test]
+    fn hal5_pool_and_admission_metrics_exposed() {
+        let m = sample_metrics();
+        m.pool_ctx_requested.store(100_000, Ordering::Relaxed);
+        m.pool_ctx_effective.store(100_000, Ordering::Relaxed);
+        m.pool_ubatch_effective.store(2_048, Ordering::Relaxed);
+        m.pool_fit_downgrades.store(1, Ordering::Relaxed);
+        m.joins_deferred.store(7, Ordering::Relaxed);
+        m.joins_clamped.store(2, Ordering::Relaxed);
+        m.queue_timeouts.store(3, Ordering::Relaxed);
+        let out = render_metrics(&m);
+        assert!(out.contains("golbang_pool_ctx_requested 100000\n"));
+        assert!(out.contains("golbang_pool_ctx_effective 100000\n"));
+        assert!(out.contains("golbang_pool_ubatch_effective 2048\n"));
+        assert!(out.contains("golbang_pool_fit_downgrades_total 1\n"));
+        assert!(out.contains("golbang_joins_deferred_total 7\n"));
+        assert!(out.contains("golbang_joins_clamped_total 2\n"));
+        assert!(out.contains("golbang_queue_timeouts_total 3\n"));
     }
 }

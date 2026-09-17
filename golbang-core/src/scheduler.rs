@@ -13,7 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::batch::{
     BatchBuilder, BatchToken, MixMode, decide_mix_mode, has_pending_decode, max_prefill_remaining,
 };
-use crate::ctx_cap::{cap_for_join, effective_cap, resolve_single_max, slot_cap};
+use crate::ctx_cap::{
+    JoinDecision, PoolFit, admission_decision, cap_for_join, effective_cap, resolve_single_max,
+    slot_cap,
+};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::generate::{FinishReason, GenerateParams, GeneratedToken, stop_cut_len};
@@ -59,6 +62,9 @@ pub struct SchedulerConfig {
     /// Engine/weights/config identity stamped into every disk snapshot.
     /// Required together with `prefix_cache_dir` to enable the disk tier.
     pub fingerprint: Option<crate::prefix_cache::SnapshotFingerprint>,
+    /// Startup pool-fit result (HAL-5 #249). Exposed as `golbang_pool_*`
+    /// gauges so a lowered context is never silent.
+    pub pool_fit: PoolFit,
 }
 
 impl Default for SchedulerConfig {
@@ -72,6 +78,7 @@ impl Default for SchedulerConfig {
             prefix_cache_dir: None,
             prefix_cache_disk_bytes: 0,
             fingerprint: None,
+            pool_fit: PoolFit::default(),
         }
     }
 }
@@ -87,6 +94,10 @@ pub struct Job {
     pub images: Vec<Vec<u8>>,
     /// Filled at join so prefix-aware pick and bind share one tokenize.
     pub prompt_tokens: Option<Vec<Token>>,
+    /// When the job entered the submit channel. HAL-5 #249: the per-request
+    /// timeout also bounds queue wait, so a deferred (admission-rejected)
+    /// request can never sit in `waiting` forever.
+    pub queued_at: Instant,
 }
 
 impl Job {
@@ -106,6 +117,7 @@ impl Job {
             events,
             images: Vec::new(),
             prompt_tokens: None,
+            queued_at: Instant::now(),
         }
     }
 }
@@ -145,6 +157,18 @@ pub struct SchedulerMetrics {
     /// These are instantaneous gauges, unlike the sampled averages above.
     pub requests_active: AtomicU64,
     pub requests_waiting: AtomicU64,
+    /// HAL-5 #249 admission: joins kept in `waiting` because `prompt +
+    /// max_tokens` did not fit the free room, and joins force-run because the
+    /// request was larger than the pool (so waiting could not help).
+    pub joins_deferred: AtomicU64,
+    pub joins_clamped: AtomicU64,
+    /// Deferred requests failed by the per-request timeout while still queued.
+    pub queue_timeouts: AtomicU64,
+    /// Startup pool-fit gauges: requested vs effective `n_ctx`/`n_ubatch`.
+    pub pool_ctx_requested: AtomicU64,
+    pub pool_ctx_effective: AtomicU64,
+    pub pool_ubatch_effective: AtomicU64,
+    pub pool_fit_downgrades: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -177,6 +201,29 @@ pub fn spawn_scheduler(
     let cap = config.queue_capacity.max(1);
     let (tx, rx) = mpsc::channel(cap);
     let metrics = Arc::new(SchedulerMetrics::default());
+    metrics
+        .pool_ctx_requested
+        .store(u64::from(config.pool_fit.requested_ctx), Ordering::Relaxed);
+    metrics
+        .pool_ctx_effective
+        .store(u64::from(config.pool_fit.effective_ctx), Ordering::Relaxed);
+    metrics.pool_ubatch_effective.store(
+        u64::from(config.pool_fit.effective_ubatch),
+        Ordering::Relaxed,
+    );
+    metrics
+        .pool_fit_downgrades
+        .store(u64::from(config.pool_fit.downgrades), Ordering::Relaxed);
+    if config.pool_fit.lowered() {
+        tracing::warn!(
+            requested_ctx = config.pool_fit.requested_ctx,
+            effective_ctx = config.pool_fit.effective_ctx,
+            requested_ubatch = config.pool_fit.requested_ubatch,
+            effective_ubatch = config.pool_fit.effective_ubatch,
+            downgrades = config.pool_fit.downgrades,
+            "pool-fit lowered the serving context"
+        );
+    }
     let handle = SchedulerHandle {
         tx,
         metrics: metrics.clone(),
@@ -214,9 +261,11 @@ async fn run_loop(
     // HAL-4 #248: optional disk tier under the RAM `PrefixStore`. Without a
     // dir+fingerprint this is exactly the P8 RAM-only path.
     let prefix_store = {
-        let ram = || Arc::new(std::sync::Mutex::new(PrefixStore::with_cap(
-            PrefixStore::DEFAULT_MAX_BYTES,
-        )));
+        let ram = || {
+            Arc::new(std::sync::Mutex::new(PrefixStore::with_cap(
+                PrefixStore::DEFAULT_MAX_BYTES,
+            )))
+        };
         match (
             config.prefix_cache_dir.as_deref(),
             config.fingerprint.clone(),
@@ -296,6 +345,10 @@ async fn run_loop(
             waiting.push_back(job);
         }
 
+        // HAL-5 #249: a deferred (admission-rejected) request must not wait
+        // forever. The per-request timeout now also bounds queue time.
+        expire_waiting_timeouts(&mut waiting, &metrics);
+
         evict_cancelled(&mut slots, &engine, iter, &metrics);
 
         let extra = policy.evict(&slot_views(&slots));
@@ -313,7 +366,7 @@ async fn run_loop(
             &mut slots,
             &mut waiting,
             &mut *policy,
-            &engine,
+            &*engine,
             pool,
             single_max,
             spec_n_max,
@@ -471,11 +524,36 @@ fn has_active(slots: &[Slot]) -> bool {
     slots.iter().any(|s| s.is_active())
 }
 
+/// Fail queued jobs whose per-request timeout elapsed before they could bind
+/// (HAL-5 #249). Without this, an admission-deferred request whose
+/// `prompt + max_tokens` never fits the free room would wait forever.
+fn expire_waiting_timeouts(waiting: &mut VecDeque<Job>, metrics: &SchedulerMetrics) {
+    let now = Instant::now();
+    let mut keep = VecDeque::with_capacity(waiting.len());
+    while let Some(job) = waiting.pop_front() {
+        let expired = job
+            .timeout
+            .is_some_and(|t| now.saturating_duration_since(job.queued_at) >= t);
+        if expired {
+            metrics.queue_timeouts.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                request_id = job.request_id,
+                queued_ms = now.saturating_duration_since(job.queued_at).as_millis() as u64,
+                "queued request timed out before admission"
+            );
+            let _ = job.events.send(SlotEvent::Failed(Error::Timeout));
+        } else {
+            keep.push_back(job);
+        }
+    }
+    *waiting = keep;
+}
+
 fn join_waiting(
     slots: &mut [Slot],
     waiting: &mut VecDeque<Job>,
     policy: &mut dyn SchedulePolicy,
-    engine: &Engine,
+    engine: &impl SeqKv,
     pool: u32,
     single_max: u32,
     spec_n_max: u32,
@@ -564,9 +642,14 @@ fn join_waiting(
     }
     *waiting = remain;
 
+    // Jobs not bound this pass (deferred by admission, or a slot that
+    // vanished) collect here and are prepended in arrival order afterwards,
+    // so a deferral never reverses the FIFO queue.
+    let mut rejected: Vec<Job> = Vec::new();
+
     for (slot_id, job) in extracted {
         if !slots.iter().any(|s| s.id == slot_id) {
-            waiting.push_front(job);
+            rejected.push(job);
             continue;
         }
         let n_active_after = slots.iter().filter(|s| s.is_active()).count() as u32 + 1;
@@ -576,6 +659,54 @@ fn join_waiting(
             .map(slot_kv_used_for_cap)
             .sum();
         let cap = cap_for_join(others_used, n_active_after, pool, single_max, spec_n_max);
+        // HAL-5 #249 admission reservation: a joiner must fit its whole
+        // `prompt + max_tokens` in the cap it would receive. Otherwise it
+        // could be clamped against the pool ceiling mid-generation.
+        let need_prompt = job
+            .prompt_tokens
+            .as_deref()
+            .map(|t| t.len() as u32)
+            .unwrap_or(0);
+        match admission_decision(
+            cap,
+            need_prompt,
+            job.params.max_tokens,
+            pool,
+            single_max,
+            spec_n_max,
+        ) {
+            JoinDecision::Defer => {
+                metrics.joins_deferred.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    iter,
+                    slot = slot_id.0,
+                    request_id = job.request_id,
+                    n_prompt = need_prompt,
+                    max_tokens = job.params.max_tokens,
+                    cap,
+                    others_used,
+                    n_active_after,
+                    "join deferred: prompt+max_tokens does not fit free room"
+                );
+                rejected.push(job);
+                continue;
+            }
+            JoinDecision::Clamp(_) => {
+                metrics.joins_clamped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    iter,
+                    slot = slot_id.0,
+                    request_id = job.request_id,
+                    n_prompt = need_prompt,
+                    max_tokens = job.params.max_tokens,
+                    cap,
+                    pool,
+                    single_max,
+                    "join clamped: request larger than any cap it could get"
+                );
+            }
+            JoinDecision::Admit(_) => {}
+        }
         let (prefix_n, ckpt_n, lcp) = slots
             .iter()
             .find(|s| s.id == slot_id)
@@ -593,7 +724,7 @@ fn join_waiting(
         let req = job.request_id;
         let bound = {
             let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) else {
-                waiting.push_front(job);
+                rejected.push(job);
                 continue;
             };
             bind_slot(slot, job, engine, cap, prefix_store)
@@ -628,6 +759,9 @@ fn join_waiting(
             );
             recompute_slot_caps(slots, pool, single_max, spec_n_max);
         }
+    }
+    for job in rejected.into_iter().rev() {
+        waiting.push_front(job);
     }
     // HiCache L2 (4th stage): a vision bind may have captured a new chain
     // dump (`capture_prefix_checkpoint`); enforce the global host-RAM cap.
@@ -1906,6 +2040,7 @@ fn recompute_slot_caps(slots: &mut [Slot], pool: u32, single_max: u32, spec_n_ma
                 used = used[i],
                 n_active,
                 others_used = others,
+                reserved = job.reserved_cells(),
                 "slot ctx cap"
             );
         }
@@ -2955,6 +3090,136 @@ mod tests {
         );
         job.prompt_tokens = Some(tokens);
         job
+    }
+
+    fn job_with_tokens_max(tokens: Vec<Token>, max_tokens: u32) -> Job {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut job = Job::new(
+            "unused".into(),
+            GenerateParams {
+                max_tokens,
+                ..GenerateParams::default()
+            },
+            CancellationToken::new(),
+            tx,
+        );
+        job.prompt_tokens = Some(tokens);
+        job
+    }
+
+    fn active_job_with_used(used: u32) -> ActiveJob {
+        let mut job = ActiveJob::for_test(vec![1]);
+        job.n_prompt = used;
+        job.n_past = used;
+        job
+    }
+
+    fn join_once(
+        slots: &mut [Slot],
+        waiting: &mut VecDeque<Job>,
+        kv: &FakeSeqKv,
+        pool: u32,
+    ) -> SchedulerMetrics {
+        let mut policy: Box<dyn SchedulePolicy> = Box::new(crate::policy::FifoPolicy::default());
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let metrics = SchedulerMetrics::default();
+        join_waiting(
+            slots,
+            waiting,
+            &mut *policy,
+            kv,
+            pool,
+            0,
+            0,
+            1,
+            &metrics,
+            &store,
+        );
+        metrics
+    }
+
+    // ── HAL-5 #249: admission reservation on the join path ────────────────
+
+    #[test]
+    fn admission_defers_join_and_keeps_job_waiting() {
+        // pool 1000; slot0 holds 900 cells, slot1 empty. The joiner
+        // 100 + 500 = 600 fits the pool (solo 1000) but not the free room
+        // (cap 100), so it must stay queued instead of binding short.
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+        slots[0].occupy(active_job_with_used(900));
+        let mut waiting: VecDeque<Job> =
+            std::iter::once(job_with_tokens_max(vec![7; 100], 500)).collect();
+        let kv = FakeSeqKv::new();
+
+        let metrics = join_once(&mut slots, &mut waiting, &kv, 1_000);
+
+        assert_eq!(waiting.len(), 1, "deferred job stays in waiting");
+        assert!(slots[1].is_empty(), "no bind on the empty slot");
+        assert_eq!(
+            metrics.joins_deferred.load(Ordering::Relaxed),
+            1,
+            "deferral counted"
+        );
+        assert_eq!(metrics.joins.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn admission_admits_join_when_reservation_fits() {
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+        slots[0].occupy(active_job_with_used(900));
+        let mut waiting: VecDeque<Job> =
+            std::iter::once(job_with_tokens_max(vec![7; 50], 40)).collect();
+        let kv = FakeSeqKv::new();
+
+        let metrics = join_once(&mut slots, &mut waiting, &kv, 1_000);
+
+        assert!(waiting.is_empty(), "admitted job left the queue");
+        assert!(slots[1].is_active(), "slot1 bound");
+        assert_eq!(metrics.joins.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.joins_deferred.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn admission_clamps_request_larger_than_pool() {
+        // 100 + 5000 = 5100 > solo 1000: waiting cannot help, so it binds and
+        // bind_slot holds it with a clamped generation budget instead of
+        // starving it forever.
+        let mut slots = vec![Slot::new(SlotId(0))];
+        let mut waiting: VecDeque<Job> =
+            std::iter::once(job_with_tokens_max(vec![7; 100], 5_000)).collect();
+        let kv = FakeSeqKv::new();
+
+        let metrics = join_once(&mut slots, &mut waiting, &kv, 1_000);
+
+        assert!(
+            waiting.is_empty(),
+            "clamped job is not left waiting forever"
+        );
+        assert!(slots[0].is_active(), "clamped job binds");
+        assert_eq!(metrics.joins_clamped.load(Ordering::Relaxed), 1);
+        let job = slots[0].job.as_ref().unwrap();
+        assert!(
+            job.max_tokens <= 900,
+            "generation budget clamped to the cap, got {}",
+            job.max_tokens
+        );
+    }
+
+    #[test]
+    fn admission_deferral_keeps_fifo_order() {
+        // Two deferrals must come back in arrival order at the queue front.
+        let mut slots = vec![Slot::new(SlotId(0)), Slot::new(SlotId(1))];
+        slots[0].occupy(active_job_with_used(900));
+        let a = job_with_tokens_max(vec![7; 100], 500);
+        let b = job_with_tokens_max(vec![7; 100], 500);
+        let (a_id, b_id) = (a.request_id, b.request_id);
+        let mut waiting: VecDeque<Job> = [a, b].into_iter().collect();
+        let kv = FakeSeqKv::new();
+
+        join_once(&mut slots, &mut waiting, &kv, 1_000);
+
+        let ids: Vec<u64> = waiting.iter().map(|j| j.request_id).collect();
+        assert_eq!(ids, vec![a_id, b_id], "FIFO order preserved");
     }
 
     #[test]

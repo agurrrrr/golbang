@@ -25,7 +25,9 @@ Environment=RUST_LOG=info
 # other. Load with 42/11,1 = GPU0 ~14.3 GiB, GPU1 ~9.4 GiB.
 # --n-ubatch 2048 is the prefill lever: 512 -> 1024 -> 2048 lifts 80k-token prefill
 # from 102 to 234 tok/s at identical decode. ub 4096 fails at load (`llama_init_from_model
-# returned null`), so 2048 is the ceiling on 2x16 GiB.
+# returned null`), so 2048 is the ceiling on 2x16 GiB. To let the server find the
+# ceiling itself, add --kv-pool-fit: on load failure it retries with a halved
+# n_ubatch (then n_ctx) and exports the effective values as golbang_pool_* gauges.
 # --spec-type ngram-mod is a loss here: acceptance ~0.20 and decode drops to 7-15 tok/s
 # because verifying a draft span activates the union of CPU experts. Leave it off.
 # MTP (`-md` + draft-mtp) is a win on this tree: the external Unsloth

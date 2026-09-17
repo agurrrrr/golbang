@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use clap::Parser;
 use golbang_core::{
-    Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
-    SnapshotFingerprint, SpecParams, SpecType, is_volatile_fs, parse_ggml_type, parse_rpc_servers,
-    parse_tensor_overrides, parse_tensor_split, spawn_scheduler,
+    Engine, FifoPolicy, IterationBudget, LoadParams, Model, PoolFit, ReasoningFormat,
+    SchedulerConfig, SnapshotFingerprint, SpecParams, SpecType, is_volatile_fs, parse_ggml_type,
+    parse_rpc_servers, parse_tensor_overrides, parse_tensor_split, pool_fit_ladder,
+    spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -227,6 +228,14 @@ struct Args {
     /// Disk tier LRU cap in GiB. Ignored without `--prefix-cache-dir`.
     #[arg(long, env = "GOLBANG_PREFIX_CACHE_DISK_GIB", default_value_t = 64)]
     prefix_cache_disk_gib: u64,
+
+    /// Startup pool-fit (HAL-5 #249). On `llama_init_from_model` /
+    /// `llama_model_load_from_file` failure, retry with a halved `n_ubatch`
+    /// (then `n_ctx`) instead of exiting. The lowered values are logged and
+    /// exported as `golbang_pool_*` gauges. Off by default: a clear load
+    /// error is safer when the operator wants the requested context.
+    #[arg(long, env = "GOLBANG_KV_POOL_FIT", default_value_t = false)]
+    kv_pool_fit: bool,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -322,6 +331,103 @@ fn prefix_fingerprint_config(args: &Args) -> String {
     parts.join(";")
 }
 
+/// Physical ubatch llama.cpp will use for the requested args. Mirrors
+/// `Model::load`: `0` means `n_batch`, which itself defaults to `n_ctx`.
+fn effective_ubatch(n_ctx: u32, n_batch: u32, n_ubatch: u32) -> u32 {
+    if n_ubatch > 0 {
+        n_ubatch
+    } else if n_batch > 0 {
+        n_batch
+    } else {
+        n_ctx.max(1)
+    }
+}
+
+/// Load the model, optionally walking [`pool_fit_ladder`] when the requested
+/// `n_ctx`/`n_ubatch` do not fit VRAM. Returns the effective pool so the
+/// scheduler can expose it as a gauge.
+fn load_with_pool_fit(
+    path: &std::path::Path,
+    base: LoadParams,
+    enabled: bool,
+    requested_ctx: u32,
+    requested_ubatch: u32,
+) -> Result<(Model, PoolFit)> {
+    let identity = PoolFit {
+        requested_ctx,
+        requested_ubatch,
+        effective_ctx: requested_ctx,
+        effective_ubatch: requested_ubatch,
+        downgrades: 0,
+    };
+    if !enabled {
+        let model = Model::load(path, base).with_context(|| format!("load {}", path.display()))?;
+        return Ok((model, identity));
+    }
+    let ladder = pool_fit_ladder(requested_ctx, requested_ubatch);
+    let mut last: Option<anyhow::Error> = None;
+    for (i, &(ctx, ub)) in ladder.iter().enumerate() {
+        let mut params = base.clone();
+        if i > 0 {
+            params.n_ctx = ctx;
+            params.n_ubatch = ub;
+            if params.n_batch > ctx {
+                params.n_batch = ctx;
+            }
+            tracing::warn!(
+                attempt = i + 1,
+                requested_ctx,
+                requested_ubatch,
+                n_ctx = ctx,
+                n_ubatch = ub,
+                "pool-fit: retrying load with a smaller pool"
+            );
+        }
+        match Model::load(path, params) {
+            Ok(model) => {
+                let fit = PoolFit {
+                    requested_ctx,
+                    requested_ubatch,
+                    effective_ctx: ctx,
+                    effective_ubatch: ub,
+                    downgrades: i as u32,
+                };
+                if fit.lowered() {
+                    tracing::warn!(
+                        effective_ctx = ctx,
+                        effective_ubatch = ub,
+                        downgrades = fit.downgrades,
+                        "pool-fit: loaded with a lowered pool"
+                    );
+                } else {
+                    tracing::info!(
+                        n_ctx = ctx,
+                        n_ubatch = ub,
+                        "pool-fit: requested pool loaded"
+                    );
+                }
+                return Ok((model, fit));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt = i + 1,
+                    n_ctx = ctx,
+                    n_ubatch = ub,
+                    error = %e,
+                    "pool-fit: load attempt failed"
+                );
+                last = Some(anyhow::Error::new(e));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no pool-fit candidates"))).with_context(|| {
+        format!(
+            "load {} failed for every pool-fit candidate (requested n_ctx={requested_ctx} n_ubatch={requested_ubatch})",
+            path.display()
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -408,33 +514,37 @@ async fn main() -> Result<()> {
             "speculative decoding enabled"
         );
     }
-    let model = Model::load(
+    let base_params = LoadParams {
+        n_gpu_layers: args.n_gpu_layers,
+        n_ctx: args.n_ctx,
+        n_seq_max: n_parallel,
+        n_cpu_moe: args.n_cpu_moe,
+        tensor_overrides,
+        flash_attn,
+        n_batch: args.n_batch,
+        n_ubatch: args.n_ubatch,
+        n_threads: args.n_threads,
+        n_rs_seq: args.n_rs_seq,
+        use_mmap: !args.no_mmap,
+        load_mtp,
+        spec,
+        mmproj: args.mmproj.clone(),
+        kv_unified: args.kv_unified,
+        cache_type_k: parse_ggml_type(&args.kv_type_k).map_err(anyhow::Error::msg)?,
+        cache_type_v: parse_ggml_type(&args.kv_type_v).map_err(anyhow::Error::msg)?,
+        model_draft: args.model_draft.clone(),
+        rpc_servers,
+        rpc_backend: args.rpc_backend.clone(),
+        tensor_split,
+    };
+    let requested_ubatch = effective_ubatch(args.n_ctx, args.n_batch, args.n_ubatch);
+    let (model, pool_fit) = load_with_pool_fit(
         &model_path,
-        LoadParams {
-            n_gpu_layers: args.n_gpu_layers,
-            n_ctx: args.n_ctx,
-            n_seq_max: n_parallel,
-            n_cpu_moe: args.n_cpu_moe,
-            tensor_overrides,
-            flash_attn,
-            n_batch: args.n_batch,
-            n_ubatch: args.n_ubatch,
-            n_threads: args.n_threads,
-            n_rs_seq: args.n_rs_seq,
-            use_mmap: !args.no_mmap,
-            load_mtp,
-            spec,
-            mmproj: args.mmproj.clone(),
-            kv_unified: args.kv_unified,
-            cache_type_k: parse_ggml_type(&args.kv_type_k).map_err(anyhow::Error::msg)?,
-            cache_type_v: parse_ggml_type(&args.kv_type_v).map_err(anyhow::Error::msg)?,
-            model_draft: args.model_draft.clone(),
-            rpc_servers,
-            rpc_backend: args.rpc_backend.clone(),
-            tensor_split,
-        },
-    )
-    .with_context(|| format!("load {}", model_path.display()))?;
+        base_params,
+        args.kv_pool_fit,
+        args.n_ctx,
+        requested_ubatch,
+    )?;
 
     let policy: Box<dyn golbang_core::SchedulePolicy> = match args.policy.as_str() {
         "fifo" => Box::new(FifoPolicy::with_budget(IterationBudget::for_context(
@@ -494,43 +604,46 @@ async fn main() -> Result<()> {
 
     // HAL-4 #248: optional disk tier for prefix snapshots. RAM-only when the
     // dir is unset or sits on a volatile filesystem.
-    let (prefix_cache_dir, prefix_cache_disk_bytes, prefix_fingerprint) =
-        match args.prefix_cache_dir.as_ref() {
-            Some(dir) if args.prefix_cache_disk_gib > 0 => {
-                if is_volatile_fs(dir) {
-                    tracing::warn!(
-                        dir = %dir.display(),
-                        "prefix-cache-dir is on a volatile filesystem (tmpfs/ramfs/overlay); disk tier disabled (RAM only)"
-                    );
-                    (None, 0, None)
-                } else {
-                    let fp = SnapshotFingerprint::for_model(
-                        &model_path,
-                        args.n_ctx,
-                        prefix_fingerprint_config(&args),
-                    );
-                    tracing::info!(
-                        dir = %dir.display(),
-                        disk_gib = args.prefix_cache_disk_gib,
-                        fp = fp.hash(),
-                        "prefix snapshot disk tier configured"
-                    );
-                    (
-                        Some(dir.clone()),
-                        args.prefix_cache_disk_gib.saturating_mul(1024 * 1024 * 1024),
-                        Some(fp),
-                    )
-                }
-            }
-            Some(dir) => {
+    let (prefix_cache_dir, prefix_cache_disk_bytes, prefix_fingerprint) = match args
+        .prefix_cache_dir
+        .as_ref()
+    {
+        Some(dir) if args.prefix_cache_disk_gib > 0 => {
+            if is_volatile_fs(dir) {
                 tracing::warn!(
                     dir = %dir.display(),
-                    "prefix-cache-disk-gib=0; disk tier disabled (RAM only)"
+                    "prefix-cache-dir is on a volatile filesystem (tmpfs/ramfs/overlay); disk tier disabled (RAM only)"
                 );
                 (None, 0, None)
+            } else {
+                let fp = SnapshotFingerprint::for_model(
+                    &model_path,
+                    args.n_ctx,
+                    prefix_fingerprint_config(&args),
+                );
+                tracing::info!(
+                    dir = %dir.display(),
+                    disk_gib = args.prefix_cache_disk_gib,
+                    fp = fp.hash(),
+                    "prefix snapshot disk tier configured"
+                );
+                (
+                    Some(dir.clone()),
+                    args.prefix_cache_disk_gib
+                        .saturating_mul(1024 * 1024 * 1024),
+                    Some(fp),
+                )
             }
-            None => (None, 0, None),
-        };
+        }
+        Some(dir) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                "prefix-cache-disk-gib=0; disk tier disabled (RAM only)"
+            );
+            (None, 0, None)
+        }
+        None => (None, 0, None),
+    };
 
     let spawned = spawn_scheduler(
         engine,
@@ -544,6 +657,7 @@ async fn main() -> Result<()> {
             prefix_cache_dir,
             prefix_cache_disk_bytes,
             fingerprint: prefix_fingerprint,
+            pool_fit,
         },
     );
 

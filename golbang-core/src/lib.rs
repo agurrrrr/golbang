@@ -23,6 +23,7 @@ pub use batch::{BatchBuilder, BatchPlan, BatchToken};
 pub use chat::{
     AppliedPrompt, ChatApplyOpts, ChatMessage, apply_chat_template, apply_chat_template_with,
 };
+pub use ctx_cap::{JoinDecision, PoolFit, admission_decision, pool_fit_ladder};
 pub use engine::Engine;
 pub use error::Error;
 pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
