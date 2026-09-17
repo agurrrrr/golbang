@@ -3,7 +3,7 @@
 //! Reads the scheduler's atomic counters and renders the `/metrics` route.
 //! Bucket labels mirror the coarse TTFT/ITL histograms in `SchedulerMetrics`.
 
-use golbang_core::SchedulerHandle;
+use golbang_core::{SchedulerHandle, SchedulerMetrics};
 
 const BUCKET_LE: [&str; 8] = ["1", "5", "10", "25", "50", "100", "500", "+Inf"];
 
@@ -16,7 +16,12 @@ fn bucket_lines(name: &str, bucket: &[std::sync::atomic::AtomicU64; 8], out: &mu
 
 /// Render Prometheus text exposition for the scheduler.
 pub fn render(scheduler: &SchedulerHandle) -> String {
-    let m = &scheduler.metrics;
+    render_metrics(&scheduler.metrics)
+}
+
+/// Render the scheduler metrics. Split from `render` so it can be unit-tested
+/// without a live scheduler handle (HAL-2 #246).
+pub fn render_metrics(m: &SchedulerMetrics) -> String {
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
 
     let mut out = String::new();
@@ -34,6 +39,15 @@ pub fn render(scheduler: &SchedulerHandle) -> String {
     );
     out.push_str("# TYPE golbang_prompt_tokens_total counter\n");
     out.push_str(&format!("golbang_prompt_tokens_total {prompt_tokens}\n"));
+
+    let cached_tokens = load(&m.prompt_tokens_cached_total);
+    out.push_str(
+        "# HELP golbang_prompt_tokens_cached_total Prompt tokens reused from the prefix cache.\n",
+    );
+    out.push_str("# TYPE golbang_prompt_tokens_cached_total counter\n");
+    out.push_str(&format!(
+        "golbang_prompt_tokens_cached_total {cached_tokens}\n"
+    ));
 
     out.push_str("# HELP golbang_prompt_seconds_total Wall time spent prefilling.\n");
     out.push_str("# TYPE golbang_prompt_seconds_total counter\n");
@@ -137,6 +151,46 @@ pub fn render(scheduler: &SchedulerHandle) -> String {
     out.push_str("# TYPE golbang_evicts_total counter\n");
     out.push_str(&format!("golbang_evicts_total {}\n", load(&m.evicts)));
 
+    // HAL-2 #246: llama.cpp-compatible aliases so a dashboard built for
+    // llama.cpp / llama-swap reads golbang unchanged. Values mirror the
+    // `golbang_` series above; `:` is a legal Prometheus name character
+    // (recording-rule namespace convention). The `golbang_` names are kept
+    // exactly as before.
+    out.push_str(
+        "# HELP llamacpp:prompt_tokens_total Prompt tokens prefilled (excludes cache reuse).\n",
+    );
+    out.push_str("# TYPE llamacpp:prompt_tokens_total counter\n");
+    out.push_str(&format!("llamacpp:prompt_tokens_total {prompt_tokens}\n"));
+
+    out.push_str("# HELP llamacpp:tokens_predicted_total Tokens emitted to clients.\n");
+    out.push_str("# TYPE llamacpp:tokens_predicted_total counter\n");
+    out.push_str(&format!("llamacpp:tokens_predicted_total {gen_tokens}\n"));
+
+    out.push_str("# HELP llamacpp:prompt_tokens_seconds Wall time spent prefilling.\n");
+    out.push_str("# TYPE llamacpp:prompt_tokens_seconds gauge\n");
+    out.push_str(&format!("llamacpp:prompt_tokens_seconds {prompt_s:.6}\n"));
+
+    out.push_str("# HELP llamacpp:predicted_tokens_seconds Wall time spent generating.\n");
+    out.push_str("# TYPE llamacpp:predicted_tokens_seconds gauge\n");
+    out.push_str(&format!("llamacpp:predicted_tokens_seconds {pred_s:.6}\n"));
+
+    out.push_str(
+        "# HELP llamacpp:prompt_tokens_cached_total Prompt tokens reused from the prefix cache.\n",
+    );
+    out.push_str("# TYPE llamacpp:prompt_tokens_cached_total counter\n");
+    out.push_str(&format!(
+        "llamacpp:prompt_tokens_cached_total {cached_tokens}\n"
+    ));
+
+    let req_active = load(&m.requests_active);
+    let req_waiting = load(&m.requests_waiting);
+    out.push_str("# HELP llamacpp:requests_processing Requests currently being processed.\n");
+    out.push_str("# TYPE llamacpp:requests_processing gauge\n");
+    out.push_str(&format!("llamacpp:requests_processing {req_active}\n"));
+    out.push_str("# HELP llamacpp:requests_deferred Requests waiting in the queue.\n");
+    out.push_str("# TYPE llamacpp:requests_deferred gauge\n");
+    out.push_str(&format!("llamacpp:requests_deferred {req_waiting}\n"));
+
     out
 }
 
@@ -151,4 +205,55 @@ pub async fn metrics(state: axum::extract::State<crate::AppState>) -> axum::resp
         )
         .body(axum::body::Body::from(body))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn sample_metrics() -> SchedulerMetrics {
+        let m = SchedulerMetrics::default();
+        m.prompt_tokens_total.store(1000, Ordering::Relaxed);
+        m.prompt_tokens_cached_total.store(640, Ordering::Relaxed);
+        m.tokens_generated_total.store(250, Ordering::Relaxed);
+        m.prompt_us_total.store(2_000_000, Ordering::Relaxed);
+        m.predicted_us_total.store(500_000, Ordering::Relaxed);
+        m.requests_active.store(2, Ordering::Relaxed);
+        m.requests_waiting.store(3, Ordering::Relaxed);
+        m
+    }
+
+    #[test]
+    fn llama_cpp_aliases_exposed_with_matching_values() {
+        let out = render_metrics(&sample_metrics());
+        for n in [
+            "llamacpp:prompt_tokens_total",
+            "llamacpp:tokens_predicted_total",
+            "llamacpp:prompt_tokens_seconds",
+            "llamacpp:predicted_tokens_seconds",
+            "llamacpp:prompt_tokens_cached_total",
+            "llamacpp:requests_processing",
+            "llamacpp:requests_deferred",
+        ] {
+            assert!(out.contains(&format!("# TYPE {n} ")), "missing TYPE {n}");
+        }
+        assert!(out.contains("llamacpp:prompt_tokens_total 1000\n"));
+        assert!(out.contains("llamacpp:tokens_predicted_total 250\n"));
+        assert!(out.contains("llamacpp:prompt_tokens_cached_total 640\n"));
+        assert!(out.contains("llamacpp:prompt_tokens_seconds 2.000000\n"));
+        assert!(out.contains("llamacpp:predicted_tokens_seconds 0.500000\n"));
+        assert!(out.contains("llamacpp:requests_processing 2\n"));
+        assert!(out.contains("llamacpp:requests_deferred 3\n"));
+    }
+
+    #[test]
+    fn golbang_names_and_values_unchanged() {
+        let out = render_metrics(&sample_metrics());
+        assert!(out.contains("golbang_prompt_tokens_total 1000\n"));
+        assert!(out.contains("golbang_prompt_tokens_cached_total 640\n"));
+        assert!(out.contains("golbang_tokens_generated_total 250\n"));
+        assert!(out.contains("golbang_prompt_seconds_total 2.000000\n"));
+        assert!(out.contains("golbang_predicted_seconds_total 0.500000\n"));
+    }
 }

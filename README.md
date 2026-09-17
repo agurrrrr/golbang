@@ -190,7 +190,10 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
 - **tool calls** — 요청 `tools`를 템플릿에 주입, DSML/Qwen/Hermes 출력을 OpenAI `tool_calls`로 재파싱
 - **vision** — `--mmproj`로 `image_url` / `input_image` (`mtmd`)
 - **speculative decoding** — `--spec-type draft-mtp,ngram-mod`. 타깃에서 `[sampled, draft…]` 검증
-- `/metrics` — Prometheus. 토큰, TTFT/ITL 히스토그램, draft accept, 슬롯 점유, 503
+- `/metrics` — Prometheus. 토큰, TTFT/ITL 히스토그램, draft accept, 슬롯 점유, 503.
+  `llamacpp:` 별칭(`prompt_tokens_total`, `tokens_predicted_total`, `requests_processing`,
+  `requests_deferred`, `prompt_tokens_cached_total` 등)도 같은 값으로 내보내 llama.cpp/llama-swap
+  대시보드가 수정 없이 읽는다
 - `--prompt-progress`(기본 on) — SSE에 llama-server식 `prompt_progress`를 실어 긴 프리필 동안 연결 유지
 - `--api-key` / `--alias` / `--rpc` / `--tensor-split` — llama-server와 같은 의미
 

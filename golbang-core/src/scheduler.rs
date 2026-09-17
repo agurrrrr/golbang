@@ -120,6 +120,9 @@ pub struct SchedulerMetrics {
     pub service_unavailable_total: AtomicU64,
     /// Prompt tokens actually prefilled (excludes prefix-cache reuse).
     pub prompt_tokens_total: AtomicU64,
+    /// Prompt tokens reused from the prefix cache (HAL-2 #246). Sum of
+    /// per-request `cache_n`, so a rising value shows P8 savings.
+    pub prompt_tokens_cached_total: AtomicU64,
     /// Completion tokens sampled and emitted.
     pub tokens_generated_total: AtomicU64,
     /// Accumulated prefill / decode wall time (microseconds).
@@ -128,6 +131,10 @@ pub struct SchedulerMetrics {
     /// Speculative draft tokens proposed / accepted (not counting the bonus).
     pub draft_tokens_total: AtomicU64,
     pub draft_accepted_total: AtomicU64,
+    /// Current active slots / waiting jobs, stored each iteration (HAL-2 #246).
+    /// These are instantaneous gauges, unlike the sampled averages above.
+    pub requests_active: AtomicU64,
+    pub requests_waiting: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -238,6 +245,10 @@ async fn run_loop(
         let q = waiting.len() as u64;
         metrics.queue_depth_total.fetch_add(q, Ordering::Relaxed);
         metrics.queue_depth_samples.fetch_add(1, Ordering::Relaxed);
+        // HAL-2 #246: instantaneous gauges for llama.cpp-compatible
+        // `requests_processing` / `requests_deferred`.
+        metrics.requests_active.store(active, Ordering::Relaxed);
+        metrics.requests_waiting.store(q, Ordering::Relaxed);
 
         while let Ok(job) = rx.try_recv() {
             waiting.push_back(job);
@@ -1583,6 +1594,9 @@ fn record_request_totals(metrics: &SchedulerMetrics, t: &SlotTimings) {
     metrics
         .prompt_tokens_total
         .fetch_add(u64::from(t.prompt_n), Ordering::Relaxed);
+    metrics
+        .prompt_tokens_cached_total
+        .fetch_add(u64::from(t.cache_n), Ordering::Relaxed);
     metrics
         .tokens_generated_total
         .fetch_add(u64::from(t.predicted_n), Ordering::Relaxed);
@@ -3524,6 +3538,16 @@ mod gpu_tests {
             t1.prompt_n,
             t2.prompt_n,
             t2.cache_n
+        );
+        // HAL-2 #246: the lifetime cached-token counter must capture the reuse.
+        let cached = spawned
+            .handle
+            .metrics
+            .prompt_tokens_cached_total
+            .load(Ordering::Relaxed);
+        assert!(
+            cached > 0,
+            "prompt_tokens_cached_total must be positive after a prefix-reusing turn, got {cached}"
         );
 
         drop(spawned.handle);
