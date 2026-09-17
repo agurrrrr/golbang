@@ -18,7 +18,7 @@ use crate::error::ApiError;
 use crate::types::{
     ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage, Choice, ChunkChoice,
     Delta, DeltaFunction, DeltaToolCall, OutgoingToolCall, PromptProgress, Timings, Usage,
-    effective_reasoning_budget,
+    effective_reasoning_budget, resolve_max_tokens,
 };
 
 pub fn completion_id() -> String {
@@ -57,7 +57,7 @@ pub fn generate_params(
     let extracts = state.chat.reasoning_format.extracts();
     let enable_thinking = req.resolved_enable_thinking(state.chat.enable_thinking);
     let thinking_on = extracts && enable_thinking;
-    let max_tokens = req.max_tokens.unwrap_or(256).max(1);
+    let max_tokens = resolve_max_tokens(req.max_tokens, state.chat.max_tokens);
     GenerateParams {
         max_tokens,
         temperature: req.temperature.unwrap_or(state.chat.temperature).max(0.0),

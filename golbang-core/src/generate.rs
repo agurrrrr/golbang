@@ -26,6 +26,12 @@ impl FinishReason {
     }
 }
 
+/// `GenerateParams::max_tokens` sentinel meaning "no request cap": generate
+/// until EOS or the slot's remaining context is full (llama-server `-n -1`).
+/// The scheduler clamps it at bind (`max_tokens_req.min(remaining)`), so the
+/// context ceiling still bounds generation.
+pub const UNLIMITED_MAX_TOKENS: u32 = u32::MAX;
+
 #[derive(Clone, Debug)]
 pub struct GenerateParams {
     pub max_tokens: u32,

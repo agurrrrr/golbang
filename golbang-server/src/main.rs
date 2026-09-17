@@ -126,6 +126,12 @@ struct Args {
     #[arg(long, env = "GOLBANG_TOP_K", default_value_t = 40)]
     top_k: i32,
 
+    /// Server-side `max_tokens` default when a request omits it
+    /// (llama-server `-n` / `--n-predict`). `0` = unlimited up to context.
+    /// Request field overrides.
+    #[arg(long, env = "GOLBANG_MAX_TOKENS", default_value_t = 0)]
+    max_tokens: u32,
+
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
     n_parallel: u32,
@@ -704,6 +710,7 @@ async fn main() -> Result<()> {
             temperature: args.temperature.max(0.0),
             top_p: args.top_p.clamp(0.0, 1.0),
             top_k: args.top_k.max(0),
+            max_tokens: args.max_tokens,
         },
         api_keys,
         vision,

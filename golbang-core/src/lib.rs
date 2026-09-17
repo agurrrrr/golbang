@@ -26,7 +26,7 @@ pub use chat::{
 pub use ctx_cap::{JoinDecision, PoolFit, admission_decision, pool_fit_ladder};
 pub use engine::Engine;
 pub use error::Error;
-pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken};
+pub use generate::{FinishReason, Generate, GenerateParams, GeneratedToken, UNLIMITED_MAX_TOKENS};
 pub use model::{
     LoadParams, Model, ModelCard, TensorOverride, parse_rpc_servers, parse_tensor_overrides,
     parse_tensor_split,

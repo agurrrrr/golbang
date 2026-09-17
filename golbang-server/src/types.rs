@@ -1,4 +1,5 @@
 use golbang_core::MEDIA_MARKER;
+use golbang_core::UNLIMITED_MAX_TOKENS;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +145,21 @@ fn json_bool(v: Option<&serde_json::Value>, keys: &[&str]) -> Option<bool> {
         }
     }
     None
+}
+
+/// Resolve the request `max_tokens` against the server default.
+///
+/// Order: request field wins, then `--max-tokens` (env `GOLBANG_MAX_TOKENS`),
+/// then [`UNLIMITED_MAX_TOKENS`] (generate until EOS or the context ceiling).
+/// A server default of `0` means unlimited, matching llama-server `-n -1`, so a
+/// client that omits `max_tokens` (e.g. the built-in WebUI) is not silently
+/// truncated at the old hard-coded 256.
+pub fn resolve_max_tokens(request: Option<u32>, server: u32) -> u32 {
+    match request {
+        Some(n) => n.max(1),
+        None if server > 0 => server,
+        None => UNLIMITED_MAX_TOKENS,
+    }
 }
 
 /// Answer-room policy (halogen-flash-server `halogen-borrowable-techniques`
@@ -675,6 +691,18 @@ mod tests {
         let default_on: ChatCompletionRequest =
             serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
         assert!(default_on.resolved_enable_thinking(true));
+    }
+
+    #[test]
+    fn resolve_max_tokens_request_wins_then_server_then_unlimited() {
+        assert_eq!(resolve_max_tokens(Some(8), 4096), 8);
+        assert_eq!(resolve_max_tokens(Some(0), 4096), 1, "zero request → 1");
+        assert_eq!(resolve_max_tokens(None, 4096), 4096);
+        assert_eq!(
+            resolve_max_tokens(None, 0),
+            UNLIMITED_MAX_TOKENS,
+            "server default 0 = unlimited up to context"
+        );
     }
 
     #[test]

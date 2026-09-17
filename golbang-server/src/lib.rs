@@ -31,6 +31,9 @@ pub struct ChatRuntime {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: i32,
+    /// Default `max_tokens` when the request omits it. `0` = unlimited up to
+    /// context (llama-server `-n -1`). Request field overrides.
+    pub max_tokens: u32,
 }
 
 impl Default for ChatRuntime {
@@ -46,6 +49,7 @@ impl Default for ChatRuntime {
             temperature: 0.8,
             top_p: 0.95,
             top_k: 40,
+            max_tokens: 0,
         }
     }
 }

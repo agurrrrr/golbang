@@ -118,6 +118,14 @@ pub fn admission_decision(
     single_max: u32,
     spec_n_max: u32,
 ) -> JoinDecision {
+    // `--max-tokens 0` (or an omitted request field) means "no cap", sent as
+    // `UNLIMITED_MAX_TOKENS`. It can never fit `prompt + max_tokens` in a finite
+    // cap, so treating it as Defer would starve it forever. Admit it like the
+    // oversized case: bind clamps `max_tokens` to the remaining room and
+    // generation stops at EOS or the context ceiling.
+    if max_tokens_req == crate::generate::UNLIMITED_MAX_TOKENS {
+        return JoinDecision::Admit(cap);
+    }
     let need = prompt_len.saturating_add(max_tokens_req.max(1));
     if cap >= need {
         return JoinDecision::Admit(cap);
@@ -410,6 +418,21 @@ mod tests {
         assert_eq!(
             admission_decision(5_001, 5_000, 0, T, 0, OFF),
             JoinDecision::Admit(5_001)
+        );
+    }
+
+    #[test]
+    fn admission_unlimited_always_admits() {
+        // `--max-tokens 0`: bind and let generation stop at EOS/context instead
+        // of deferring forever against an impossible `prompt + max_tokens`.
+        use crate::generate::UNLIMITED_MAX_TOKENS;
+        assert_eq!(
+            admission_decision(10_000, 59_000, UNLIMITED_MAX_TOKENS, T, S, OFF),
+            JoinDecision::Admit(10_000)
+        );
+        assert_eq!(
+            admission_decision(0, 90_000, UNLIMITED_MAX_TOKENS, T, 0, OFF),
+            JoinDecision::Admit(0)
         );
     }
 
