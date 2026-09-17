@@ -111,6 +111,21 @@ struct Args {
     #[arg(long, env = "GOLBANG_REASONING_BUDGET", default_value_t = 0)]
     reasoning_budget: u32,
 
+    /// Server-side sampling default (llama-server `--temp`). A request field
+    /// overrides it. The llama.cpp raw default (1.0) samples the full
+    /// vocabulary and turns instruct models into multilingual word salad.
+    #[arg(long, env = "GOLBANG_TEMPERATURE", default_value_t = 0.8)]
+    temperature: f32,
+
+    /// Server-side top-p default (llama-server `--top-p`). Request field overrides.
+    #[arg(long, env = "GOLBANG_TOP_P", default_value_t = 0.95)]
+    top_p: f32,
+
+    /// Server-side top-k default (llama-server `--top-k`, 0 = disabled).
+    /// Request field overrides.
+    #[arg(long, env = "GOLBANG_TOP_K", default_value_t = 40)]
+    top_k: i32,
+
     /// Slot count / llama n_seq_max.
     #[arg(long, env = "GOLBANG_N_PARALLEL", default_value_t = 2)]
     n_parallel: u32,
@@ -686,6 +701,9 @@ async fn main() -> Result<()> {
             enable_thinking,
             reasoning_effort,
             reasoning_budget: args.reasoning_budget,
+            temperature: args.temperature.max(0.0),
+            top_p: args.top_p.clamp(0.0, 1.0),
+            top_k: args.top_k.max(0),
         },
         api_keys,
         vision,
@@ -713,6 +731,9 @@ async fn main() -> Result<()> {
         n_ctx = args.n_ctx,
         single_max_ctx = args.single_max_ctx,
         kv_unified = args.kv_unified,
+        temperature = args.temperature,
+        top_p = args.top_p,
+        top_k = args.top_k,
         "listening"
     );
 

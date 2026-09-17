@@ -60,9 +60,9 @@ pub fn generate_params(
     let max_tokens = req.max_tokens.unwrap_or(256).max(1);
     GenerateParams {
         max_tokens,
-        temperature: req.temperature.unwrap_or(1.0).max(0.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k.unwrap_or(0),
+        temperature: req.temperature.unwrap_or(state.chat.temperature).max(0.0),
+        top_p: req.top_p.unwrap_or(state.chat.top_p),
+        top_k: req.top_k.unwrap_or(state.chat.top_k),
         seed: req.seed.unwrap_or(0),
         stop,
         reasoning_budget: if thinking_on {

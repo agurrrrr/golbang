@@ -225,6 +225,10 @@ llama-server처럼 "서버를 띄우면 브라우저에서 바로 확인"하는 
    처리 중/대기열, 슬롯 점유, 503, 유효 `n_ctx`, 큐 깊이를 보여 준다.
 
 `temperature`·`max_tokens`·context length는 UI가 보내지 않고 서버 설정값을 그대로 쓴다.
+샘플링 기본값은 `--temperature` / `--top-p` / `--top-k`(기본 `0.8` / `0.95` / `40`, llama-server
+parity)이고, 요청이 값을 주지 않으면 이 기본값이 적용된다. 이 기본값이 없던 시절에는
+llama.cpp의 raw 기본값(temperature 1.0, top_k 0, top_p 1.0)이 그대로 쓰여, 온도를 명시하지
+않은 채팅 요청이 24.8만 토큰 전체에서 표집돼 다국어 단어 나열로 무너졌다.
 
 원본은 [`webui/`](webui/)에 있는 Svelte + Vite 앱이고, `vite-plugin-singlefile`로 단일
 `webui/dist/index.html`을 만들어 리포지토리에 커밋한다. `golbang-server`는 이 파일을
@@ -335,6 +339,7 @@ completion 1500)가 동시에 HTTP 200으로 완주했고 `failed to find a memo
 | `--chat-template-file` | 없음 | GGUF 템플릿 재정의 |
 | `--reasoning-format` | `none` | `none` \| `deepseek` \| `deepseek-legacy` \| `auto` |
 | `--reasoning-effort` / `--reasoning-budget` | 템플릿 기본 / answer room | think 제어. 요청이 budget을 명시하지 않으면 `max(1024, 15%)`를 답변용으로 남긴다 |
+| `--temperature` / `--top-p` / `--top-k` | `0.8` / `0.95` / `40` | 서버 샘플링 기본값 (llama-server parity). 요청 필드가 각각 덮어쓴다 |
 | `--mmproj` | 없음 | CLIP/projector GGUF (vision) |
 | `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod`, `prompt-lookup`/`pld` (콤마) |
 | `--spec-draft-n-max` / `--spec-draft-p-min` | `3` / `0.90` | MTP draft 상한 / 최소 확률 |

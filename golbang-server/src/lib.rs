@@ -12,7 +12,7 @@ use golbang_core::{ModelCard, ReasoningFormat, SchedulerHandle};
 
 use crate::error::ApiError;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ChatRuntime {
     pub use_jinja: bool,
     pub template: Option<String>,
@@ -24,6 +24,30 @@ pub struct ChatRuntime {
     pub reasoning_effort: Option<String>,
     /// Default think-token cap. 0 = unlimited. Request field overrides.
     pub reasoning_budget: u32,
+    /// Server-side sampling defaults (llama-server parity). A request field
+    /// overrides each one. These exist because the raw llama.cpp defaults
+    /// (temperature 1.0, top_k 0, top_p 1.0) sample the full vocabulary and
+    /// degrade instruction models into multilingual word salad.
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+}
+
+impl Default for ChatRuntime {
+    fn default() -> Self {
+        Self {
+            use_jinja: false,
+            template: None,
+            bos_token: String::new(),
+            reasoning_format: ReasoningFormat::default(),
+            enable_thinking: false,
+            reasoning_effort: None,
+            reasoning_budget: 0,
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+        }
+    }
 }
 
 #[derive(Clone)]
