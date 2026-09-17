@@ -33,7 +33,10 @@ pub use model::{
 pub use policy::{
     EmptySlotView, FifoPolicy, IterationBudget, SchedulePolicy, SlotView, WaitingJobView,
 };
-pub use prefix_cache::{PrefixStore, SlotPrefixCache, VisionChunk, VisionSeq, common_prefix_len};
+pub use prefix_cache::{
+    PrefixStore, SlotPrefixCache, SnapshotFingerprint, VisionChunk, VisionSeq, common_prefix_len,
+    is_volatile_fs,
+};
 pub use reasoning::{
     ReasoningDelta, ReasoningFormat, ReasoningParser, ThinkBudget, prompt_opens_think,
 };

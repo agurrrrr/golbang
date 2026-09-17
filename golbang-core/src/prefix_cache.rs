@@ -18,6 +18,9 @@
 //! uses `n_pos != n_tokens`; `pos_next` is what `seq_rm` / `n_past` need.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use crate::slot::SeqCheckpoint;
 use crate::tokenizer::Token;
@@ -319,6 +322,457 @@ impl SlotPrefixCache {
     }
 }
 
+/// Identity of the engine + weights + settings that produced a snapshot.
+///
+/// A dump restored under a different fingerprint can be silently wrong, so the
+/// disk tier refuses any file whose fingerprint does not match. `engine_build`
+/// is a compile-time tag; `model_path`/mtime/size pin the primary weights and
+/// `n_ctx`/`config` cover settings that change the saved bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotFingerprint {
+    pub engine_build: String,
+    pub model_path: String,
+    pub model_mtime: u64,
+    pub model_size: u64,
+    pub n_ctx: u32,
+    pub config: String,
+}
+
+impl SnapshotFingerprint {
+    pub fn new(
+        engine_build: impl Into<String>,
+        model_path: impl Into<String>,
+        model_mtime: u64,
+        model_size: u64,
+        n_ctx: u32,
+        config: impl Into<String>,
+    ) -> Self {
+        Self {
+            engine_build: engine_build.into(),
+            model_path: model_path.into(),
+            model_mtime,
+            model_size,
+            n_ctx,
+            config: config.into(),
+        }
+    }
+
+    /// Fingerprint for a GGUF path (mtime/size read from the filesystem).
+    /// Missing metadata records 0/0 — the path itself still discriminates.
+    pub fn for_model(model: &Path, n_ctx: u32, config: impl Into<String>) -> Self {
+        let (mtime, size) = file_stamp(model);
+        Self::new(
+            engine_build_tag(),
+            model.display().to_string(),
+            mtime,
+            size,
+            n_ctx,
+            config,
+        )
+    }
+
+    /// Stable FNV-1a 64 over all fields. Embedded in every disk file header and
+    /// in the file name, so a new build/model never overwrites an old dump.
+    pub fn hash(&self) -> u64 {
+        let mut h = FNV_OFFSET;
+        h = fnv1a(self.engine_build.as_bytes(), h);
+        h = fnv1a(self.model_path.as_bytes(), h);
+        h = fnv1a(&self.model_mtime.to_le_bytes(), h);
+        h = fnv1a(&self.model_size.to_le_bytes(), h);
+        h = fnv1a(&self.n_ctx.to_le_bytes(), h);
+        fnv1a(self.config.as_bytes(), h)
+    }
+}
+
+/// Compile-time build tag for the fingerprint. Code changes without a version
+/// bump do not move this, but weights/settings do, which is the dangerous case.
+fn engine_build_tag() -> String {
+    format!(
+        "{} {} {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
+}
+
+fn file_stamp(path: &Path) -> (u64, u64) {
+    match fs::metadata(path) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (mtime, m.len())
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Disk file magic. `GBPK` = golbang prefix.
+const DISK_MAGIC: &[u8; 4] = b"GBPK";
+/// v2: disk entries are full-state sequence snapshots (v1 held PARTIAL_ONLY,
+/// which is not self-sufficient on a fresh context). Bumping the version makes
+/// an old v1 file fail the header check and get ignored.
+const DISK_VERSION: u32 = 2;
+/// Fixed header before the key: magic(4) + version(4) + fp(8) + n_tokens(4) +
+/// key_len(4) = 24, then `key_len` i32 tokens, then the u64 data length.
+const DISK_HEADER_FIXED: usize = 24;
+/// Sanity caps so a corrupt header cannot trigger a huge allocation.
+const DISK_MAX_KEY_TOKENS: u32 = 4_000_000;
+const DISK_MAX_DATA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// One disk-tier entry's metadata (kept in RAM; data lives in the file).
+#[derive(Clone, Debug)]
+struct DiskMeta {
+    n_tokens: u32,
+    file: String,
+    bytes: u64,
+    tick: u64,
+}
+
+/// Decoded disk file header (everything before `data`).
+#[derive(Clone, Debug)]
+struct DiskHeader {
+    fp_hash: u64,
+    n_tokens: u32,
+    key: Vec<Token>,
+    data_len: u64,
+}
+
+/// Disk tier for prefix snapshots (HAL-4 #248): a `PrefixStore`-shaped map
+/// whose data lives in `<DIR>/<key-hash>.ckpt` and survives a restart.
+///
+/// Startup scans headers only (not the ~150 MiB payloads) into an in-memory
+/// index. A bind lookup that misses the RAM map reads the matching file. Writes
+/// are temp-file + rename so a crash cannot leave a half-written dump. LRU
+/// eviction honours `max_bytes` (0 = unlimited).
+#[derive(Clone, Debug)]
+pub struct PrefixDisk {
+    dir: PathBuf,
+    fingerprint: SnapshotFingerprint,
+    fp_hash: u64,
+    max_bytes: u64,
+    used_bytes: u64,
+    index: HashMap<Vec<Token>, DiskMeta>,
+    tick: u64,
+}
+
+impl PrefixDisk {
+    /// Open (creating if needed) and scan `dir`. Mismatched/corrupt files are
+    /// ignored, not deleted.
+    pub fn open(
+        dir: &Path,
+        max_bytes: u64,
+        fingerprint: SnapshotFingerprint,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
+        let fp_hash = fingerprint.hash();
+        let mut disk = Self {
+            dir: dir.to_path_buf(),
+            fingerprint,
+            fp_hash,
+            max_bytes,
+            used_bytes: 0,
+            index: HashMap::new(),
+            tick: 0,
+        };
+        disk.scan();
+        disk.evict_over_cap();
+        Ok(disk)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn fingerprint(&self) -> &SnapshotFingerprint {
+        &self.fingerprint
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    fn scan(&mut self) {
+        let Ok(rd) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut skipped = 0usize;
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ckpt") {
+                continue;
+            }
+            let header = match read_header(&path) {
+                Ok(h) => h,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if header.fp_hash != self.fp_hash || header.key.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            if header.n_tokens as usize != header.key.len() {
+                skipped += 1;
+                continue;
+            }
+            self.tick = self.tick.saturating_add(1);
+            let tick = file_stamp(&path).0.max(self.tick);
+            let file = file_name(&path);
+            if let Some(old) = self.index.insert(
+                header.key,
+                DiskMeta {
+                    n_tokens: header.n_tokens,
+                    file,
+                    bytes: header.data_len,
+                    tick,
+                },
+            ) {
+                self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+            }
+            self.used_bytes = self.used_bytes.saturating_add(header.data_len);
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                dir = %self.dir.display(),
+                "prefix disk: ignored mismatched/corrupt files"
+            );
+        }
+    }
+
+    /// Write a snapshot and update the index. Same key overwrites the file.
+    pub fn put(&mut self, key: &[Token], ckpt: &SeqCheckpoint) -> io::Result<()> {
+        if key.is_empty() || ckpt.data.is_empty() || key.len() != ckpt.n_tokens as usize {
+            return Ok(());
+        }
+        let name = self.file_name(key);
+        let path = self.dir.join(&name);
+        let bytes = write_entry(&path, self.fp_hash, key, ckpt)?;
+        let tick = self.next_tick();
+        if let Some(old) = self.index.insert(
+            key.to_vec(),
+            DiskMeta {
+                n_tokens: ckpt.n_tokens,
+                file: name,
+                bytes,
+                tick,
+            },
+        ) {
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+        }
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.evict_over_cap();
+        Ok(())
+    }
+
+    /// Longest usable entry for `prompt`. `search_len` is already
+    /// `host_search_len(...)`-adjusted. Disk entries require **no rollback**
+    /// (`n_tokens <= search_len`): restore the exact length and prefill the
+    /// suffix. A rollback needs a token re-decode that the hybrid/indexer
+    /// runtime cannot reconstruct, so such a hit is not offered here.
+    pub fn find(&mut self, prompt: &[Token], search_len: usize) -> Option<SeqCheckpoint> {
+        let mut best: Option<Vec<Token>> = None;
+        for (key, meta) in &self.index {
+            if meta.n_tokens == 0 || meta.n_tokens as usize > search_len {
+                continue;
+            }
+            if common_prefix_len(key, prompt) != meta.n_tokens as usize {
+                continue;
+            }
+            match &best {
+                Some(b) if b.len() >= meta.n_tokens as usize => {}
+                _ => best = Some(key.clone()),
+            }
+        }
+        let key = best?;
+        let meta = self.index.get(&key)?.clone();
+        let data = read_entry_data(&self.dir.join(&meta.file)).ok()?;
+        if data.len() as u64 != meta.bytes {
+            return None;
+        }
+        self.touch(&key);
+        Some(SeqCheckpoint {
+            n_tokens: meta.n_tokens,
+            data,
+        })
+    }
+
+    fn file_name(&self, key: &[Token]) -> String {
+        let mut h = fnv1a(&self.fp_hash.to_le_bytes(), FNV_OFFSET);
+        for &t in key {
+            h = fnv1a(&t.to_le_bytes(), h);
+        }
+        format!("{h:016x}.ckpt")
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    fn touch(&mut self, key: &[Token]) {
+        let t = self.next_tick();
+        if let Some(m) = self.index.get_mut(key) {
+            m.tick = t;
+        }
+    }
+
+    /// Drop the oldest entries until `used_bytes <= max_bytes`.
+    fn evict_over_cap(&mut self) {
+        while self.max_bytes > 0 && self.used_bytes > self.max_bytes && !self.index.is_empty() {
+            let Some(victim) = self
+                .index
+                .iter()
+                .min_by_key(|(_, m)| m.tick)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(meta) = self.index.remove(&victim) {
+                self.used_bytes = self.used_bytes.saturating_sub(meta.bytes);
+                let _ = fs::remove_file(self.dir.join(&meta.file));
+            }
+        }
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn write_entry(
+    path: &Path,
+    fp_hash: u64,
+    key: &[Token],
+    ckpt: &SeqCheckpoint,
+) -> io::Result<u64> {
+    let mut buf = Vec::with_capacity(DISK_HEADER_FIXED + key.len() * 4 + 8 + ckpt.data.len());
+    buf.extend_from_slice(DISK_MAGIC);
+    buf.extend_from_slice(&DISK_VERSION.to_le_bytes());
+    buf.extend_from_slice(&fp_hash.to_le_bytes());
+    buf.extend_from_slice(&ckpt.n_tokens.to_le_bytes());
+    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    for &t in key {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+    buf.extend_from_slice(&(ckpt.data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&ckpt.data);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &buf)?;
+    fs::rename(&tmp, path)?;
+    Ok(ckpt.data.len() as u64)
+}
+
+fn read_header(path: &Path) -> io::Result<DiskHeader> {
+    let mut f = fs::File::open(path)?;
+    read_header_from(&mut f)
+}
+
+fn read_header_from(f: &mut fs::File) -> io::Result<DiskHeader> {
+    let mut fixed = [0u8; DISK_HEADER_FIXED];
+    f.read_exact(&mut fixed)?;
+    if &fixed[0..4] != DISK_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+    }
+    let version = u32::from_le_bytes(fixed[4..8].try_into().unwrap());
+    if version != DISK_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported version",
+        ));
+    }
+    let fp_hash = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+    let n_tokens = u32::from_le_bytes(fixed[16..20].try_into().unwrap());
+    let key_len = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
+    if key_len == 0 || key_len > DISK_MAX_KEY_TOKENS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad key length"));
+    }
+    let mut key_buf = vec![0u8; key_len as usize * 4];
+    f.read_exact(&mut key_buf)?;
+    let key: Vec<Token> = key_buf
+        .chunks_exact(4)
+        .map(|c| Token::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut dl = [0u8; 8];
+    f.read_exact(&mut dl)?;
+    let data_len = u64::from_le_bytes(dl);
+    if data_len == 0 || data_len > DISK_MAX_DATA_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad data length"));
+    }
+    Ok(DiskHeader {
+        fp_hash,
+        n_tokens,
+        key,
+        data_len,
+    })
+}
+
+fn read_entry_data(path: &Path) -> io::Result<Vec<u8>> {
+    let mut f = fs::File::open(path)?;
+    let header = read_header_from(&mut f)?;
+    let mut data = vec![0u8; header.data_len as usize];
+    f.read_exact(&mut data)?;
+    Ok(data)
+}
+
+/// Best-effort check for a filesystem that will not survive a reboot.
+///
+/// The disk tier only earns its keep if the bytes persist. `tmpfs` and
+/// `ramfs` (and container `overlay` roots) are treated as volatile; a caller
+/// should then stay on the RAM tier. Unknown mounts are assumed durable.
+pub fn is_volatile_fs(path: &Path) -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(usize, &str)> = None;
+    for line in mounts.lines() {
+        let mut it = line.split_whitespace();
+        let _device = it.next();
+        let Some(mount) = it.next() else { continue };
+        let Some(fstype) = it.next() else { continue };
+        if !canon.starts_with(mount) {
+            continue;
+        }
+        let len = mount.len();
+        if best.is_none_or(|(bl, _)| len >= bl) {
+            best = Some((len, fstype));
+        }
+    }
+    matches!(best.map(|(_, t)| t), Some("tmpfs" | "ramfs" | "overlay"))
+}
+
 /// Bind-miss numbers for the journal. Empty store → [`PrefixStore::miss_diag`]
 /// returns `None` so a first-request miss stays silent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,6 +804,8 @@ pub struct PrefixStore {
     last_used_tick: u64,
     /// Per-entry tick of last use (keyed by the same prefix slice).
     last_used: HashMap<Vec<Token>, u64>,
+    /// Optional disk tier (HAL-4 #248). `None` = RAM only, exactly P8.
+    pub disk: Option<PrefixDisk>,
 }
 
 impl Default for PrefixStore {
@@ -361,6 +817,7 @@ impl Default for PrefixStore {
             max_entries: Self::DEFAULT_MAX_ENTRIES,
             last_used_tick: 0,
             last_used: HashMap::new(),
+            disk: None,
         }
     }
 }
@@ -401,6 +858,48 @@ impl PrefixStore {
         s
     }
 
+    /// RAM tier plus a disk tier rooted at `dir` (HAL-4 #248). Scans existing
+    /// `*.ckpt` headers into the index; a restart therefore reuses prior
+    /// snapshots without any GPU work. `max_bytes` is the disk LRU cap.
+    pub fn with_disk(
+        dir: &Path,
+        max_bytes: u64,
+        fingerprint: SnapshotFingerprint,
+    ) -> io::Result<Self> {
+        let mut s = Self::with_cap(Self::DEFAULT_MAX_BYTES);
+        s.disk = Some(PrefixDisk::open(dir, max_bytes, fingerprint)?);
+        Ok(s)
+    }
+
+    /// Number of disk-tier entries (0 when the tier is off).
+    pub fn disk_entries(&self) -> usize {
+        self.disk.as_ref().map(PrefixDisk::len).unwrap_or(0)
+    }
+
+    /// Disk-tier bytes in use (0 when the tier is off).
+    pub fn disk_bytes(&self) -> u64 {
+        self.disk.as_ref().map(PrefixDisk::used_bytes).unwrap_or(0)
+    }
+
+    /// Persist a snapshot to the disk tier only, without touching the RAM map.
+    ///
+    /// The slot anchor chain (`Slot::prefix_ckpts`) holds dumps longer than the
+    /// store's stub window (e.g. a 100k prefill-end anchor). Writing those to
+    /// disk lets a restart restore the long session, while keeping them out of
+    /// the 2 GiB RAM map avoids evicting the shared tool head.
+    pub fn persist(&mut self, prefix: &[Token], ckpt: &SeqCheckpoint) {
+        let Some(disk) = self.disk.as_mut() else {
+            return;
+        };
+        if let Err(e) = disk.put(prefix, ckpt) {
+            tracing::warn!(
+                error = %e,
+                dir = %disk.dir().display(),
+                "prefix disk tier write failed"
+            );
+        }
+    }
+
     /// Insert or refresh a snapshot for prefix `[0..n_tokens)`.
     ///
     /// Skips empty keys and key/`n_tokens` mismatches: those cannot hit
@@ -427,7 +926,53 @@ impl PrefixStore {
     /// whole snapshot prefix still matches) and `n_tokens <= reuse_len + 1`
     /// (the GPU can restore it and trim one logits token). Among usable
     /// entries, returns the longest. Linear scan.
+    ///
+    /// The RAM map is searched first. On a miss the disk tier (if enabled) is
+    /// consulted with the same usability rule, so a restarted process can
+    /// restore a session it never held in RAM.
     pub fn find_best(&mut self, prompt: &[Token], reuse_len: usize) -> Option<SeqCheckpoint> {
+        if let Some(hit) = self.find_ram(prompt, reuse_len) {
+            return Some(hit);
+        }
+        self.disk
+            .as_mut()
+            .and_then(|disk| disk.find(prompt, reuse_len))
+    }
+
+    /// Bind-time lookup. `reuse_len == 0` still searches the new prompt
+    /// (`prompt.len() - 1`) so an empty slot can restore the shared head.
+    pub fn find_best_for_bind(
+        &mut self,
+        prompt: &[Token],
+        reuse_len: usize,
+    ) -> Option<SeqCheckpoint> {
+        self.find_best(prompt, host_search_len(prompt.len(), reuse_len))
+    }
+
+    /// RAM-map bind lookup only. Used by `restore_host_snapshot` so a disk hit
+    /// (full-state snapshot) can take a different restore path.
+    pub fn find_best_ram_for_bind(
+        &mut self,
+        prompt: &[Token],
+        reuse_len: usize,
+    ) -> Option<SeqCheckpoint> {
+        self.find_ram(prompt, host_search_len(prompt.len(), reuse_len))
+    }
+
+    /// Disk-tier bind lookup only. Entries are full-state snapshots, so the
+    /// caller must restore them with `seq_state_full_set`.
+    pub fn find_disk_for_bind(
+        &mut self,
+        prompt: &[Token],
+        reuse_len: usize,
+    ) -> Option<SeqCheckpoint> {
+        let search_len = host_search_len(prompt.len(), reuse_len);
+        self.disk
+            .as_mut()
+            .and_then(|disk| disk.find(prompt, search_len))
+    }
+
+    fn find_ram(&mut self, prompt: &[Token], reuse_len: usize) -> Option<SeqCheckpoint> {
         let mut best: Option<(u32, Vec<Token>)> = None;
         for (prefix, ckpt) in &self.entries {
             if ckpt.n_tokens == 0 || ckpt.n_tokens > reuse_len as u32 + 1 {
@@ -441,20 +986,11 @@ impl PrefixStore {
                 _ => best = Some((ckpt.n_tokens, prefix.clone())),
             }
         }
-        best.map(|(_, prefix)| {
+        if let Some((_, prefix)) = best {
             self.touch(&prefix);
-            self.entries[&prefix].clone()
-        })
-    }
-
-    /// Bind-time lookup. `reuse_len == 0` still searches the new prompt
-    /// (`prompt.len() - 1`) so an empty slot can restore the shared head.
-    pub fn find_best_for_bind(
-        &mut self,
-        prompt: &[Token],
-        reuse_len: usize,
-    ) -> Option<SeqCheckpoint> {
-        self.find_best(prompt, host_search_len(prompt.len(), reuse_len))
+            return Some(self.entries[&prefix].clone());
+        }
+        None
     }
 
     /// Numbers for a bind miss. `None` when the store is empty so a cold
@@ -1039,5 +1575,170 @@ mod tests {
             3,
             "global host-RAM cap must not drop store stubs"
         );
+    }
+
+    // ── HAL-4 #248: disk tier ──────────────────────────────────────────────
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "golbang-prefix-disk-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn fp(tag: &str) -> SnapshotFingerprint {
+        SnapshotFingerprint::new("golbang-test", "/models/test.gguf", 1, 2, 4096, tag)
+    }
+
+    #[test]
+    fn disk_tier_survives_reopen() {
+        let dir = temp_dir("reopen");
+        let head = t(&[1, 2, 3, 4, 5, 6]);
+        {
+            let mut store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+            store.persist(&head, &ckpt(6, 0xAB));
+            assert_eq!(store.disk_entries(), 1);
+        }
+        // Simulate a process restart: a fresh store on the same directory.
+        let mut store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+        assert_eq!(store.disk_entries(), 1, "index must reload on startup");
+        assert!(store.entries.is_empty(), "data stays on disk, not in RAM");
+        let hit = store
+            .find_best(&t(&[1, 2, 3, 4, 5, 6, 7, 8]), 7)
+            .expect("disk hit after restart");
+        assert_eq!(hit.n_tokens, 6);
+        assert_eq!(hit.data, vec![0xAB; 6]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_restore_matches_ram_restore() {
+        let dir = temp_dir("parity");
+        let head: Vec<Token> = (0..512).map(|i| (i % 9) as Token).collect();
+        let prompt: Vec<Token> = head.iter().copied().chain([7, 8, 9]).collect();
+
+        let mut ram = PrefixStore::new();
+        ram.put(head.clone(), ckpt(512, 0x5A));
+        let ram_hit = ram.find_best(&prompt, prompt.len() - 1).unwrap();
+
+        let mut disk = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+        disk.persist(&head, &ckpt(512, 0x5A));
+        let disk_hit = disk.find_best(&prompt, prompt.len() - 1).unwrap();
+
+        assert_eq!(disk_hit.n_tokens, ram_hit.n_tokens, "n_tokens must match");
+        assert_eq!(disk_hit.data, ram_hit.data, "bytes must be byte-identical");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_fingerprint_mismatch_misses() {
+        let dir = temp_dir("fp");
+        let head = t(&[1, 2, 3, 4, 5, 6]);
+        {
+            let mut store = PrefixStore::with_disk(&dir, 0, fp("build-a")).unwrap();
+            store.persist(&head, &ckpt(6, 0xAB));
+        }
+        // Different build/model/config: the header is ignored on scan.
+        let mut other = PrefixStore::with_disk(&dir, 0, fp("build-b")).unwrap();
+        assert_eq!(other.disk_entries(), 0, "foreign dump must not load");
+        assert!(
+            other.find_best(&t(&[1, 2, 3, 4, 5, 6, 7]), 6).is_none(),
+            "different fingerprint must miss"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_n_ctx_changes_fingerprint() {
+        let a = SnapshotFingerprint::new("g", "/m.gguf", 1, 2, 4096, "c");
+        let b = SnapshotFingerprint::new("g", "/m.gguf", 1, 2, 8192, "c");
+        assert_ne!(a.hash(), b.hash(), "n_ctx must change the key");
+        let c = SnapshotFingerprint::new("g", "/other.gguf", 1, 2, 4096, "c");
+        assert_ne!(a.hash(), c.hash(), "model path must change the key");
+        let d = SnapshotFingerprint::new("g", "/m.gguf", 1, 2, 4096, "different");
+        assert_ne!(a.hash(), d.hash(), "config must change the key");
+    }
+
+    #[test]
+    fn disk_tier_lru_evicts_oldest() {
+        let dir = temp_dir("lru");
+        // Each entry is 100 data bytes; cap 250 forces one eviction of 3.
+        let mut disk =
+            PrefixDisk::open(&dir, 250, fp("a")).expect("open");
+        for i in 0..3u32 {
+            let key: Vec<Token> = std::iter::repeat(i as Token).take(100).collect();
+            disk.put(&key, &ckpt(100, i as u8)).unwrap();
+        }
+        assert_eq!(disk.len(), 2, "cap 250 with 100-byte entries keeps two");
+        assert!(disk.used_bytes() <= 250);
+        // Oldest (key 0) was evicted; newest (key 2) still reads.
+        assert!(
+            disk.find(&vec![0 as Token; 110], 109).is_none(),
+            "oldest entry evicted"
+        );
+        assert!(
+            disk.find(&vec![2 as Token; 110], 109).is_some(),
+            "newest entry kept"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_put_overwrites_same_key() {
+        let dir = temp_dir("overwrite");
+        let mut store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+        store.persist(&t(&[1, 2, 3]), &ckpt(3, 0x11));
+        store.persist(&t(&[1, 2, 3]), &ckpt(3, 0x22));
+        assert_eq!(store.disk_entries(), 1);
+        let hit = store.find_best(&t(&[1, 2, 3, 4]), 3).unwrap();
+        assert_eq!(hit.data, vec![0x22; 3], "newer dump wins");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_off_is_ram_only() {
+        // Regression: no `--prefix-cache-dir` → no disk tier, RAM behavior.
+        let mut store = PrefixStore::new();
+        assert!(store.disk.is_none());
+        assert_eq!(store.disk_entries(), 0);
+        store.put(t(&[1, 2, 3]), ckpt(3, 0x33));
+        let hit = store.find_best(&t(&[1, 2, 3, 4]), 3).unwrap();
+        assert_eq!(hit.data, vec![0x33; 3]);
+        assert_eq!(store.disk_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_tier_persist_skips_ram_map() {
+        // `persist` writes a chain anchor to disk but not into the 2 GiB RAM
+        // map, so a long 100k anchor cannot evict the shared tool head.
+        let dir = temp_dir("persist");
+        let long: Vec<Token> = (0..100_000).map(|i| (i % 11) as Token).collect();
+        let mut store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+        store.persist(&long, &ckpt(100_000, 0x77));
+        assert!(store.entries.is_empty(), "persist must not touch RAM");
+        assert_eq!(store.disk_entries(), 1);
+        let hit = store.find_best(&long, 100_000).unwrap();
+        assert_eq!(hit.n_tokens, 100_000);
+        assert_eq!(hit.data.len(), 100_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_tier_scan_ignores_corrupt_files() {
+        let dir = temp_dir("corrupt");
+        let key = t(&[1, 2, 3, 4]);
+        {
+            let mut store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+            store.persist(&key, &ckpt(4, 0xAB));
+        }
+        fs::write(dir.join("garbage.ckpt"), b"not a snapshot").unwrap();
+        let store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
+        assert_eq!(store.disk_entries(), 1, "only the valid file loads");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

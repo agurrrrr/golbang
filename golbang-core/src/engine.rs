@@ -112,6 +112,16 @@ impl Engine {
         self.lock().seq_state_set(seq_id, data)
     }
 
+    /// Full sequence snapshot (base KV + recurrent + indexer), self-sufficient
+    /// across a fresh context. Used by the disk tier (HAL-4 #248).
+    pub fn seq_state_full_get(&self, seq_id: i32) -> Option<Vec<u8>> {
+        self.lock().seq_state_full_get(seq_id)
+    }
+
+    pub fn seq_state_full_set(&self, seq_id: i32, data: &[u8]) -> bool {
+        self.lock().seq_state_full_set(seq_id, data)
+    }
+
     /// Decode one planned batch and copy logits for every token that asked
     /// for them. Copies so the async side can sample after the lock drops.
     pub fn decode_and_logits(&self, items: &[BatchToken]) -> Result<Vec<Vec<f32>>> {

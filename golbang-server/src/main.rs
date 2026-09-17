@@ -8,8 +8,8 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use golbang_core::{
     Engine, FifoPolicy, IterationBudget, LoadParams, Model, ReasoningFormat, SchedulerConfig,
-    SpecParams, SpecType, parse_ggml_type, parse_rpc_servers, parse_tensor_overrides,
-    parse_tensor_split, spawn_scheduler,
+    SnapshotFingerprint, SpecParams, SpecType, is_volatile_fs, parse_ggml_type, parse_rpc_servers,
+    parse_tensor_overrides, parse_tensor_split, spawn_scheduler,
 };
 use golbang_server::{AppState, ChatRuntime, router};
 use tracing_subscriber::EnvFilter;
@@ -217,6 +217,16 @@ struct Args {
         default_missing_value = "true"
     )]
     prompt_progress: bool,
+
+    /// Prefix snapshot disk tier (HAL-4 #248). Empty = RAM only (P8). Should be
+    /// a durable filesystem (tmpfs/overlay disables the tier); the directory is
+    /// scanned at startup so a restart can restore sessions.
+    #[arg(long, env = "GOLBANG_PREFIX_CACHE_DIR")]
+    prefix_cache_dir: Option<PathBuf>,
+
+    /// Disk tier LRU cap in GiB. Ignored without `--prefix-cache-dir`.
+    #[arg(long, env = "GOLBANG_PREFIX_CACHE_DISK_GIB", default_value_t = 64)]
+    prefix_cache_disk_gib: u64,
 }
 
 fn resolve_model(args: &Args) -> Result<PathBuf> {
@@ -268,6 +278,48 @@ fn load_chat_template(args: &Args, model: &Model) -> Result<Option<String>> {
         return Ok(Some(text));
     }
     Ok(model.chat_template())
+}
+
+fn file_stamp_str(path: &std::path::Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{mtime}:{}", m.len())
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
+/// Settings that change the saved prefix-snapshot bytes. Folded into the disk
+/// tier fingerprint so a config change cannot silently restore a mismatch.
+fn prefix_fingerprint_config(args: &Args) -> String {
+    let mut parts = vec![
+        format!("gpu_layers={}", args.n_gpu_layers),
+        format!("cpu_moe={}", args.n_cpu_moe),
+        format!("flash_attn={}", args.flash_attn),
+        format!("n_rs_seq={}", args.n_rs_seq),
+        format!("kv_k={}", args.kv_type_k),
+        format!("kv_v={}", args.kv_type_v),
+        format!("n_batch={}", args.n_batch),
+        format!("n_ubatch={}", args.n_ubatch),
+        format!("kv_unified={}", args.kv_unified),
+        format!("spec={}", args.spec_type),
+        format!("spec_n_max={}", args.spec_draft_n_max),
+        format!("pld_n={}", args.spec_pld_n),
+        format!("pld_k={}", args.spec_pld_k),
+    ];
+    if let Some(p) = &args.model_draft {
+        parts.push(format!("draft={}:{}", p.display(), file_stamp_str(p)));
+    }
+    if let Some(p) = &args.mmproj {
+        parts.push(format!("mmproj={}:{}", p.display(), file_stamp_str(p)));
+    }
+    parts.join(";")
 }
 
 #[tokio::main]
@@ -439,6 +491,47 @@ async fn main() -> Result<()> {
     let vision = model.vision_enabled();
     let model_card = model.card().clone();
     let engine = Arc::new(Engine::new(model));
+
+    // HAL-4 #248: optional disk tier for prefix snapshots. RAM-only when the
+    // dir is unset or sits on a volatile filesystem.
+    let (prefix_cache_dir, prefix_cache_disk_bytes, prefix_fingerprint) =
+        match args.prefix_cache_dir.as_ref() {
+            Some(dir) if args.prefix_cache_disk_gib > 0 => {
+                if is_volatile_fs(dir) {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        "prefix-cache-dir is on a volatile filesystem (tmpfs/ramfs/overlay); disk tier disabled (RAM only)"
+                    );
+                    (None, 0, None)
+                } else {
+                    let fp = SnapshotFingerprint::for_model(
+                        &model_path,
+                        args.n_ctx,
+                        prefix_fingerprint_config(&args),
+                    );
+                    tracing::info!(
+                        dir = %dir.display(),
+                        disk_gib = args.prefix_cache_disk_gib,
+                        fp = fp.hash(),
+                        "prefix snapshot disk tier configured"
+                    );
+                    (
+                        Some(dir.clone()),
+                        args.prefix_cache_disk_gib.saturating_mul(1024 * 1024 * 1024),
+                        Some(fp),
+                    )
+                }
+            }
+            Some(dir) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "prefix-cache-disk-gib=0; disk tier disabled (RAM only)"
+                );
+                (None, 0, None)
+            }
+            None => (None, 0, None),
+        };
+
     let spawned = spawn_scheduler(
         engine,
         policy,
@@ -448,6 +541,9 @@ async fn main() -> Result<()> {
             default_timeout: args.timeout_secs.map(Duration::from_secs),
             single_max_ctx: args.single_max_ctx,
             spec_n_max,
+            prefix_cache_dir,
+            prefix_cache_disk_bytes,
+            fingerprint: prefix_fingerprint,
         },
     );
 

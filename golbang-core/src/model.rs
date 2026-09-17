@@ -689,6 +689,36 @@ impl Model {
         n > 0
     }
 
+    /// Full sequence snapshot (flags = 0): base attention KV + recurrent +
+    /// indexer state. Much larger than [`seq_state_get`], but self-sufficient
+    /// across a fresh context, unlike PARTIAL_ONLY.
+    pub fn seq_state_full_get(&mut self, seq_id: i32) -> Option<Vec<u8>> {
+        let flags = 0;
+        let n = unsafe { llama_state_seq_get_size_ext(self.ctx, seq_id, flags) };
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n];
+        let wrote =
+            unsafe { llama_state_seq_get_data_ext(self.ctx, buf.as_mut_ptr(), n, seq_id, flags) };
+        if wrote == 0 {
+            return None;
+        }
+        buf.truncate(wrote);
+        Some(buf)
+    }
+
+    /// Restore a full sequence snapshot from [`seq_state_full_get`].
+    pub fn seq_state_full_set(&mut self, seq_id: i32, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        let n = unsafe {
+            llama_state_seq_set_data_ext(self.ctx, data.as_ptr(), data.len(), seq_id, 0)
+        };
+        n > 0
+    }
+
     /// Tokens already in `seq_id` (0 if empty).
     pub fn n_past_seq(&self, seq_id: i32) -> u32 {
         unsafe {

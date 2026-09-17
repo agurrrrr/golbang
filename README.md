@@ -233,6 +233,30 @@ prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬
 
 전체 근거·상수·저널 표는 [`docs/bench/p8.md`](docs/bench/p8.md)에 있다.
 
+### 디스크 tier: 재시작 후 세션 복원 (HAL-4 #248, 실험적)
+
+P8의 스냅샷은 전부 호스트 RAM이라 프로세스가 재시작하면 사라진다. `--prefix-cache-dir
+<DIR>`을 주면 `--prefix-cache-disk-gib`(기본 64) LRU 안에서 스냅샷을
+`<DIR>/<key-hash>.ckpt`로 남기고, 기동 시 디렉터리 헤더만 스캔해 인덱스를 재적재한다.
+재시작 뒤 같은 접두가 빈 슬롯에 붙으면 `seq_state_full_set`으로 복원한다.
+
+- 키 = **엔진 빌드 + 가중치 경로/mtime/size + `n_ctx` + 저장 바이트를 바꾸는 설정 +
+  토큰 접두**. 지문이 다르면 파일 헤더가 무시되어 미스가 난다(조용한 오답 방지).
+- 디스크 파일은 **full-state**(base KV + recurrent + indexer)다. `PARTIAL_ONLY`는
+  fresh context에서 비-SWA base가 없어 이어받을 수 없다.
+- **롤백이 필요한 복원은 거부한다.** 복원 길이가 프롬프트보다 짧은 연속(continuation)
+  만 복원하고, 정확 재전송처럼 마지막 토큰을 되감아야 하면 전량 prefill로 폴백한다.
+  되감은 토큰의 QSA/indexer 셀을 재구성할 수 없어 답이 갈리기 때문이다.
+- 저장은 요청 경로 밖(기존 캡처 지점)이고 temp 파일 + rename이다.
+- `--prefix-cache-dir` 미지정이면 RAM 전용(P8) 그대로다. tmpfs/ramfs/overlay면 경고
+  후 RAM으로 폴백한다.
+
+**등급 NUMERIC, 기본 off.** Flash-Next 실측(2x V100, 9965토큰): 재시작 후 연속
+프롬프트 복원은 cold와 message가 byte-identical이고 TTFT가 42.3s → 10.6s(약 4배)
+였습니다(2회 재현). 다만 exact 재전송 1회에서 MTP draft 상태가 스냅샷에 없어 출력이
+갈렸습니다. 그래서 생산 유닛에는 켜지 않고 opt-in으로 둡니다. MTP draft context까지
+저장하는 후속이 필요합니다. 전체 근거는 위키 `p8-host-prefix-snapshots`에 있다.
+
 ## 설정
 
 대부분의 플래그는 `GOLBANG_*` 환경 변수와 동일하다. `--help`가 최종 진실이고,
@@ -267,6 +291,8 @@ prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬
 | `--timeout-secs` | 없음 | 요청 생성 시간 제한 |
 | `--api-key` | 없음 | 반복 또는 콤마. `/metrics` `/models`는 면제 |
 | `--prompt-progress` | on | SSE `prompt_progress` 이벤트 |
+| `--prefix-cache-dir` | 없음 | prefix 스냅샷 디스크 tier. 재시작 후 세션 복원 (HAL-4 #248) |
+| `--prefix-cache-disk-gib` | `64` | 디스크 tier LRU 상한 (GiB). `0`이면 비활성 |
 | `--rpc` / `--tensor-split` | 없음 | llama-server와 동일 의미 (ggml-rpc 오프로드) |
 
 요청 필드: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`,

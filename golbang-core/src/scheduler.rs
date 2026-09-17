@@ -52,6 +52,13 @@ pub struct SchedulerConfig {
     /// Caps reserve `(spec_n_max + 1) * n_active` draft cells from the pool so
     /// a verify step never overruns into another sequence's cells (#8565).
     pub spec_n_max: u32,
+    /// Prefix snapshot disk tier (HAL-4 #248). `None` = RAM only (P8).
+    pub prefix_cache_dir: Option<std::path::PathBuf>,
+    /// Disk tier LRU cap in bytes. `0` = unlimited.
+    pub prefix_cache_disk_bytes: u64,
+    /// Engine/weights/config identity stamped into every disk snapshot.
+    /// Required together with `prefix_cache_dir` to enable the disk tier.
+    pub fingerprint: Option<crate::prefix_cache::SnapshotFingerprint>,
 }
 
 impl Default for SchedulerConfig {
@@ -62,6 +69,9 @@ impl Default for SchedulerConfig {
             default_timeout: None,
             single_max_ctx: 0,
             spec_n_max: 0,
+            prefix_cache_dir: None,
+            prefix_cache_disk_bytes: 0,
+            fingerprint: None,
         }
     }
 }
@@ -201,9 +211,41 @@ async fn run_loop(
     }
 
     let mut slots: Vec<Slot> = (0..n).map(|i| Slot::new(SlotId(i as u32))).collect();
-    let prefix_store = Arc::new(std::sync::Mutex::new(PrefixStore::with_cap(
-        PrefixStore::DEFAULT_MAX_BYTES,
-    )));
+    // HAL-4 #248: optional disk tier under the RAM `PrefixStore`. Without a
+    // dir+fingerprint this is exactly the P8 RAM-only path.
+    let prefix_store = {
+        let ram = || Arc::new(std::sync::Mutex::new(PrefixStore::with_cap(
+            PrefixStore::DEFAULT_MAX_BYTES,
+        )));
+        match (
+            config.prefix_cache_dir.as_deref(),
+            config.fingerprint.clone(),
+        ) {
+            (Some(dir), Some(fp)) if config.prefix_cache_disk_bytes > 0 => {
+                match PrefixStore::with_disk(dir, config.prefix_cache_disk_bytes, fp) {
+                    Ok(store) => {
+                        tracing::info!(
+                            dir = %dir.display(),
+                            disk_bytes = config.prefix_cache_disk_bytes,
+                            entries = store.disk_entries(),
+                            used_bytes = store.disk_bytes(),
+                            "prefix snapshot disk tier enabled"
+                        );
+                        Arc::new(std::sync::Mutex::new(store))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %dir.display(),
+                            "prefix disk tier open failed; RAM only"
+                        );
+                        ram()
+                    }
+                }
+            }
+            _ => ram(),
+        }
+    };
     let n_batch = engine.n_batch().max(1) as usize;
     let n_ubatch = engine.n_ubatch().max(1) as usize;
     let builder = BatchBuilder::new(n_batch);
@@ -604,6 +646,10 @@ trait SeqKv {
     fn seq_state_set(&self, seq: i32, data: &[u8]) -> bool;
     fn rm_seq_from(&self, seq: i32, p0: i32) -> bool;
     fn seq_state_get(&self, seq: i32) -> Option<Vec<u8>>;
+    /// Full sequence snapshot for the disk tier (self-sufficient across a
+    /// fresh context, unlike PARTIAL_ONLY).
+    fn seq_state_full_get(&self, seq: i32) -> Option<Vec<u8>>;
+    fn seq_state_full_set(&self, seq: i32, data: &[u8]) -> bool;
     fn n_ubatch(&self) -> u32;
     fn encode(&self, text: &str) -> crate::error::Result<Vec<Token>>;
     fn tokenize_special(&self, text: &str) -> crate::error::Result<Vec<Token>>;
@@ -632,6 +678,12 @@ impl SeqKv for Engine {
     }
     fn seq_state_get(&self, seq: i32) -> Option<Vec<u8>> {
         Engine::seq_state_get(self, seq)
+    }
+    fn seq_state_full_get(&self, seq: i32) -> Option<Vec<u8>> {
+        Engine::seq_state_full_get(self, seq)
+    }
+    fn seq_state_full_set(&self, seq: i32, data: &[u8]) -> bool {
+        Engine::seq_state_full_set(self, seq, data)
     }
     fn n_ubatch(&self) -> u32 {
         Engine::n_ubatch(self)
@@ -961,45 +1013,81 @@ fn apply_plan(
             }
             if need_chain || promote_key.is_some() {
                 let n_tokens = slot.job.as_ref().map(|j| j.n_past).unwrap_or(0);
+                // HAL-4 #248: the disk tier stores a **full-state** snapshot so a
+                // restarted process can continue from it (PARTIAL_ONLY lacks the
+                // non-SWA base). Persist every anchor that has a prompt key
+                // (the store-stub window plus the prefill end). Full-state
+                // dumps are bounded by the stub window except the prefill end.
+                let anchor_disk_key = promote_key.clone().or_else(|| {
+                    if need_chain {
+                        slot.job
+                            .as_ref()
+                            .and_then(|j| snapshot_key(&j.prompt_tokens, n_tokens))
+                    } else {
+                        None
+                    }
+                });
                 match engine.seq_state_get(slot.id.0 as i32) {
-                    Some(data) if !data.is_empty() => match (need_chain, promote_key) {
-                        (true, Some(key)) => {
-                            if is_store_stub_len(n_tokens) {
-                                slot.prefix_ckpts.retain(|c| {
-                                    !is_store_stub_len(c.n_tokens) || c.n_tokens == n_tokens
-                                });
+                    Some(data) if !data.is_empty() => {
+                        if let Some(key) = anchor_disk_key.as_ref() {
+                            match engine.seq_state_full_get(slot.id.0 as i32) {
+                                Some(full) if !full.is_empty() => {
+                                    let bytes = full.len();
+                                    prefix_store.lock().unwrap().persist(
+                                        key,
+                                        &SeqCheckpoint {
+                                            n_tokens,
+                                            data: full,
+                                        },
+                                    );
+                                    tracing::info!(
+                                        slot = slot.id.0,
+                                        n_tokens,
+                                        bytes,
+                                        "prefix anchor persisted to disk (full state)"
+                                    );
+                                }
+                                _ => tracing::warn!(
+                                    slot = slot.id.0,
+                                    n_tokens,
+                                    "full-state disk snapshot skipped"
+                                ),
                             }
-                            push_prefix_ckpt(slot, n_tokens, data.clone());
-                            let bytes = data.len();
-                            prefix_store
-                                .lock()
-                                .unwrap()
-                                .put(key, SeqCheckpoint { n_tokens, data });
-                            tracing::info!(
-                                slot = slot.id.0,
-                                n_tokens,
-                                bytes,
-                                "host prefix snapshot promoted"
-                            );
                         }
-                        (true, None) => {
-                            push_prefix_ckpt(slot, n_tokens, data);
+                        let ckpt = SeqCheckpoint { n_tokens, data };
+                        match (need_chain, promote_key) {
+                            (true, Some(key)) => {
+                                if is_store_stub_len(n_tokens) {
+                                    slot.prefix_ckpts.retain(|c| {
+                                        !is_store_stub_len(c.n_tokens) || c.n_tokens == n_tokens
+                                    });
+                                }
+                                push_prefix_ckpt(slot, n_tokens, ckpt.data.clone());
+                                let bytes = ckpt.data.len();
+                                prefix_store.lock().unwrap().put(key, ckpt);
+                                tracing::info!(
+                                    slot = slot.id.0,
+                                    n_tokens,
+                                    bytes,
+                                    "host prefix snapshot promoted"
+                                );
+                            }
+                            (true, None) => {
+                                push_prefix_ckpt(slot, n_tokens, ckpt.data);
+                            }
+                            (false, Some(key)) => {
+                                let bytes = ckpt.data.len();
+                                prefix_store.lock().unwrap().put(key, ckpt);
+                                tracing::info!(
+                                    slot = slot.id.0,
+                                    n_tokens,
+                                    bytes,
+                                    "host prefix snapshot promoted"
+                                );
+                            }
+                            (false, None) => {}
                         }
-                        (false, Some(key)) => {
-                            let bytes = data.len();
-                            prefix_store
-                                .lock()
-                                .unwrap()
-                                .put(key, SeqCheckpoint { n_tokens, data });
-                            tracing::info!(
-                                slot = slot.id.0,
-                                n_tokens,
-                                bytes,
-                                "host prefix snapshot promoted"
-                            );
-                        }
-                        (false, None) => {}
-                    },
+                    }
                     _ => tracing::debug!(slot = slot.id.0, "prefix checkpoint skipped"),
                 }
             }
@@ -2249,23 +2337,24 @@ fn restore_host_snapshot(
     if search_len == 0 {
         return None;
     }
-    let host_ckpt = {
+    let (host_ckpt, from_disk) = {
         let mut store = prefix_store.lock().unwrap();
-        match store.find_best_for_bind(prompt, reuse_len) {
-            Some(ckpt) => ckpt,
-            None => {
-                if let Some(diag) = store.miss_diag(prompt) {
-                    tracing::warn!(
-                        slot = slot.id.0,
-                        reuse_len,
-                        search_len,
-                        lcp = diag.max_lcp,
-                        store_ns = ?diag.store_ns,
-                        "host snapshot miss"
-                    );
-                }
-                return None;
+        if let Some(ckpt) = store.find_best_ram_for_bind(prompt, reuse_len) {
+            (ckpt, false)
+        } else if let Some(ckpt) = store.find_disk_for_bind(prompt, reuse_len) {
+            (ckpt, true)
+        } else {
+            if let Some(diag) = store.miss_diag(prompt) {
+                tracing::warn!(
+                    slot = slot.id.0,
+                    reuse_len,
+                    search_len,
+                    lcp = diag.max_lcp,
+                    store_ns = ?diag.store_ns,
+                    "host snapshot miss"
+                );
             }
+            return None;
         }
     };
     tracing::info!(
@@ -2273,17 +2362,82 @@ fn restore_host_snapshot(
         reuse_len,
         search_len,
         host_n = host_ckpt.n_tokens,
+        from_disk,
         gpu_n,
         gpu_after = engine.n_past_seq(seq),
         "host snapshot restore"
     );
     engine.clear_seq(seq);
+    if from_disk {
+        // Disk entries are **full-state** snapshots, faithful on a fresh
+        // context only when nothing is rolled back: restore exactly
+        // `n_tokens` and prefill the suffix. A rollback (prompt no longer than
+        // the dump, e.g. an exact resend) re-runs a token whose QSA/indexer
+        // cell cannot be reconstructed and silently diverges, so fall back to
+        // full prefill instead.
+        if host_ckpt.n_tokens as usize > search_len {
+            tracing::warn!(
+                slot = slot.id.0,
+                reuse_len,
+                search_len,
+                host_n = host_ckpt.n_tokens,
+                "disk snapshot needs a rollback; full prefill"
+            );
+            engine.clear_seq(seq);
+            prune_chain_beyond_reuse(slot, 0);
+            return None;
+        }
+        if !engine.seq_state_full_set(seq, &host_ckpt.data) {
+            tracing::warn!(
+                slot = slot.id.0,
+                host_n = host_ckpt.n_tokens,
+                "full-state disk restore failed; full prefill"
+            );
+            engine.clear_seq(seq);
+            prune_chain_beyond_reuse(slot, 0);
+            return None;
+        }
+        let kept = host_ckpt.n_tokens as usize;
+        if engine.n_past_seq(seq) == 0 {
+            tracing::warn!(
+                slot = slot.id.0,
+                host_n = host_ckpt.n_tokens,
+                "full-state disk restore reports an empty sequence; full prefill"
+            );
+            engine.clear_seq(seq);
+            prune_chain_beyond_reuse(slot, 0);
+            return None;
+        }
+        tracing::info!(
+            slot = slot.id.0,
+            reuse_len = kept,
+            host_n = host_ckpt.n_tokens,
+            gpu_after = engine.n_past_seq(seq),
+            "host snapshot restored (full state, no rollback)"
+        );
+        prune_chain_beyond_reuse(slot, kept);
+        return Some(kept);
+    }
+    // In-process RAM entries are PARTIAL_ONLY: the non-SWA base is still
+    // resident in this context, so a rollback via `trim_seq_to` is valid.
     if !engine.seq_state_set(seq, &host_ckpt.data) {
         tracing::warn!(
             slot = slot.id.0,
             reuse_len,
             host_n = host_ckpt.n_tokens,
             "host snapshot restore failed; full prefill"
+        );
+        engine.clear_seq(seq);
+        prune_chain_beyond_reuse(slot, 0);
+        return None;
+    }
+    let kept = search_len.min(host_ckpt.n_tokens as usize);
+    if engine.n_past_seq(seq) == 0 {
+        tracing::warn!(
+            slot = slot.id.0,
+            reuse_len,
+            host_n = host_ckpt.n_tokens,
+            "partial restore incomplete; full prefill"
         );
         engine.clear_seq(seq);
         prune_chain_beyond_reuse(slot, 0);
@@ -2296,7 +2450,6 @@ fn restore_host_snapshot(
             "host snapshot leftover sweep failed"
         );
     }
-    let kept = search_len.min(host_ckpt.n_tokens as usize);
     if trim_seq_to(engine, seq, kept) {
         tracing::info!(
             slot = slot.id.0,
@@ -2736,6 +2889,23 @@ mod tests {
             self.inner.lock().unwrap().state.get(&seq).cloned()
         }
 
+        fn seq_state_full_get(&self, seq: i32) -> Option<Vec<u8>> {
+            // Tests store opaque dumps; full == partial here. Production
+            // captures a larger, self-sufficient blob.
+            self.inner.lock().unwrap().state.get(&seq).cloned()
+        }
+
+        fn seq_state_full_set(&self, seq: i32, data: &[u8]) -> bool {
+            if data.is_empty() {
+                return false;
+            }
+            let mut g = self.inner.lock().unwrap();
+            g.seq_state_set_count = g.seq_state_set_count.saturating_add(1);
+            g.state.insert(seq, data.to_vec());
+            g.n_past.insert(seq, data.len() as u32);
+            true
+        }
+
         fn n_ubatch(&self) -> u32 {
             self.inner.lock().unwrap().n_ubatch
         }
@@ -3142,6 +3312,133 @@ mod tests {
         let job = slot.job.as_ref().expect("slot occupied");
         assert_eq!(job.prompt_offset, 0, "no store hit → full prefill");
         assert_eq!(job.n_past, 0);
+    }
+
+    // ── HAL-4 #248: disk tier restore across a process restart ─────────────
+
+    fn disk_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "golbang-sched-disk-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn disk_fp(tag: &str) -> crate::prefix_cache::SnapshotFingerprint {
+        crate::prefix_cache::SnapshotFingerprint::new("golbang-test", "/m.gguf", 1, 2, 4096, tag)
+    }
+
+    #[test]
+    fn disk_prefix_store_reload_restores_via_seq_state_set() {
+        // Arrange: capture the tool-head dump on the disk tier, then drop the
+        // store to simulate a unit restart (RAM gone, files remain).
+        let dir = disk_temp_dir("reload");
+        let (head, prompt) = tool_head_and_prompt();
+        {
+            let mut store = PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap();
+            store.persist(&head, &ckpt_n(12_288, 0xAB));
+        }
+
+        // Act: a fresh store on the same dir must reload the index, and an
+        // empty-slot bind must restore through `seq_state_set`.
+        let store = Arc::new(std::sync::Mutex::new(
+            PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap(),
+        ));
+        assert_eq!(store.lock().unwrap().disk_entries(), 1, "index reloaded");
+        let mut slot = Slot::new(SlotId(0));
+        let kv = FakeSeqKv::new();
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+
+        assert!(bound, "bind with disk-store hit must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(job.prompt_offset, 12_288, "restored from disk dump");
+        assert_eq!(kv.n_past_seq(0), 12_288);
+        assert_eq!(kv.seq_state_set_count(), 1, "restore used seq_state_set");
+        assert_eq!(
+            kv.seq_state_get(0),
+            Some(vec![0xAB; 12_288]),
+            "disk bytes match the RAM-tier dump"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_snapshot_requiring_rollback_full_prefills() {
+        // Disk snapshots are only faithful with no rollback. An exact resend
+        // (prompt == dump) would need to drop the last token and re-decode it,
+        // which diverges on the hybrid/indexer runtime, so it must full-prefill.
+        let dir = disk_temp_dir("rollback");
+        let prompt: Vec<Token> = (0..300).map(|i| (i % 7) as Token).collect();
+        {
+            let mut store = PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap();
+            store.persist(&prompt, &ckpt_n(300, 0x42));
+        }
+        let store = Arc::new(std::sync::Mutex::new(
+            PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap(),
+        ));
+        let mut slot = Slot::new(SlotId(0));
+        let kv = FakeSeqKv::new();
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+        assert!(bound);
+        let job = slot.job.as_ref().unwrap();
+        assert_eq!(job.prompt_offset, 0, "rollback hit must be refused");
+        assert_eq!(kv.seq_state_set_count(), 0, "no restore attempt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_and_ram_restore_are_identical() {
+        // Same dump through RAM and through disk → same reuse length/bytes.
+        let dir = disk_temp_dir("parity");
+        let (head, prompt) = tool_head_and_prompt();
+
+        let ram_store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        ram_store
+            .lock()
+            .unwrap()
+            .put(head.clone(), ckpt_n(12_288, 0x9C));
+        let mut ram_slot = Slot::new(SlotId(0));
+        let ram_kv = FakeSeqKv::new();
+        assert!(bind_slot(
+            &mut ram_slot,
+            job_with_tokens(prompt.clone()),
+            &ram_kv,
+            40_000,
+            &ram_store
+        ));
+        let ram_job = ram_slot.job.as_ref().unwrap();
+        let ram_off = ram_job.prompt_offset;
+        let ram_state = ram_kv.seq_state_get(0);
+
+        let mut disk = PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap();
+        disk.persist(&head, &ckpt_n(12_288, 0x9C));
+        drop(disk);
+        let disk_store = Arc::new(std::sync::Mutex::new(
+            PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap(),
+        ));
+        let mut disk_slot = Slot::new(SlotId(0));
+        let disk_kv = FakeSeqKv::new();
+        assert!(bind_slot(
+            &mut disk_slot,
+            job_with_tokens(prompt),
+            &disk_kv,
+            40_000,
+            &disk_store
+        ));
+        let disk_job = disk_slot.job.as_ref().unwrap();
+
+        assert_eq!(disk_job.prompt_offset, ram_off, "reuse length parity");
+        assert_eq!(
+            disk_kv.seq_state_get(0),
+            ram_state,
+            "restored bytes must be identical"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
