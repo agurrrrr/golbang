@@ -3,6 +3,7 @@ pub mod metrics;
 pub mod routes;
 pub mod sse;
 pub mod types;
+pub mod webui;
 
 use axum::extract::Request;
 use axum::middleware::{self, Next};
@@ -37,22 +38,29 @@ pub struct AppState {
     /// llama-server `return_progress` default (`--prompt-progress`).
     pub prompt_progress: bool,
     pub created: u64,
+    /// Serve the embedded minimal UI at `GET /` (`--webui`).
+    pub webui: bool,
 }
 
 pub fn router(state: AppState) -> axum::Router {
-    axum::Router::new()
+    let mut app = axum::Router::new()
         .route(
             "/v1/chat/completions",
             axum::routing::post(routes::chat_completions),
         )
         .route("/models", axum::routing::get(routes::list_models))
         .route("/v1/models", axum::routing::get(routes::list_models))
-        .route("/metrics", axum::routing::get(metrics::metrics))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            api_key_middleware,
-        ))
-        .with_state(state)
+        .route("/metrics", axum::routing::get(metrics::metrics));
+    if state.webui {
+        app = app
+            .route("/", axum::routing::get(webui::index))
+            .route("/index.html", axum::routing::get(webui::index));
+    }
+    app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        api_key_middleware,
+    ))
+    .with_state(state)
 }
 
 async fn api_key_middleware(
@@ -69,6 +77,8 @@ async fn api_key_middleware(
         || path == "/v1/health"
         || path == "/models"
         || path == "/v1/models"
+        || path == "/"
+        || path == "/index.html"
     {
         return Ok(next.run(req).await);
     }

@@ -63,6 +63,7 @@ async fn serve_with(model: Model, n_parallel: u32, queue_size: usize, chat: Chat
         model_card,
         prompt_progress: true,
         created: 1,
+        webui: true,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();

@@ -219,6 +219,19 @@ struct Args {
     )]
     prompt_progress: bool,
 
+    /// Serve the embedded minimal web UI at `GET /` (API key + speed stats +
+    /// smoke chat). Static HTML is embedded at compile time from `webui/`.
+    /// The page itself needs no key; `/v1/chat/completions` still does.
+    #[arg(
+        long,
+        env = "GOLBANG_WEBUI",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    webui: bool,
+
     /// Prefix snapshot disk tier (HAL-4 #248). Empty = RAM only (P8). Should be
     /// a durable filesystem (tmpfs/overlay disables the tier); the directory is
     /// scanned at startup so a restart can restore sessions.
@@ -679,6 +692,7 @@ async fn main() -> Result<()> {
         model_card,
         prompt_progress: args.prompt_progress,
         created: golbang_server::sse::unix_ts(),
+        webui: args.webui,
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

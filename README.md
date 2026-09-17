@@ -30,6 +30,7 @@ golbang이 노리는 지점은 처리량이 아니라 **스케줄 정책·취소
 - [무엇을 서빙하나 (MI50와 V100)](#무엇을-서빙하나-mi50와-v100)
 - [빠른 시작](#빠른-시작)
 - [기능](#기능)
+- [내장 웹 UI (`--webui`)](#내장-웹-ui---webui)
 - [프리필 단축: 호스트 접두 스냅샷 (P8)](#프리필-단축-호스트-접두-스냅샷-p8)
 - [설정](#설정)
 - [빌드 (백엔드별)](#빌드-백엔드별)
@@ -199,9 +200,32 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
   `requests_deferred`, `prompt_tokens_cached_total` 등)도 같은 값으로 내보내 llama.cpp/llama-swap
   대시보드가 수정 없이 읽는다
 - `--prompt-progress`(기본 on) — SSE에 llama-server식 `prompt_progress`를 실어 긴 프리필 동안 연결 유지
+- **내장 웹 UI** (`--webui`, 기본 on) — `GET /`에서 최소 스모크 UI를 제공한다. API 키 설정,
+  `/metrics` 기반 실시간 추론 속도(prefill/decode tok/s, 캐시 재사용률, 대기열, 503), 그리고
+  응답마다 그 요청의 `timings`를 보여 주는 간단한 채팅만 있다. Svelte 정적 빌드를
+  `include_bytes!`로 바이너리에 넣으므로 런타임 파일도, 빌드 시 Node도 필요 없다. 정적 HTML은
+  비인증으로 공개되지만 `/v1/chat/completions`는 여전히 키를 요구한다
 - `--api-key` / `--alias` / `--rpc` / `--tensor-split` — llama-server와 같은 의미
 
 **없는 것:** embeddings, rerank, `fifo` 이외 스케줄 정책, 순수 Rust GPU 커널(P6 gate 실패로 닫힘).
+내장 웹 UI는 스모크 확인용 최소 기능뿐이고, 세션·RAG·멀티모델은 Open WebUI 같은 외부 클라이언트에 맡긴다.
+
+## 내장 웹 UI (`--webui`)
+
+llama-server처럼 "서버를 띄우면 브라우저에서 바로 확인"하는 경로를 골뱅에도 둔다. 다만
+범위는 **배포 직후 모델이 살아 있는지 3초 만에 확인하는 스모크 UI**로 좁혔다. 기능은 셋뿐이다.
+
+1. **API 키 설정** — 브라우저 `localStorage`에만 저장하고 `Authorization: Bearer …`로 전달한다.
+2. **추론 속도 통계** — `/metrics`를 폴링해 prefill/decode tok/s, 캐시 재사용률, 드래프트 수락률,
+   처리 중/대기열, 슬롯 점유, 503, 유효 `n_ctx`, 큐 깊이를 보여 준다.
+3. **스모크 채팅** — 요청을 실제로 만들어 통계를 움직여 보고, 응답마다 `timings`
+   (prompt/predicted tok/s, 캐시 히트, 드래프트 수락)와 `reasoning_content`를 표시한다.
+
+원본은 [`webui/`](webui/)에 있는 Svelte + Vite 앱이고, `vite-plugin-singlefile`로 단일
+`webui/dist/index.html`을 만들어 리포지토리에 커밋한다. `golbang-server`는 이 파일을
+`include_bytes!`로 넣으므로 **최종 바이너리 빌드에는 Node가 필요 없다.** UI를 고칠 때만
+`cd webui && npm install && npm run build`로 다시 만들고 `dist/index.html`을 함께 커밋한다.
+`--webui false`(또는 `GOLBANG_WEBUI=false`)로 라우트를 끌 수 있다.
 
 ## 프리필 단축: 호스트 접두 스냅샷 (P8)
 
@@ -413,6 +437,8 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
   답변 공간을 남긴다.
 - **비전 prefix.** 이미지 요청은 슬롯 KV를 비운다 (prefix hit 없음).
 - **단일 모델.** 프로세스당 모델 하나. 멀티 모델 게이트웨이는 범위 밖이다.
+- **내장 웹 UI는 스모크용.** 세션 저장·RAG·멀티모델·도구 편집은 없다. 그런 작업은 Open WebUI 같은
+  외부 클라이언트에 맡긴다. UI 자산은 커밋된 빌드 산출물이라, 고칠 때만 Node로 다시 빌드한다.
 - **gfx906 실험실 산물.** MI50/V100 외 세대(3090, MI210 등)에서는 테스트가 부족하다.
 
 ## 문서

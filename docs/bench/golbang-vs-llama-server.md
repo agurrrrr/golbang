@@ -221,7 +221,7 @@ llama-server도 continuous batching이 **기본**이다.
 | 스케줄 루프가 `llama_decode`에 동기 결합. 정책 교체가 C++ 내부 | `SchedulePolicy` trait (`join` / `evict` / `rank`). 기본 FIFO |
 | 과부하 시 내부 큐에 쌓임 | bounded `mpsc::try_send` → **즉시 503 + Retry-After** |
 | 취소는 decode 경계까지 대기 | 핸들러는 즉시 `CancellationToken`. 슬롯 회수는 같은 하한(decode 1회) |
-| 임베딩/rerank/스펙큘/웹 UI까지 한 프로세스 | 채팅 스트리밍 + 메트릭만 |
+| 임베딩/rerank/스펙큘/슬롯 UI까지 한 프로세스 | 채팅 스트리밍 + 메트릭 + 최소 스모크 UI(`--webui`) |
 
 join의 정의도 같다: **이번 `llama_decode`가 돌아온 직후** 빈 슬롯에 넣는다.
 골뱅 로그: `join after decode boundary`. GPU 워커만 `spawn_blocking`.
@@ -372,7 +372,7 @@ gfx906 + 이 모델 + OpenAI 채팅만 보면 고장면이 적다.
 | ~2.5k 전량 prefill | **llama-server** (126 vs 84 tok/s). `-ub 5800` + 신 SHA |
 | decode tok/s | **동률** (~8). 차이는 노이즈 |
 | 다턴 prefix 체감 | **동률** (양쪽 cache_n ≈ 2540, 2턴 wall 6초 전후) |
-| 기능 폭 | **llama-server** (`/props`, 슬롯 UI, 임베딩, 샘플러 옵션) |
+| 기능 폭 | **llama-server** (`/props`, 임베딩, 샘플러 옵션). 골뱅의 내장 UI는 API 키·속도 통계·스모크 채팅뿐 |
 | `/health` | **llama-server** |
 | 신 트리 추적 | **llama-server** (`e700bfb37`). 골뱅은 고의로 핀 |
 | GPU 커널 | **동일 계열** ggml-hip. 골뱅은 더 오래된 SHA |
