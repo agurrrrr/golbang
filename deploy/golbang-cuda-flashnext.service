@@ -35,6 +35,13 @@ Environment=RUST_LOG=info
 # offsets the CPU expert union cost. Output is valid but not bit-identical to
 # no-spec greedy (batched-verify numerics). Needs the PR #28243 runtime
 # (EXPECTED_SHA_CUDA 1c4cfda6c); the draft rides on CUDA1 (~5.4 GiB, ~2 GiB free).
+# Prompt lookup (`--spec-type draft-mtp,prompt-lookup`, #247) copies the tail of
+# an earlier suffix. On this unit it lifts copy-heavy mean accepted length
+# 2.99 -> 3.72 but decode only 35.4 -> 35.8 tok/s (+1.1%) because the verify
+# batch grows 3 -> 4 and CPU experts cancel the gain; prose is flat. Left off by
+# default. If enabled, n_rs_seq is raised to max(n_max, pld_k) automatically --
+# without that the scheduler snapshots 115 MiB every verify step (35 -> 19 t/s).
+# See docs/bench/pld-flashnext.md.
 # n-threads 16 vs 32 is noise.
 # Measured on 2x V100 + EPYC 7452 (mmap, page cache warm):
 #   prefill 234 tok/s @ 80k prompt (258 tok/s @ 7k), decode ~22 tok/s short / ~15.4 tok/s @ 80k.

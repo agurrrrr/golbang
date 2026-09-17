@@ -62,6 +62,10 @@ impl Engine {
         self.lock().spec_n_max()
     }
 
+    pub fn spec_wants_pld(&self) -> bool {
+        self.lock().spec_wants_pld()
+    }
+
     pub fn n_rs_seq(&self) -> u32 {
         self.lock().n_rs_seq()
     }
@@ -171,9 +175,10 @@ impl Engine {
         id_last: Token,
         n_past: i32,
         n_max: i32,
+        pld_ok: bool,
     ) -> Vec<Token> {
         self.lock()
-            .spec_draft(seq_id, prompt, id_last, n_past, n_max)
+            .spec_draft(seq_id, prompt, id_last, n_past, n_max, pld_ok)
     }
 
     pub fn spec_accept(&self, seq_id: i32, n_accepted: u16) {

@@ -12,7 +12,7 @@ use golbang_sys::*;
 
 use crate::error::{Error, Result};
 use crate::generate::{Generate, GenerateParams};
-use crate::speculative::{NgramMod, SpecParams, SpecType, topk_mode};
+use crate::speculative::{NgramMod, SpecParams, SpecType, pld_draft, spec_rs_need, topk_mode};
 use crate::tokenizer::{Token, Tokenizer};
 use crate::vision::{TokenizedVision, Vision};
 
@@ -211,8 +211,12 @@ impl Model {
         // llama-server: cparams.n_rs_seq = speculative.need_n_rs_seq() == n_max
         // when draft-mtp is on. n_rs_seq=1 cannot rewind a 3-token reject, so
         // the scheduler copied ~150 MiB PARTIAL_ONLY state every verify step.
-        let n_rs_seq = if params.spec.wants_mtp() {
-            params.n_rs_seq.max(params.spec.n_max.max(0) as u32)
+        // PLD extends the MTP chain (and can run alone), so its `pld_k` raises
+        // the rollback depth too; otherwise a `max(n_max, pld_k)`-token reject
+        // triggers that snapshot every step (#247).
+        let rs_need = spec_rs_need(&params.spec);
+        let n_rs_seq = if rs_need > 0 {
+            params.n_rs_seq.max(rs_need)
         } else {
             params.n_rs_seq
         };
@@ -221,7 +225,8 @@ impl Model {
                 from = params.n_rs_seq,
                 to = n_rs_seq,
                 n_max = params.spec.n_max,
-                "n_rs_seq raised to spec n_max (llama need_n_rs_seq)"
+                pld_k = params.spec.pld_k,
+                "n_rs_seq raised to spec n_max/pld_k (llama need_n_rs_seq)"
             );
         }
         tracing::info!(
@@ -510,6 +515,10 @@ impl Model {
 
     pub fn spec_n_max(&self) -> i32 {
         self.spec.params.verify_n_max()
+    }
+
+    pub fn spec_wants_pld(&self) -> bool {
+        self.spec.params.wants_pld()
     }
 
     pub fn n_rs_seq(&self) -> u32 {
@@ -994,6 +1003,7 @@ impl Model {
         id_last: Token,
         n_past: i32,
         n_max: i32,
+        pld_ok: bool,
     ) -> Vec<Token> {
         let n_budget = n_max.max(0) as usize;
         if n_budget == 0 {
@@ -1009,21 +1019,60 @@ impl Model {
             *slot = None;
         }
         // llama `common_speculative_draft`: first non-empty impl in --spec-type
-        // order wins. Production is `draft-mtp,ngram-mod` (MTP then ngram).
+        // order opens the draft. PLD then extends whatever chain is open, so
+        // `draft-mtp,pld` yields MTP tokens followed by a looked-up tail.
         let types = self.spec.params.types.clone();
+        let mut drafted: Vec<Token> = Vec::new();
+        let mut last: Option<SpecType> = None;
         for t in types {
-            let drafted = match t {
-                SpecType::NgramMod => self.draft_ngram(seq_id, prompt, id_last, n_budget),
-                SpecType::DraftMtp => self.draft_mtp(seq_id, id_last, n_past, n_budget),
-            };
-            if !drafted.is_empty() {
-                if let Some(slot) = self.spec.last_draft.get_mut(seq_id.max(0) as usize) {
-                    *slot = Some(t);
+            match t {
+                SpecType::NgramMod => {
+                    if drafted.is_empty() {
+                        let d = self.draft_ngram(seq_id, prompt, id_last, n_budget);
+                        if !d.is_empty() {
+                            drafted = d;
+                            last = Some(t);
+                        }
+                    }
                 }
-                return drafted;
+                SpecType::DraftMtp => {
+                    if drafted.is_empty() {
+                        let d = self.draft_mtp(seq_id, id_last, n_past, n_budget);
+                        if !d.is_empty() {
+                            drafted = d;
+                            last = Some(t);
+                        }
+                    }
+                }
+                SpecType::PromptLookup => {
+                    if !pld_ok {
+                        continue;
+                    }
+                    let remain = n_budget.saturating_sub(drafted.len());
+                    if remain == 0 {
+                        continue;
+                    }
+                    let d = pld_draft(
+                        prompt,
+                        id_last,
+                        &drafted,
+                        self.spec.params.pld_n as usize,
+                        self.spec.params.pld_k as usize,
+                        remain,
+                    );
+                    if !d.is_empty() {
+                        drafted.extend(d);
+                        last.get_or_insert(t);
+                    }
+                }
             }
         }
-        Vec::new()
+        if let Some(t) = last {
+            if let Some(slot) = self.spec.last_draft.get_mut(seq_id.max(0) as usize) {
+                *slot = Some(t);
+            }
+        }
+        drafted
     }
 
     fn draft_ngram(

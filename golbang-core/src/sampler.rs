@@ -47,6 +47,12 @@ impl Sampler {
         }
     }
 
+    /// temperature <= 0.0 is argmax (`sample` returns `argmax`). PLD is gated
+    /// to greedy steps so its copy proposal matches the target's choice.
+    pub fn greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     /// Sample one token id from a full-vocab logits row.
     pub fn sample(&mut self, logits: &[f32]) -> Token {
         assert!(!logits.is_empty(), "empty logits");

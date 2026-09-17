@@ -16,7 +16,7 @@
 //! ```
 //!
 //! `spec_n_max` is `SpecParams::verify_n_max()` (ngram-mod 64, MTP-only 3,
-//! 0 = spec off). The extra cell is the sampled token that sits in front of
+//! prompt-lookup `pld_k` (default 3), 0 = spec off). The extra cell is the sampled token that sits in front of
 //! the draft batch. Grown occupancy is never reduced. A solo slot may grow
 //! to `S` so a second slot still has `T - S` cells; when both are below the
 //! fair share they split `T_usable` evenly.

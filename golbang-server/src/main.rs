@@ -159,6 +159,14 @@ struct Args {
     #[arg(long, env = "GOLBANG_SPEC_NGRAM_N_MIN", default_value_t = 1)]
     spec_ngram_n_min: i32,
 
+    /// Prompt-lookup suffix length (`HALOGEN_PLD` N, default 3).
+    #[arg(long, env = "GOLBANG_SPEC_PLD_N", default_value_t = 3)]
+    spec_pld_n: u32,
+
+    /// Prompt-lookup continuation draft length (`HALOGEN_PLD` K, default 3).
+    #[arg(long, env = "GOLBANG_SPEC_PLD_K", default_value_t = 3)]
+    spec_pld_k: u32,
+
     /// Min MTP draft probability (llama-server `--spec-draft-p-min`).
     #[arg(long, env = "GOLBANG_SPEC_DRAFT_P_MIN", default_value_t = 0.90)]
     spec_draft_p_min: f32,
@@ -293,6 +301,8 @@ async fn main() -> Result<()> {
         p_min: args.spec_draft_p_min.clamp(0.0, 1.0),
         ngram_n_max: args.spec_ngram_n_max.max(0),
         ngram_n_min: args.spec_ngram_n_min.max(0),
+        pld_n: args.spec_pld_n,
+        pld_k: args.spec_pld_k,
         cache_type_k: parse_ggml_type(&args.spec_draft_type_k).map_err(anyhow::Error::msg)?,
         cache_type_v: parse_ggml_type(&args.spec_draft_type_v).map_err(anyhow::Error::msg)?,
     };
@@ -339,6 +349,8 @@ async fn main() -> Result<()> {
             n_max = spec.n_max,
             ngram_n_max = spec.ngram_n_max,
             ngram_n_min = spec.ngram_n_min,
+            pld_n = spec.pld_n,
+            pld_k = spec.pld_k,
             verify_n_max = spec.verify_n_max(),
             p_min = spec.p_min,
             "speculative decoding enabled"

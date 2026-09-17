@@ -20,7 +20,7 @@ use crate::generate::{FinishReason, GenerateParams, GeneratedToken, stop_cut_len
 use crate::policy::{EmptySlotView, IterationBudget, SchedulePolicy, SlotView, WaitingJobView};
 use crate::prefix_cache::{PrefixStore, common_prefix_len, host_search_len, snapshot_key};
 use crate::slot::{ActiveJob, SeqCheckpoint, Slot, SlotEvent, SlotId, SlotPhase, SlotTimings};
-use crate::speculative::accept_drafts;
+use crate::speculative::{accept_drafts, pld_allowed};
 use crate::tokenizer::Token;
 use crate::tools::{DsmlNameGuard, dsml_invoke_name_eq_text};
 
@@ -1384,11 +1384,15 @@ struct DraftJob {
     id_last: Token,
     n_past: i32,
     n_max: i32,
+    /// Prompt lookup is enabled for this step (greedy, solo, `--spec-type`).
+    pld_ok: bool,
 }
 
 fn take_draft_jobs(slots: &mut [Slot], engine: &Engine) -> Vec<DraftJob> {
     let spec_on = engine.spec_enabled();
     let spec_n_max = if spec_on { engine.spec_n_max() } else { 0 };
+    let wants_pld = engine.spec_wants_pld();
+    let n_active = slots.iter().filter(|s| s.is_active()).count() as u32;
     let mut jobs = Vec::new();
     for slot in slots.iter_mut() {
         let seq = slot.id.0 as i32;
@@ -1434,6 +1438,7 @@ fn take_draft_jobs(slots: &mut [Slot], engine: &Engine) -> Vec<DraftJob> {
             id_last,
             n_past: job.n_past as i32,
             n_max,
+            pld_ok: pld_allowed(wants_pld, job.sampler.greedy(), n_active),
         });
     }
     jobs
@@ -1443,7 +1448,7 @@ fn fill_drafts_sync(slots: &mut [Slot], engine: &Engine) {
     let reqs = take_draft_jobs(slots, engine);
     for r in reqs {
         let t0 = Instant::now();
-        let drafts = engine.spec_draft(r.seq, &r.hist, r.id_last, r.n_past, r.n_max);
+        let drafts = engine.spec_draft(r.seq, &r.hist, r.id_last, r.n_past, r.n_max, r.pld_ok);
         if let Some(slot) = slots.iter_mut().find(|s| s.id == r.slot_id) {
             if let Some(job) = slot.job.as_mut() {
                 if job.finish.is_some() {
@@ -1463,7 +1468,7 @@ fn maybe_fill_drafts(slot: &mut Slot, engine: &Engine) {
         return;
     };
     let t0 = Instant::now();
-    let drafts = engine.spec_draft(r.seq, &r.hist, r.id_last, r.n_past, r.n_max);
+    let drafts = engine.spec_draft(r.seq, &r.hist, r.id_last, r.n_past, r.n_max, r.pld_ok);
     if let Some(job) = slot.job.as_mut() {
         job.drafts = drafts;
         job.spec_us_draft += t0.elapsed().as_micros() as u64;

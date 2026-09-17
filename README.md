@@ -189,7 +189,11 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
   `chat_template_kwargs.*`)을 읽는다
 - **tool calls** — 요청 `tools`를 템플릿에 주입, DSML/Qwen/Hermes 출력을 OpenAI `tool_calls`로 재파싱
 - **vision** — `--mmproj`로 `image_url` / `input_image` (`mtmd`)
-- **speculative decoding** — `--spec-type draft-mtp,ngram-mod`. 타깃에서 `[sampled, draft…]` 검증
+- **speculative decoding** — `--spec-type draft-mtp,ngram-mod,prompt-lookup`. 타깃에서 `[sampled, draft…]` 검증.
+  PLD(prompt lookup)는 greedy·단독 생성일 때만 켜지고, 마지막 `N`토큰 접미의 이전 출현 뒤 `K`토큰을
+  MTP 사슬 뒤에 이어 붙인다(halogen 방식). 복사 중심 턴에서 mean accepted length가 늘지만
+  Flash-Next처럼 MTP가 이미 포화된 유닛에서는 decode 이득이 1% 수준이라 기본 off다
+  (`docs/bench/pld-flashnext.md`, 이슈 #247)
 - `/metrics` — Prometheus. 토큰, TTFT/ITL 히스토그램, draft accept, 슬롯 점유, 503.
   `llamacpp:` 별칭(`prompt_tokens_total`, `tokens_predicted_total`, `requests_processing`,
   `requests_deferred`, `prompt_tokens_cached_total` 등)도 같은 값으로 내보내 llama.cpp/llama-swap
@@ -256,8 +260,9 @@ prefill하면 30k~70k 토큰을 몇 분씩 다시 계산한다. P5가 같은 슬
 | `--reasoning-format` | `none` | `none` \| `deepseek` \| `deepseek-legacy` \| `auto` |
 | `--reasoning-effort` / `--reasoning-budget` | 템플릿 기본 / answer room | think 제어. 요청이 budget을 명시하지 않으면 `max(1024, 15%)`를 답변용으로 남긴다 |
 | `--mmproj` | 없음 | CLIP/projector GGUF (vision) |
-| `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod` (콤마) |
+| `--spec-type` | 빈 값 | `draft-mtp`, `ngram-mod`, `prompt-lookup`/`pld` (콤마) |
 | `--spec-draft-n-max` / `--spec-draft-p-min` | `3` / `0.90` | MTP draft 상한 / 최소 확률 |
+| `--spec-pld-n` / `--spec-pld-k` | `3` / `3` | prompt lookup 접미 길이 / 연속 초안 길이 (greedy·단독 시만) |
 | `--policy` | `fifo` | 현재 `fifo`만 구현. trait은 교체 가능 |
 | `--timeout-secs` | 없음 | 요청 생성 시간 제한 |
 | `--api-key` | 없음 | 반복 또는 콤마. `/metrics` `/models`는 면제 |

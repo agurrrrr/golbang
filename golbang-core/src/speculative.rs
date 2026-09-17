@@ -1,4 +1,5 @@
-//! draft-mtp + ngram-mod, matching llama-server `--spec-type draft-mtp,ngram-mod`.
+//! draft-mtp + ngram-mod + prompt-lookup, matching llama-server
+//! `--spec-type draft-mtp,ngram-mod,prompt-lookup`.
 //!
 //! Verification is: decode `[sampled, draft…]` on the target, then sample each
 //! row until a mismatch. The last sampled token (mismatch or bonus) is not yet
@@ -16,6 +17,9 @@ use crate::tokenizer::Token;
 pub enum SpecType {
     DraftMtp,
     NgramMod,
+    /// Prompt lookup (PLD): copy the tokens that followed an earlier occurrence
+    /// of the trailing `pld_n` tokens. halogen `HALOGEN_PLD=3,3`.
+    PromptLookup,
 }
 
 impl SpecType {
@@ -35,8 +39,9 @@ impl SpecType {
         match s.trim().to_ascii_lowercase().as_str() {
             "draft-mtp" | "mtp" => Ok(Self::DraftMtp),
             "ngram-mod" => Ok(Self::NgramMod),
+            "prompt-lookup" | "pld" => Ok(Self::PromptLookup),
             other => Err(format!(
-                "unsupported --spec-type {other} (golbang implements draft-mtp,ngram-mod)"
+                "unsupported --spec-type {other} (golbang implements draft-mtp,ngram-mod,prompt-lookup)"
             )),
         }
     }
@@ -45,6 +50,7 @@ impl SpecType {
         match self {
             Self::DraftMtp => "draft-mtp",
             Self::NgramMod => "ngram-mod",
+            Self::PromptLookup => "prompt-lookup",
         }
     }
 }
@@ -60,6 +66,10 @@ pub struct SpecParams {
     pub ngram_n_max: i32,
     /// ngram-mod `n_min` (llama-server default 48). Shorter hits are dropped.
     pub ngram_n_min: i32,
+    /// Prompt-lookup suffix length (`HALOGEN_PLD` N, default 3).
+    pub pld_n: u32,
+    /// Prompt-lookup continuation draft length (`HALOGEN_PLD` K, default 3).
+    pub pld_k: u32,
     pub cache_type_k: u32,
     pub cache_type_v: u32,
 }
@@ -74,6 +84,8 @@ impl Default for SpecParams {
             // llama default is 48. On a cold table MTP-fail steps then draft
             // 0 tokens (~10 t/s holes). 1 lets a short ngram fill those.
             ngram_n_min: 1,
+            pld_n: 3,
+            pld_k: 3,
             cache_type_k: golbang_sys::GGML_TYPE_Q8_0 as u32,
             cache_type_v: golbang_sys::GGML_TYPE_Q8_0 as u32,
         }
@@ -93,19 +105,82 @@ impl SpecParams {
         self.types.iter().any(|t| *t == SpecType::NgramMod)
     }
 
+    pub fn wants_pld(&self) -> bool {
+        self.types.iter().any(|t| *t == SpecType::PromptLookup)
+    }
+
     /// llama `common_speculative_n_max`: max of each enabled impl's n_max.
     /// Used as the verify budget (`dp.n_max` is remaining ctx/tokens).
+    ///
+    /// PLD contributes only `pld_k` (default 3), never the ngram 64, so enabling
+    /// it does not inflate the CPU expert verify union.
     pub fn verify_n_max(&self) -> i32 {
         let mut n = 0i32;
         for t in &self.types {
             let v = match t {
                 SpecType::DraftMtp => self.n_max,
                 SpecType::NgramMod => self.ngram_n_max,
+                SpecType::PromptLookup => self.pld_k as i32,
             };
             n = n.max(v);
         }
         n.max(0)
     }
+}
+
+/// Prompt lookup is greedy-solo only (halogen policy). A non-greedy sampler or
+/// a shared batch step makes the copy pattern unreliable and the verify budget
+/// contended, so the draft is suppressed.
+pub fn pld_allowed(wants_pld: bool, greedy: bool, n_active: u32) -> bool {
+    wants_pld && greedy && n_active <= 1
+}
+
+/// Recurrent-state rollback depth for a multi-token speculative reject.
+///
+/// llama-server sets `n_rs_seq = draft-mtp n_max`. PLD extends that chain (and
+/// can run alone), so its `pld_k` must be covered too, or the scheduler copies
+/// the ~150 MiB PARTIAL_ONLY state every verify step (#247). ngram-mod is
+/// excluded here to match llama; it still snapshots.
+pub fn spec_rs_need(spec: &SpecParams) -> u32 {
+    let mtp = if spec.wants_mtp() { spec.n_max.max(0) } else { 0 };
+    let pld = if spec.wants_pld() { spec.pld_k as i32 } else { 0 };
+    mtp.max(pld).max(0) as u32
+}
+
+/// Prompt-lookup draft. `hist` is the request's token history (prompt +
+/// generated, excluding `id_last`); `prior` are drafts an earlier impl (MTP)
+/// already produced this step. The needle is the trailing `n` ids of
+/// `hist ++ [id_last] ++ prior`, so the lookup chains off MTP proposals.
+/// Returns the `k` tokens that followed an earlier occurrence of that needle.
+pub fn pld_draft(
+    hist: &[Token],
+    id_last: Token,
+    prior: &[Token],
+    n: usize,
+    k: usize,
+    n_budget: usize,
+) -> Vec<Token> {
+    if n == 0 || k == 0 || n_budget == 0 {
+        return Vec::new();
+    }
+    let k = k.min(n_budget);
+    let mut full = Vec::with_capacity(hist.len() + 1 + prior.len());
+    full.extend_from_slice(hist);
+    full.push(id_last);
+    full.extend_from_slice(prior);
+    if full.len() <= n {
+        return Vec::new();
+    }
+    let needle = &full[full.len() - n..];
+    // `i == full.len() - n` is the needle itself; search strictly before it.
+    for i in (0..=full.len() - n - 1).rev() {
+        if &full[i..i + n] == needle {
+            let start = i + n;
+            let end = (start + k).min(full.len());
+            return full[start..end].to_vec();
+        }
+    }
+    Vec::new()
 }
 
 /// Hash table from llama.cpp `common_ngram_mod` (PR 19164).
@@ -368,6 +443,91 @@ mod tests {
     fn spec_type_parses_llama_server_list() {
         let types = SpecType::parse_list("draft-mtp,ngram-mod").unwrap();
         assert_eq!(types, vec![SpecType::DraftMtp, SpecType::NgramMod]);
+    }
+
+    #[test]
+    fn spec_type_parses_prompt_lookup_aliases() {
+        assert_eq!(
+            SpecType::parse_list("prompt-lookup").unwrap(),
+            vec![SpecType::PromptLookup]
+        );
+        assert_eq!(SpecType::parse_list("pld").unwrap(), vec![SpecType::PromptLookup]);
+        assert_eq!(
+            SpecType::parse_list("draft-mtp,pld").unwrap(),
+            vec![SpecType::DraftMtp, SpecType::PromptLookup]
+        );
+        assert_eq!(SpecType::PromptLookup.as_str(), "prompt-lookup");
+    }
+
+    #[test]
+    fn verify_n_max_counts_pld_as_k_not_64() {
+        let mut p = SpecParams::default();
+        p.types = vec![SpecType::PromptLookup];
+        assert_eq!(p.verify_n_max(), 3);
+        p.pld_k = 5;
+        assert_eq!(p.verify_n_max(), 5);
+        p.types = vec![SpecType::DraftMtp, SpecType::PromptLookup];
+        assert_eq!(p.verify_n_max(), 5);
+        p.types = vec![SpecType::NgramMod, SpecType::PromptLookup];
+        assert_eq!(p.verify_n_max(), 64, "ngram still dominates");
+        p.ngram_n_max = 2;
+        assert_eq!(p.verify_n_max(), 5, "pld_k=5 now dominates");
+    }
+
+    #[test]
+    fn pld_draft_copies_tokens_after_previous_suffix() {
+        // history [.. a b c X Y Z .. a b c], needle is the final a b c.
+        let hist = [1, 2, 3, 10, 11, 12, 1, 2];
+        let draft = pld_draft(&hist, 3, &[], 3, 3, 3);
+        assert_eq!(draft, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn pld_draft_chains_off_mtp_prior() {
+        // needle = [hist.last()=40, id_last=50, prior=60], found at i=0.
+        let hist = [40, 50, 60, 99, 20, 30, 40];
+        let draft = pld_draft(&hist, 50, &[60], 3, 2, 2);
+        assert_eq!(draft, vec![99, 20]);
+    }
+
+    #[test]
+    fn pld_draft_empty_without_match_or_room() {
+        let hist = [1, 2, 3, 4, 5];
+        assert!(pld_draft(&hist, 5, &[], 3, 3, 3).is_empty());
+        assert!(pld_draft(&[1, 2], 3, &[], 3, 3, 3).is_empty());
+        assert!(pld_draft(&hist, 5, &[], 0, 3, 3).is_empty());
+        assert!(pld_draft(&hist, 5, &[], 3, 0, 3).is_empty());
+        assert!(pld_draft(&hist, 5, &[], 3, 3, 0).is_empty());
+    }
+
+    #[test]
+    fn pld_draft_respects_budget() {
+        let hist = [1, 2, 3, 10, 11, 12, 1, 2];
+        assert_eq!(pld_draft(&hist, 3, &[], 3, 3, 2), vec![10, 11]);
+    }
+
+    #[test]
+    fn pld_gate_is_greedy_solo_only() {
+        assert!(pld_allowed(true, true, 1));
+        assert!(!pld_allowed(false, true, 1), "type off");
+        assert!(!pld_allowed(true, false, 1), "non-greedy");
+        assert!(!pld_allowed(true, true, 2), "batched");
+    }
+
+    #[test]
+    fn spec_rs_need_covers_mtp_and_pld() {
+        let mut p = SpecParams::default();
+        assert_eq!(spec_rs_need(&p), 0, "nothing enabled");
+        p.types = vec![SpecType::NgramMod];
+        assert_eq!(spec_rs_need(&p), 0, "ngram excluded (llama snapshots)");
+        p.types = vec![SpecType::DraftMtp];
+        assert_eq!(spec_rs_need(&p), 3);
+        p.n_max = 2;
+        assert_eq!(spec_rs_need(&p), 2, "MTP n_max=2 like the Flash-Next unit");
+        p.types = vec![SpecType::DraftMtp, SpecType::PromptLookup];
+        assert_eq!(spec_rs_need(&p), 3, "PLD extends the reject span");
+        p.types = vec![SpecType::PromptLookup];
+        assert_eq!(spec_rs_need(&p), 3, "PLD alone");
     }
 
     #[test]
