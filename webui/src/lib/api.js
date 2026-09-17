@@ -56,6 +56,9 @@ function dispatchSse(raw, handlers) {
 }
 
 /// Streamed chat completion (POST + manual SSE framing; EventSource cannot POST).
+///
+/// `temperature` / `max_tokens` are intentionally omitted: the server applies
+/// its own configured defaults (context length included).
 export async function chatStream(messages, handlers) {
   const res = await fetch('/v1/chat/completions', {
     method: 'POST',
@@ -64,8 +67,6 @@ export async function chatStream(messages, handlers) {
       model: 'golbang',
       messages,
       stream: true,
-      temperature: settings.temperature,
-      max_tokens: settings.maxTokens,
     }),
   });
   if (!res.ok) throw new Error(await errorMessage(res));
@@ -95,8 +96,6 @@ export async function chatOnce(messages) {
       model: 'golbang',
       messages,
       stream: false,
-      temperature: settings.temperature,
-      max_tokens: settings.maxTokens,
     }),
   });
   if (!res.ok) throw new Error(await errorMessage(res));

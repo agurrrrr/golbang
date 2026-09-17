@@ -6,6 +6,8 @@
   import { fetchModels } from './lib/api.js';
 
   let model = $state(null);
+  let panelOpen = $state(false);
+  let tab = $state('settings');
 
   // Persist the API key / stream preference whenever they change.
   $effect(() => {
@@ -19,7 +21,13 @@
       .then((m) => (model = m))
       .catch(() => {});
   });
+
+  function onKeydown(e) {
+    if (e.key === 'Escape') panelOpen = false;
+  }
 </script>
+
+<svelte:window onkeydown={onKeydown} />
 
 <div class="app">
   <header class="topbar">
@@ -28,14 +36,33 @@
       <span class="model">{model.id} · n_ctx {model.meta?.n_ctx ?? '?'}</span>
     {/if}
     <span class="spacer"></span>
-    <a href="/metrics" target="_blank" rel="noreferrer">/metrics</a>
-    <a href="/v1/models" target="_blank" rel="noreferrer">/v1/models</a>
+    <button type="button" onclick={() => (panelOpen = true)}>⚙ 설정</button>
   </header>
-  <div class="columns">
-    <aside class="sidebar">
-      <Settings />
-      <Stats />
-    </aside>
-    <Chat />
-  </div>
+
+  <Chat />
+
+  {#if panelOpen}
+    <div class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-label="설정" tabindex="-1">
+        <div class="modal-head">
+          <div class="tabs">
+            <button type="button" class:active={tab === 'settings'} onclick={() => (tab = 'settings')}>
+              설정
+            </button>
+            <button type="button" class:active={tab === 'stats'} onclick={() => (tab = 'stats')}>
+              통계
+            </button>
+          </div>
+          <button type="button" onclick={() => (panelOpen = false)}>닫기</button>
+        </div>
+        <div class="modal-body">
+          {#if tab === 'settings'}
+            <Settings />
+          {:else}
+            <Stats />
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>

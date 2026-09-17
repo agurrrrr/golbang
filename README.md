@@ -200,11 +200,12 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
   `requests_deferred`, `prompt_tokens_cached_total` 등)도 같은 값으로 내보내 llama.cpp/llama-swap
   대시보드가 수정 없이 읽는다
 - `--prompt-progress`(기본 on) — SSE에 llama-server식 `prompt_progress`를 실어 긴 프리필 동안 연결 유지
-- **내장 웹 UI** (`--webui`, 기본 on) — `GET /`에서 최소 스모크 UI를 제공한다. API 키 설정,
-  `/metrics` 기반 실시간 추론 속도(prefill/decode tok/s, 캐시 재사용률, 대기열, 503), 그리고
-  응답마다 그 요청의 `timings`를 보여 주는 간단한 채팅만 있다. Svelte 정적 빌드를
-  `include_bytes!`로 바이너리에 넣으므로 런타임 파일도, 빌드 시 Node도 필요 없다. 정적 HTML은
-  비인증으로 공개되지만 `/v1/chat/completions`는 여전히 키를 요구한다
+- **내장 웹 UI** (`--webui`, 기본 on) — `GET /`에서 최소 스모크 UI를 제공한다. 첫 화면은
+  채팅 전폭이고, API 키 설정과 `/metrics` 기반 실시간 추론 속도(prefill/decode tok/s, 캐시
+  재사용률, 대기열, 503)는 **⚙ 설정 버튼 팝업의 탭**에 있다. 응답마다 그 요청의 `timings`도
+  표시한다. Svelte 정적 빌드를 `include_bytes!`로 바이너리에 넣으므로 런타임 파일도, 빌드 시
+  Node도 필요 없다. 정적 HTML은 비인증으로 공개되지만 `/v1/chat/completions`는 여전히 키를
+  요구한다
 - `--api-key` / `--alias` / `--rpc` / `--tensor-split` — llama-server와 같은 의미
 
 **없는 것:** embeddings, rerank, `fifo` 이외 스케줄 정책, 순수 Rust GPU 커널(P6 gate 실패로 닫힘).
@@ -213,13 +214,17 @@ TLS은 리버스 프록시에서 종결하는 것을 권한다. 키 없는 인�
 ## 내장 웹 UI (`--webui`)
 
 llama-server처럼 "서버를 띄우면 브라우저에서 바로 확인"하는 경로를 골뱅에도 둔다. 다만
-범위는 **배포 직후 모델이 살아 있는지 3초 만에 확인하는 스모크 UI**로 좁혔다. 기능은 셋뿐이다.
+범위는 **배포 직후 모델이 살아 있는지 3초 만에 확인하는 스모크 UI**로 좁혔다. 첫 접속에는
+채팅 화면만 보이고, 나머지는 우상단 **⚙ 설정** 버튼을 눌렀을 때 뜨는 팝업의 탭으로 들어간다.
 
-1. **API 키 설정** — 브라우저 `localStorage`에만 저장하고 `Authorization: Bearer …`로 전달한다.
-2. **추론 속도 통계** — `/metrics`를 폴링해 prefill/decode tok/s, 캐시 재사용률, 드래프트 수락률,
-   처리 중/대기열, 슬롯 점유, 503, 유효 `n_ctx`, 큐 깊이를 보여 준다.
-3. **스모크 채팅** — 요청을 실제로 만들어 통계를 움직여 보고, 응답마다 `timings`
+1. **스모크 채팅** — 전폭 화면. 요청을 실제로 만들어 통계를 움직여 보고, 응답마다 `timings`
    (prompt/predicted tok/s, 캐시 히트, 드래프트 수락)와 `reasoning_content`를 표시한다.
+2. **API 키 설정** — 브라우저 `sessionStorage`에만 저장하고 `Authorization: Bearer …`로
+   전달한다. 탭을 닫으면 지워지고 디스크에는 남지 않는다.
+3. **추론 속도 통계** — `/metrics`를 폴링해 prefill/decode tok/s, 캐시 재사용률, 드래프트 수락률,
+   처리 중/대기열, 슬롯 점유, 503, 유효 `n_ctx`, 큐 깊이를 보여 준다.
+
+`temperature`·`max_tokens`·context length는 UI가 보내지 않고 서버 설정값을 그대로 쓴다.
 
 원본은 [`webui/`](webui/)에 있는 Svelte + Vite 앱이고, `vite-plugin-singlefile`로 단일
 `webui/dist/index.html`을 만들어 리포지토리에 커밋한다. `golbang-server`는 이 파일을

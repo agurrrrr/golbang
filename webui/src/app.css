@@ -138,27 +138,57 @@ pre {
   text-decoration: none;
 }
 
-.columns {
-  flex: 1;
-  display: grid;
-  grid-template-columns: 340px 1fr;
-  min-height: 0;
-}
-
-@media (max-width: 860px) {
-  .columns {
-    grid-template-columns: 1fr;
-    overflow: auto;
-  }
-}
-
-.sidebar {
-  border-right: 1px solid var(--border);
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px 16px;
   overflow: auto;
-  padding: 14px;
+  z-index: 50;
+}
+
+.modal {
+  width: 100%;
+  max-width: 560px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-body {
+  padding: 12px;
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tabs button {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.tabs button.active {
+  color: var(--fg);
+  background: var(--panel-2);
+  border-color: var(--border);
 }
 
 .panel {
@@ -221,6 +251,7 @@ pre {
 }
 
 .chat {
+  flex: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;

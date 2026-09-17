@@ -2,10 +2,6 @@
   import { settings } from '../lib/store.svelte.js';
 
   let show = $state(false);
-
-  const num = (e, key) => {
-    settings[key] = Number(e.currentTarget.value);
-  };
 </script>
 
 <div class="panel">
@@ -24,43 +20,19 @@
     <button type="button" onclick={() => (show = !show)}>{show ? '숨김' : '표시'}</button>
   </div>
   <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-    브라우저 <code>localStorage</code>에만 저장됩니다. 서버가 <code>--api-key</code> 없이 떴다면
-    비워 두십시오.
+    브라우저 <code>sessionStorage</code>에만 저장됩니다. 탭을 닫으면 지워지고 디스크에는 남지
+    않습니다. 서버가 <code>--api-key</code> 없이 떴다면 비워 두십시오.
   </p>
 
-  <details class="adv" style="margin-top: 10px">
-    <summary>요청 설정</summary>
-    <div class="row" style="margin-top: 8px">
-      <div style="flex: 1">
-        <label for="temperature">temperature</label>
-        <input
-          id="temperature"
-          type="number"
-          min="0"
-          max="2"
-          step="0.05"
-          value={settings.temperature}
-          oninput={(e) => num(e, 'temperature')}
-        />
-      </div>
-      <div style="flex: 1">
-        <label for="maxtokens">max_tokens</label>
-        <input
-          id="maxtokens"
-          type="number"
-          min="1"
-          step="1"
-          value={settings.maxTokens}
-          oninput={(e) => num(e, 'maxTokens')}
-        />
-      </div>
-    </div>
-    <label for="stream" style="margin-top: 10px">응답 스트리밍</label>
-    <input
-      id="stream"
-      type="checkbox"
-      checked={settings.stream}
-      onchange={(e) => (settings.stream = e.currentTarget.checked)}
-    />
-  </details>
+  <label for="stream" style="margin-top: 14px">응답 스트리밍</label>
+  <input
+    id="stream"
+    type="checkbox"
+    checked={settings.stream}
+    onchange={(e) => (settings.stream = e.currentTarget.checked)}
+  />
+
+  <p class="muted" style="font-size: 12px; margin: 12px 0 0">
+    temperature·max_tokens·context length는 보내지 않고 서버 설정값을 그대로 씁니다.
+  </p>
 </div>
