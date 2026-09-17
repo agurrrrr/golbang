@@ -45,11 +45,13 @@ Environment=RUST_LOG=info
 # without that the scheduler snapshots 115 MiB every verify step (35 -> 19 t/s).
 # See docs/bench/pld-flashnext.md.
 # n-threads 16 vs 32 is noise.
-# Sampling: Qwen3.8 thinking-mode card (temperature 0.6 / top_p 0.95 / top_k 20).
-# The server's raw defaults (1.0 / top_k 0 / top_p 1.0) sample the whole
-# 248k vocabulary, so a chat client that omits temperature gets multilingual
-# word salad (e.g. a poem request returned "웹 fall: 생태계의 meta-genome").
-# Clients may still override per request.
+# Sampling: Qwen3.8-Flash-Next thinking-mode card (temperature 1.0 / top_p 0.95 /
+# top_k 20), same set as Qwen3.8-27B (see deploy/golbang-qwen38.service, commit
+# 33bf30d). The server's raw defaults (temperature 1.0 / top_k 0 / top_p 1.0)
+# sample the whole 248k vocabulary, so a chat client that omits top_k/top_p gets
+# multilingual word salad (e.g. a poem request returned "웹 fall: 생태계의
+# meta-genome"). The card's top_k 20 / top_p 0.95 cut the tail; temperature stays
+# 1.0 for thinking mode. Clients may still override per request.
 # Measured on 2x V100 + EPYC 7452 (mmap, page cache warm):
 #   prefill 234 tok/s @ 80k prompt (258 tok/s @ 7k), decode ~22 tok/s short / ~15.4 tok/s @ 80k.
 # KV is 27 KiB/token (24 KiB attention K+V over the 12 full-attn layers +
@@ -65,7 +67,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --n-ctx 100000 --n-batch 4096 --n-ubatch 2048 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \
-  --temperature 0.6 --top-p 0.95 --top-k 20 \
+  --temperature 1.0 --top-p 0.95 --top-k 20 \
   --model-draft /home/agurrrrr/models/qwen3.8/mtp-flashnext/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
   --spec-type draft-mtp --spec-draft-n-max 2 \
   --api-key "${GOLBANG_API_KEY}"
