@@ -6,7 +6,8 @@
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
 //!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
-//! - `cuda` → `llama.cpp-cuda-upstream` (plain `origin/master`), CUDA-symbol
+//! - `cuda` → `llama.cpp-cuda-upstream` (plain `origin/master` + ggml-org
+//!   PR #28243 qwen4exp MTP), CUDA-symbol
 //!   `.so` byte check, CUDA runtime (`cudart`/`cublas`) link. Rollback trees:
 //!   `llama.cpp-escha` @ `c5d759c8a` (`escha-w2-dense` + DSV4.1 loader patches)
 //!   and `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
@@ -35,7 +36,11 @@ use std::process::Command;
 /// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
 /// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
-const EXPECTED_SHA_CUDA: &str = "c069aa7f5f2beeead1a3a8e9f71510f1b64d0725";
+/// 1c4cfda6c = upstream `c069aa7f5f` + ggml-org PR #28243 (`qwen4exp` NextN/MTP
+/// draft head + cross-model shared-tensor borrowing). Needed so an external
+/// Unsloth MTP head runs via `-md` + `--spec-type draft-mtp` on
+/// Qwen3.8-Flash-Next. llama.h C API unchanged. See wiki `qwen38-mtp`.
+const EXPECTED_SHA_CUDA: &str = "1c4cfda6cc8b28d91eca48a30623a70253ca21fc";
 const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
 const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream";
 /// DSV4.1 native runtime: vcruz305 `runtime/deepseek41` (`f37da5711`) + the

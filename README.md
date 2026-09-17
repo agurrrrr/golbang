@@ -104,7 +104,7 @@ GPU 연산만 SHA 고정된 `libllama`/`libggml-*`를 unsafe FFI로 호출한다
 | 모델 | 양자화·구성 | 유닛 |
 |------|-------------|------|
 | Qwen3.8-27B | UD-Q4_K_XL + MTP, `--tensor-split` | `golbang-cuda-qwen38` |
-| Qwen3.8-Flash-Next | UD-Q4_K_XL, `--n-cpu-moe 48` (expert 전부 CPU), 100k ctx | `golbang-cuda-flashnext` |
+| Qwen3.8-Flash-Next | UD-Q4_K_XL, `--n-cpu-moe 42` + 외부 MTP head (`draft-mtp` n-max 2), 100k ctx | `golbang-cuda-flashnext` |
 | DeepSeek-V4.1 | 네이티브 런타임 (`GOLBANG_GPU=ds41-cuda`) | `golbang-server-ds41-cuda` |
 
 Vulkan은 같은 모델을 다른 커널 경로로 돌려볼 수 있는 백엔드다. CUDA와 HIP은

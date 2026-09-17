@@ -28,6 +28,13 @@ Environment=RUST_LOG=info
 # returned null`), so 2048 is the ceiling on 2x16 GiB.
 # --spec-type ngram-mod is a loss here: acceptance ~0.20 and decode drops to 7-15 tok/s
 # because verifying a draft span activates the union of CPU experts. Leave it off.
+# MTP (`-md` + draft-mtp) is a win on this tree: the external Unsloth
+# `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.6 GiB, borrows token_embd/output)
+# gives acceptance 0.98-1.00, decode 1.20x short (~23 -> ~28 tok/s) and 1.05x at
+# ~15k ctx (~21 -> ~22 tok/s). Verifying a draft span batches several tokens, which
+# offsets the CPU expert union cost. Output is valid but not bit-identical to
+# no-spec greedy (batched-verify numerics). Needs the PR #28243 runtime
+# (EXPECTED_SHA_CUDA 1c4cfda6c); the draft rides on CUDA1 (~5.4 GiB, ~2 GiB free).
 # n-threads 16 vs 32 is noise.
 # Measured on 2x V100 + EPYC 7452 (mmap, page cache warm):
 #   prefill 234 tok/s @ 80k prompt (258 tok/s @ 7k), decode ~22 tok/s short / ~15.4 tok/s @ 80k.
@@ -44,6 +51,8 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --n-ctx 100000 --n-batch 4096 --n-ubatch 2048 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \
+  --model-draft /home/agurrrrr/models/qwen3.8/mtp-flashnext/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
   --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10
