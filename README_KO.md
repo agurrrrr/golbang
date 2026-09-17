@@ -493,3 +493,8 @@ FFI 경계를 수정하는 변경은 `golbang-sys/build.rs`의 SHA 핀 검사를
 
 MIT OR Apache-2.0 (dual license)이며, `Cargo.toml`의 workspace `license`와 동일합니다.
 llama.cpp와 같은 라이선스 계열이라 GGUF 생태계 관행과 호환됩니다.
+
+---
+
+> ***"우리가 이 보배를 질그릇에 가졌으니 이는 심히 큰 능력은 하나님께 있고
+> 우리에게 있지 아니함을 알게 하려 함이라."*** — 고린도후서 4:7 (개역개정)

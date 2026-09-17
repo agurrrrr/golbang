@@ -542,3 +542,8 @@ align direction — this project makes keeping the serving surface narrow an exp
 
 MIT OR Apache-2.0 (dual license, same as the workspace `license` in `Cargo.toml`). It is
 the same license family as llama.cpp, compatible with GGUF ecosystem practice.
+
+---
+
+> ***"But we have this treasure in jars of clay, to show that the surpassing power
+> belongs to God and not to us."*** — 2 Corinthians 4:7
