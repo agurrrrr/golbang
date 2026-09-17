@@ -155,7 +155,7 @@ impl BatchBuilder {
 
         let remaining: Vec<usize> = prefills
             .iter()
-            .map(|(_, job)| job.prefill_remaining())
+            .map(|(_, job)| job.prefill_remaining_to_stop())
             .collect();
         let quotas = split_prefill_quota(prefill_cap, budget.prefill_max, &remaining);
 
@@ -610,5 +610,70 @@ mod tests {
         let budget = IterationBudget::default();
         let slots = [decode_slot(0, 42), prefill_slot(1, 10_000)];
         assert_eq!(decide_mix_mode(&slots, budget, 100), MixMode::Auto);
+    }
+
+    /// P9 borrow 1: a demand boundary must land exactly so `apply_plan` can
+    /// snapshot at that length. The planner clamps the chunk to the stop.
+    #[test]
+    fn prefill_stop_lands_exactly_on_boundary() {
+        let mut slot = Slot::new(SlotId(3));
+        slot.phase = SlotPhase::Prefilling;
+        let mut job = crate::slot::ActiveJob::for_test((0..5_000).collect());
+        job.prefill_stop = Some(700);
+        slot.job = Some(job);
+        let budget = IterationBudget {
+            prefill_max: 2_048,
+            decode_max: 2,
+            mixed_prefill_max: 0,
+            ..IterationBudget::default()
+        };
+        let plan = BatchBuilder::new(2_048).plan(&[slot], &[SlotId(3)], budget);
+        assert_eq!(
+            plan.prefill_consumed,
+            vec![(SlotId(3), 700)],
+            "chunk stops exactly on the demand boundary"
+        );
+        assert_eq!(plan.tokens.len(), 700);
+    }
+
+    /// A stop-bounded slot must not starve a neighbor: its leftover goes to
+    /// the still-hungry slot (issue #33 rule) and the boundary still lands.
+    #[test]
+    fn prefill_stop_leftover_goes_to_neighbor() {
+        let mut a = Slot::new(SlotId(0));
+        a.phase = SlotPhase::Prefilling;
+        let mut job_a = crate::slot::ActiveJob::for_test((0..10_000).collect());
+        job_a.prefill_stop = Some(700);
+        a.job = Some(job_a);
+        let b = prefill_slot(1, 10_000);
+        let budget = IterationBudget {
+            prefill_max: 2_048,
+            decode_max: 2,
+            mixed_prefill_max: 0,
+            ..IterationBudget::default()
+        };
+        let plan = BatchBuilder::new(2_048).plan(&[a, b], &[SlotId(0), SlotId(1)], budget);
+        let got: Vec<(u32, u32)> = plan
+            .prefill_consumed
+            .iter()
+            .map(|(id, n)| (id.0, *n))
+            .collect();
+        assert_eq!(got, vec![(0, 700), (1, 1_348)]);
+        assert_eq!(plan.tokens.len(), 2_048);
+    }
+
+    #[test]
+    fn prefill_remaining_to_stop_releases_after_boundary() {
+        let mut job = crate::slot::ActiveJob::for_test(vec![1; 100]);
+        job.n_past = 30;
+        job.prompt_offset = 30;
+        job.prompt_pos = 0;
+        job.prefill_stop = Some(40);
+        assert_eq!(job.prefill_remaining_to_stop(), 10);
+        // Once reached, the planner must resume past the boundary.
+        job.n_past = 40;
+        job.prompt_offset = 40;
+        assert_eq!(job.prefill_remaining_to_stop(), 60);
+        assert_eq!(job.prefill_remaining(), 60);
     }
 }

@@ -887,6 +887,20 @@ fn bind_slot(
     let hint_n = gpu_n.max(ckpt_n);
     let mut reuse_len = slot.prefix_cache.reuse_for_bind(&tokens, hint_n);
     reuse_len = settle_prefix_kv(slot, engine, reuse_len, gpu_n, prefix_store, &tokens);
+    // P9 borrow 1 (Marconi): a prompt that diverges from a previously observed
+    // session reveals the shared-prefix boundary. The second observation of
+    // that boundary arms a prefill stop so `apply_plan` snapshots exactly
+    // there; one-off prefixes are only recorded.
+    let demand_stop = {
+        let mut store = prefix_store.lock().unwrap();
+        let b = if (reuse_len as usize) + 1 < tokens.len() {
+            store.observe_boundary(&tokens, reuse_len)
+        } else {
+            None
+        };
+        store.record_prompt(&tokens);
+        b
+    };
     let req = job.request_id;
     slot.occupy(ActiveJob::from_parts(
         job.request_id,
@@ -899,6 +913,20 @@ fn bind_slot(
         ctx_cap,
         job.images,
     ));
+    if let Some(active) = slot.job.as_mut() {
+        if let Some(b) = demand_stop {
+            if b > active.n_past && (b as usize) < active.prompt_tokens.len() {
+                active.prefill_stop = Some(b);
+                tracing::info!(
+                    slot = slot.id.0,
+                    request_id = req,
+                    boundary = b,
+                    reuse = active.prompt_offset,
+                    "demand boundary armed"
+                );
+            }
+        }
+    }
     arm_think_budget(slot, engine);
     arm_dsml_guard(slot, engine);
     if let Some(active) = slot.job.as_ref() {
@@ -1116,6 +1144,7 @@ fn apply_plan(
         if let Some(slot) = slots.iter_mut().find(|s| s.id == *id) {
             let mut need_chain = false;
             let mut promote_key: Option<Vec<Token>> = None;
+            let mut demand_boundary = false;
             let n_ubatch = engine.n_ubatch().max(1) as u32;
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
@@ -1127,6 +1156,14 @@ fn apply_plan(
                 }
                 let n_past = job.n_past;
                 let stride_stub = is_host_stub_boundary(n_past, n_ubatch);
+                // P9 borrow 1 (Marconi): prefill was clamped to land exactly on
+                // the observed reuse boundary; capture it here.
+                let demand_stub = job.prefill_stop.is_some_and(|b| n_past >= b);
+                if demand_stub {
+                    job.prefill_stop = None;
+                    demand_boundary = true;
+                }
+                let store_stub = stride_stub || demand_boundary;
                 if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
                     job.last_progress_n = 0;
@@ -1135,13 +1172,13 @@ fn apply_plan(
                         job.generation_started_at = Some(Instant::now());
                         need_chain = true;
                     }
-                    if stride_stub {
+                    if store_stub {
                         promote_key = snapshot_key(&job.prompt_tokens, n_past);
                     }
-                } else if stride_stub {
+                } else if store_stub {
                     // One stub in the chain: the last stride in the store-stub
                     // window. Other stride dumps go to the host store only.
-                    need_chain = is_last_host_stub(n_past);
+                    need_chain = is_last_host_stub(n_past) && !demand_boundary;
                     promote_key = snapshot_key(&job.prompt_tokens, n_past);
                 }
             }
@@ -1198,11 +1235,15 @@ fn apply_plan(
                                 }
                                 push_prefix_ckpt(slot, n_tokens, ckpt.data.clone());
                                 let bytes = ckpt.data.len();
-                                prefix_store.lock().unwrap().put(key, ckpt);
+                                prefix_store
+                                    .lock()
+                                    .unwrap()
+                                    .put_with(key, ckpt, demand_boundary);
                                 tracing::info!(
                                     slot = slot.id.0,
                                     n_tokens,
                                     bytes,
+                                    demand = demand_boundary,
                                     "host prefix snapshot promoted"
                                 );
                             }
@@ -1211,11 +1252,15 @@ fn apply_plan(
                             }
                             (false, Some(key)) => {
                                 let bytes = ckpt.data.len();
-                                prefix_store.lock().unwrap().put(key, ckpt);
+                                prefix_store
+                                    .lock()
+                                    .unwrap()
+                                    .put_with(key, ckpt, demand_boundary);
                                 tracing::info!(
                                     slot = slot.id.0,
                                     n_tokens,
                                     bytes,
+                                    demand = demand_boundary,
                                     "host prefix snapshot promoted"
                                 );
                             }
@@ -2254,6 +2299,12 @@ fn host_chain_bytes(slots: &[Slot]) -> usize {
 /// (`evict_global_over_cap` / `pick_longest_victim`), then the shortest
 /// unprotected middle of each slot chain (`trim_prefix_chain`). The shortest
 /// tool head (store stub) and each slot's newest anchor are kept last.
+///
+/// P9 borrow 2 (SGLang session-reference aware radix cache): store entries
+/// that are an exact head of a live session prompt are marked referenced and
+/// evicted after unreferenced ones; slot chains are trimmed idle-first,
+/// oldest-retained first, so an active session's anchors survive a neighbor's
+/// growth (P8-C production observation).
 fn enforce_host_ram_cap(
     slots: &mut [Slot],
     prefix_store: &Arc<std::sync::Mutex<PrefixStore>>,
@@ -2265,26 +2316,63 @@ fn enforce_host_ram_cap(
         if store.total_bytes + chain_bytes <= cap {
             break;
         }
-        // Stage 1: drop the longest PrefixStore dump.
+        // Mark live-session references before ordering eviction. Scoped so the
+        // immutable slot borrow ends before stage 2 mutates chains.
+        {
+            let live: Vec<&[Token]> = slots.iter().filter_map(live_session_prompt).collect();
+            store.refresh_entry_refs(&live);
+        }
+        // Stage 1: drop the longest unreferenced / non-demand PrefixStore dump.
         let before = store.total_bytes;
         store.evict_global_over_cap(chain_bytes, cap);
         if store.total_bytes < before {
             continue;
         }
         // Stage 2: trim each slot chain's unprotected middle (keeps newest +
-        // store stubs). `max_bytes = 0` forces the middle-only eviction rule.
-        let mut dropped = false;
-        for slot in slots.iter_mut() {
-            let before_n = slot.prefix_ckpts.len();
-            trim_prefix_chain(slot, CHAIN_MAX_ANCHORS, 0);
-            dropped |= slot.prefix_ckpts.len() < before_n;
-        }
-        if !dropped {
+        // store stubs). Idle sessions first so active anchors outlive them.
+        if !trim_chains_session_order(slots, cap, store.total_bytes) {
             // Only newest + store stubs remain everywhere; nothing left to
             // evict without dropping a protected anchor.
             break;
         }
     }
+}
+
+/// Live session prompt used for `PrefixStore` reference marking (P9 borrow 2):
+/// the active job's prompt, else the retained prefix tokens.
+fn live_session_prompt(slot: &Slot) -> Option<&[Token]> {
+    if let Some(job) = slot.job.as_ref() {
+        if !job.prompt_tokens.is_empty() {
+            return Some(&job.prompt_tokens);
+        }
+    }
+    if !slot.prefix_cache.tokens.is_empty() {
+        return Some(&slot.prefix_cache.tokens);
+    }
+    None
+}
+
+/// Trim slot chains until `store_bytes + chain_bytes <= cap`. Unreferenced
+/// (idle) slots go first, oldest `retained_at` first; active sessions last.
+/// Returns true when at least one anchor was dropped.
+fn trim_chains_session_order(slots: &mut [Slot], cap: usize, store_bytes: usize) -> bool {
+    let mut order: Vec<usize> = (0..slots.len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &slots[i];
+        let active = s.job.is_some();
+        let age = s.retained_at.map(|t| t.elapsed()).unwrap_or_default();
+        (active, std::cmp::Reverse(age))
+    });
+    let mut dropped = false;
+    for &i in &order {
+        if host_chain_bytes(slots) + store_bytes <= cap {
+            break;
+        }
+        let before_n = slots[i].prefix_ckpts.len();
+        trim_prefix_chain(&mut slots[i], CHAIN_MAX_ANCHORS, 0);
+        dropped |= slots[i].prefix_ckpts.len() < before_n;
+    }
+    dropped
 }
 
 /// After bind, drop anchors the new prompt cannot restore. Stops
@@ -3777,6 +3865,42 @@ mod tests {
                 "n={n}: only the last stub (16384) belongs on the chain"
             );
         }
+    }
+
+    #[test]
+    fn apply_plan_captures_demand_boundary_exactly() {
+        let mut slot = Slot::new(SlotId(0));
+        let prompt: Vec<Token> = (0..20_000).map(|i| (i % 7) as Token).collect();
+        slot.occupy(ActiveJob::for_test(prompt.clone()));
+        if let Some(job) = slot.job.as_mut() {
+            job.prefill_stop = Some(7_000);
+        }
+        let kv = FakeSeqKv::with_n_ubatch(2048);
+        kv.seed_state(0, vec![0xCD; 7_000]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let plan = crate::batch::BatchPlan {
+            prefill_consumed: vec![(SlotId(0), 7_000)],
+            ..Default::default()
+        };
+
+        apply_plan(std::slice::from_mut(&mut slot), &plan, &kv, &store);
+
+        let g = store.lock().unwrap();
+        assert_eq!(g.len(), 1, "demand boundary promoted");
+        let (key, ckpt) = g.entries.iter().next().expect("promoted entry");
+        assert_eq!(key.len(), 7_000);
+        assert_eq!(
+            key.as_slice(),
+            &prompt[..7_000],
+            "key is the exact boundary"
+        );
+        assert_eq!(ckpt.n_tokens, 7_000);
+        assert!(g.entry_is_demand(key), "entry marked demand");
+        drop(g);
+        assert!(
+            slot.job.as_ref().unwrap().prefill_stop.is_none(),
+            "stop cleared after capture"
+        );
     }
 
     #[tokio::test]

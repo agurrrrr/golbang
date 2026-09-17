@@ -110,6 +110,10 @@ pub(crate) struct ActiveJob {
     pub n_past: u32,
     pub n_generated: u32,
     pub n_prompt: u32,
+    /// P9 borrow 1: absolute `n_past` at which prefill must pause so
+    /// `apply_plan` can snapshot the observed reuse boundary exactly. Armed by
+    /// `bind_slot` (Marconi selective retention) and cleared once captured.
+    pub prefill_stop: Option<u32>,
     pub max_tokens: u32,
     /// Original `max_tokens` request. `max_tokens` is clamped to the current
     /// slot cap and can rise again when a neighbor leaves.
@@ -211,6 +215,7 @@ impl ActiveJob {
             n_past: prompt_offset as u32,
             n_generated: 0,
             n_prompt,
+            prefill_stop: None,
             max_tokens,
             max_tokens_req,
             ctx_cap,
@@ -301,6 +306,18 @@ impl ActiveJob {
         self.prompt_tokens
             .len()
             .saturating_sub(self.prefill_cursor())
+    }
+
+    /// Prefill tokens the next chunk may consume, honoring `prefill_stop` so a
+    /// demand-boundary snapshot lands exactly on the boundary (P9 borrow 1).
+    /// Once `n_past` reaches the stop the full remainder is returned; the
+    /// boundary is captured and the stop cleared in `apply_plan`.
+    pub fn prefill_remaining_to_stop(&self) -> usize {
+        let rem = self.prefill_remaining();
+        match self.prefill_stop {
+            Some(stop) if stop > self.n_past => rem.min((stop - self.n_past) as usize),
+            _ => rem,
+        }
     }
 
     /// KV cells this job reserved at admission (HAL-5 #249): the full prompt

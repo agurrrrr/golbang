@@ -17,7 +17,7 @@
 //! for one slot. Image cells compare FNV chunk ids, not vocab tokens. M-RoPE
 //! uses `n_pos != n_tokens`; `pos_next` is what `seq_rm` / `n_past` need.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -782,6 +782,17 @@ pub struct PrefixStoreMiss {
     pub store_ns: Vec<u32>,
 }
 
+/// Per-entry eviction metadata (P9 borrow 2, SGLang session-reference aware
+/// radix cache). `demand` marks a checkpoint captured at an observed reuse
+/// boundary (P9 borrow 1); `refs` counts live sessions whose prompt has this
+/// entry as an exact head. Both are **soft** protection: when only protected
+/// entries remain they are still evicted, oldest-longest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EntryMeta {
+    demand: bool,
+    refs: u32,
+}
+
 /// Cross-slot host snapshot map (P8-B).
 ///
 /// Each entry is a `SeqCheckpoint` captured at a known token length
@@ -804,6 +815,14 @@ pub struct PrefixStore {
     last_used_tick: u64,
     /// Per-entry tick of last use (keyed by the same prefix slice).
     last_used: HashMap<Vec<Token>, u64>,
+    /// Per-entry eviction metadata (demand / session refs).
+    meta: HashMap<Vec<Token>, EntryMeta>,
+    /// P9 borrow 1: recently observed session prompts (heads) for LCP-based
+    /// demand boundary discovery. Bounded ring.
+    observed: VecDeque<Vec<Token>>,
+    /// P9 borrow 1: boundary prefix -> times observed. The second observation
+    /// arms a demand snapshot; one-off prefixes are never checkpointed.
+    demand: HashMap<Vec<Token>, u8>,
     /// Optional disk tier (HAL-4 #248). `None` = RAM only, exactly P8.
     pub disk: Option<PrefixDisk>,
 }
@@ -817,6 +836,9 @@ impl Default for PrefixStore {
             max_entries: Self::DEFAULT_MAX_ENTRIES,
             last_used_tick: 0,
             last_used: HashMap::new(),
+            meta: HashMap::new(),
+            observed: VecDeque::new(),
+            demand: HashMap::new(),
             disk: None,
         }
     }
@@ -840,6 +862,15 @@ impl PrefixStore {
     pub const STORE_STUB_MIN: u32 = 6_144;
     pub const STORE_STUB_MAX: u32 = 16_384;
     pub const STORE_STUB_STRIDE: u32 = 2_048;
+
+    /// P9 borrow 1: observed-prompt ring size and boundary-count cap.
+    pub const OBSERVED_MAX: usize = 8;
+    pub const DEMAND_MAX: usize = 32;
+    /// Longest observed-prompt head kept for LCP (bounds host RAM).
+    pub const OBSERVED_TOKEN_CAP: usize = 65_536;
+    /// Ignore boundaries shorter than this: a tiny shared system head would
+    /// arm a stop on every request for a one-iteration prefill split.
+    pub const DEMAND_MIN_BOUNDARY: usize = 256;
 
     pub(crate) fn is_store_stub_len(n_tokens: u32) -> bool {
         (Self::STORE_STUB_MIN..=Self::STORE_STUB_MAX).contains(&n_tokens)
@@ -905,6 +936,13 @@ impl PrefixStore {
     /// Skips empty keys and key/`n_tokens` mismatches: those cannot hit
     /// `find_best` (`LCP == n_tokens`) and would only thrash the cap.
     pub fn put(&mut self, prefix: Vec<Token>, ckpt: SeqCheckpoint) {
+        self.put_with(prefix, ckpt, false);
+    }
+
+    /// [`Self::put`] with an explicit demand flag (P9 borrow 1). A demand entry
+    /// is a checkpoint captured at an observed reuse boundary, protected over
+    /// plain fixed-stride stubs during eviction.
+    pub fn put_with(&mut self, prefix: Vec<Token>, ckpt: SeqCheckpoint, demand: bool) {
         if prefix.is_empty() || ckpt.n_tokens == 0 {
             return;
         }
@@ -916,8 +954,87 @@ impl PrefixStore {
             self.total_bytes = self.total_bytes.saturating_sub(old.data.len());
         }
         self.total_bytes = self.total_bytes.saturating_add(self.entry_bytes(&prefix));
-        self.last_used.insert(prefix, self.last_used_tick);
+        self.last_used.insert(prefix.clone(), self.last_used_tick);
+        // A demand capture upgrades an existing stub; a stub never demotes a
+        // demand entry.
+        let meta = self.meta.entry(prefix).or_default();
+        meta.demand |= demand;
         self.evict_if_over_cap();
+    }
+
+    /// Record a completed session prompt so a later prompt's LCP reveals the
+    /// divergence boundary (P9 borrow 1). Bounded ring, deduped vs newest.
+    pub fn record_prompt(&mut self, tokens: &[Token]) {
+        if tokens.is_empty() {
+            return;
+        }
+        let n = tokens.len().min(Self::OBSERVED_TOKEN_CAP);
+        let head = &tokens[..n];
+        if self.observed.back().is_some_and(|p| p.as_slice() == head) {
+            return;
+        }
+        self.observed.push_back(head.to_vec());
+        while self.observed.len() > Self::OBSERVED_MAX {
+            self.observed.pop_front();
+        }
+    }
+
+    /// LCP of `prompt` against observed prompts, when it is a real divergence
+    /// (`reuse_len < b < prompt.len()`). Counts the boundary prefix; returns
+    /// `Some(b)` on the second+ observation so the caller arms a prefill stop
+    /// and snapshots exactly at `b` (Marconi selective retention).
+    ///
+    /// Returns `None` once the boundary is already resident: further binds hit
+    /// it through `find_best`, so re-capturing would only churn the cap.
+    pub fn observe_boundary(&mut self, prompt: &[Token], reuse_len: usize) -> Option<u32> {
+        let mut best = 0usize;
+        for p in &self.observed {
+            let l = common_prefix_len(p, prompt);
+            if l > best {
+                best = l;
+            }
+        }
+        if best < Self::DEMAND_MIN_BOUNDARY || best >= prompt.len() || best <= reuse_len {
+            return None;
+        }
+        let key = prompt[..best].to_vec();
+        let count = {
+            let c = self.demand.entry(key.clone()).or_insert(0);
+            *c = c.saturating_add(1);
+            *c
+        };
+        while self.demand.len() > Self::DEMAND_MAX {
+            if let Some(k) = self.demand.keys().next().cloned() {
+                self.demand.remove(&k);
+            } else {
+                break;
+            }
+        }
+        if count >= 2 && !self.entries.contains_key(&key) {
+            Some(best as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Recompute per-entry session reference counts from the live session
+    /// prompts (P9 borrow 2). An entry is referenced when it is an exact head
+    /// of at least one live prompt. SGLang's `/close_session` has no golbang
+    /// counterpart, so refs are recomputed on each cap enforcement instead of
+    /// tracked incrementally.
+    pub fn refresh_entry_refs(&mut self, live: &[&[Token]]) {
+        for meta in self.meta.values_mut() {
+            meta.refs = 0;
+        }
+        for (key, meta) in self.meta.iter_mut() {
+            let mut count = 0u32;
+            for p in live {
+                if common_prefix_len(key, p) == key.len() {
+                    count = count.saturating_add(1);
+                }
+            }
+            meta.refs = count;
+        }
     }
 
     /// Find the longest usable snapshot for `prompt`.
@@ -1036,11 +1153,38 @@ impl PrefixStore {
             let Some(victim) = victim else {
                 return;
             };
-            if let Some(ckpt) = self.entries.remove(&victim) {
-                self.total_bytes = self.total_bytes.saturating_sub(ckpt.data.len());
-            }
-            self.last_used.remove(&victim);
+            self.remove_entry(&victim);
         }
+    }
+
+    /// Remove one entry and all its bookkeeping. Returns nothing; callers only
+    /// need the side effects (bytes, ticks, meta).
+    fn remove_entry(&mut self, prefix: &[Token]) {
+        if let Some(ckpt) = self.entries.remove(prefix) {
+            self.total_bytes = self.total_bytes.saturating_sub(ckpt.data.len());
+        }
+        self.last_used.remove(prefix);
+        self.meta.remove(prefix);
+    }
+
+    /// Eviction score; the greatest tuple is evicted first.
+    ///
+    /// Order: unreferenced before referenced (SGLang session-reference aware
+    /// radix cache, P9 borrow 2), non-demand before demand-boundary checkpoints
+    /// (P9 borrow 1), then longest, then oldest. Both protections are soft:
+    /// when only protected entries remain, the longest of those still goes.
+    fn evict_score(
+        &self,
+        key: &[Token],
+        ckpt: &SeqCheckpoint,
+    ) -> (u8, u8, u32, std::cmp::Reverse<u64>) {
+        let meta = self.meta.get(key).copied().unwrap_or_default();
+        (
+            u8::from(meta.refs == 0),
+            u8::from(!meta.demand),
+            ckpt.n_tokens,
+            std::cmp::Reverse(self.last_used.get(key).copied().unwrap_or(0)),
+        )
     }
 
     /// Longest dump, then oldest tick at the same length.
@@ -1049,14 +1193,7 @@ impl PrefixStore {
         self.entries
             .iter()
             .filter(|(_, ckpt)| !skip_stubs || !Self::is_store_stub_len(ckpt.n_tokens))
-            .max_by(|a, b| {
-                a.1.n_tokens.cmp(&b.1.n_tokens).then_with(|| {
-                    let ta = self.last_used.get(a.0).copied().unwrap_or(0);
-                    let tb = self.last_used.get(b.0).copied().unwrap_or(0);
-                    // Same length: older tick is the victim.
-                    tb.cmp(&ta)
-                })
-            })
+            .max_by(|a, b| self.evict_score(a.0, a.1).cmp(&self.evict_score(b.0, b.1)))
             .map(|(k, _)| k.clone())
     }
 
@@ -1072,16 +1209,25 @@ impl PrefixStore {
             let Some(victim) = victim else {
                 break;
             };
-            if let Some(ckpt) = self.entries.remove(&victim) {
-                self.total_bytes = self.total_bytes.saturating_sub(ckpt.data.len());
-            }
-            self.last_used.remove(&victim);
+            self.remove_entry(&victim);
         }
     }
 
     /// Number of resident entries (for tests / metrics).
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Test-only: whether an entry was captured as a demand boundary.
+    #[cfg(test)]
+    pub(crate) fn entry_is_demand(&self, key: &[Token]) -> bool {
+        self.meta.get(key).map(|m| m.demand).unwrap_or(false)
+    }
+
+    /// Test-only: live-session reference count for an entry.
+    #[cfg(test)]
+    pub(crate) fn entry_refs(&self, key: &[Token]) -> u32 {
+        self.meta.get(key).map(|m| m.refs).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1740,5 +1886,95 @@ mod tests {
         let store = PrefixStore::with_disk(&dir, 0, fp("a")).unwrap();
         assert_eq!(store.disk_entries(), 1, "only the valid file loads");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demand_boundary_arms_on_second_observation() {
+        let mut store = PrefixStore::new();
+        let (sess_a, sess_b) = split_at_lcp(3_000, 4_000);
+        let mut sess_c = sess_a[..3_000].to_vec();
+        sess_c.extend((0..500).map(|i| 300 + (i % 5) as Token));
+        assert_eq!(common_prefix_len(&sess_a, &sess_c), 3_000);
+
+        // First session seeds the ring; the second only records the boundary.
+        store.record_prompt(&sess_a);
+        assert_eq!(store.observe_boundary(&sess_b, 0), None);
+        store.record_prompt(&sess_b);
+        // Third session: second observation of the 3000 boundary → armed.
+        assert_eq!(store.observe_boundary(&sess_c, 0), Some(3_000));
+    }
+
+    #[test]
+    fn demand_boundary_ignores_short_and_reused() {
+        let mut store = PrefixStore::new();
+        let (sess_a, sess_b) = split_at_lcp(100, 200);
+        store.record_prompt(&sess_a);
+        assert_eq!(
+            store.observe_boundary(&sess_b, 0),
+            None,
+            "100 < DEMAND_MIN_BOUNDARY"
+        );
+
+        let (long_a, long_b) = split_at_lcp(3_000, 4_000);
+        store.record_prompt(&long_a);
+        assert_eq!(
+            store.observe_boundary(&long_b, 3_000),
+            None,
+            "boundary already covered by local reuse"
+        );
+    }
+
+    #[test]
+    fn demand_boundary_skips_when_already_resident() {
+        let mut store = PrefixStore::new();
+        let (sess_a, sess_b) = split_at_lcp(3_000, 4_000);
+        store.record_prompt(&sess_a);
+        let _ = store.observe_boundary(&sess_b, 0);
+        store.record_prompt(&sess_b);
+        let mut sess_c = sess_a[..3_000].to_vec();
+        sess_c.extend((0..500).map(|i| 300 + (i % 5) as Token));
+
+        // Capture the boundary; a later observation must not re-arm a stop.
+        store.put(sess_c[..3_000].to_vec(), ckpt(3_000, 0xAB));
+        assert_eq!(store.observe_boundary(&sess_c, 0), None);
+    }
+
+    #[test]
+    fn eviction_prefers_unreferenced_nondemand() {
+        let mut store = PrefixStore::with_limits(0, 2);
+        let demand: Vec<Token> = (0..1_000).map(|i| (i % 7) as Token).collect();
+        let plain: Vec<Token> = (0..500).map(|i| (500 + i % 7) as Token).collect();
+        store.put_with(demand.clone(), ckpt(1_000, 0xAA), true);
+        store.put(plain.clone(), ckpt(500, 0xBB));
+        assert!(store.entry_is_demand(&demand));
+
+        // New plain entry triggers eviction. The non-demand plain entry is the
+        // victim; the demand boundary survives.
+        let fresh: Vec<Token> = (0..400).map(|i| (900 + i % 7) as Token).collect();
+        store.put(fresh.clone(), ckpt(400, 0xCC));
+        assert!(store.entries.contains_key(&demand), "demand boundary kept");
+        assert!(store.entries.contains_key(&fresh), "new entry kept");
+        assert!(!store.entries.contains_key(&plain), "plain victim evicted");
+    }
+
+    #[test]
+    fn refresh_refs_protects_live_session_head() {
+        let mut store = PrefixStore::with_limits(0, 2);
+        let head: Vec<Token> = (0..600).map(|i| (i % 7) as Token).collect();
+        let other: Vec<Token> = (0..500).map(|i| (700 + i % 7) as Token).collect();
+        store.put(head.clone(), ckpt(600, 0xAA));
+        store.put(other.clone(), ckpt(500, 0xBB));
+
+        let mut live = head.clone();
+        live.extend((0..50).map(|i| 100 + i as Token));
+        store.refresh_entry_refs(&[&live[..]]);
+        assert_eq!(store.entry_refs(&head), 1);
+        assert_eq!(store.entry_refs(&other), 0);
+
+        // New plain entry: the unreferenced `other` goes, not the referenced head.
+        let fresh: Vec<Token> = (0..400).map(|i| (900 + i % 7) as Token).collect();
+        store.put(fresh, ckpt(400, 0xCC));
+        assert!(store.entries.contains_key(&head), "referenced head kept");
+        assert!(!store.entries.contains_key(&other), "unreferenced victim");
     }
 }
