@@ -27,6 +27,11 @@
 //!
 //! Do not point bindgen at a live header from a sibling tree. SHA or `.so`
 //! drift is a hard error — rebuild that tree, then bump this pin.
+//!
+//! Tree resolution: `GOLBANG_LLAMA_DIR`, else `<repo>/vendor/<tree>` populated
+//! by `scripts/build-llama.sh` (public base commit + `patches/`, see
+//! `patches/README.md`). A patch-reproduced tree passes the exact-HEAD check via
+//! its `.golbang-llama-pin` marker; the `.so` byte and header checks still run.
 
 use std::env;
 use std::fs;
@@ -41,13 +46,15 @@ const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
 /// Unsloth MTP head runs via `-md` + `--spec-type draft-mtp` on
 /// Qwen3.8-Flash-Next. llama.h C API unchanged. See wiki `qwen38-mtp`.
 const EXPECTED_SHA_CUDA: &str = "1c4cfda6cc8b28d91eca48a30623a70253ca21fc";
-const DEFAULT_HIP_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-glm5next";
-const DEFAULT_CUDA_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream";
+/// `vendor/` 아래 트리 이름. `scripts/build-llama.sh`가 여기에 base 커밋을 받아
+/// `patches/`를 적용하고 cmake로 빌드한다. `GOLBANG_LLAMA_DIR`로 덮어쓸 수 있다.
+const VENDOR_HIP_DIR: &str = "llama.cpp-glm5next";
+const VENDOR_CUDA_DIR: &str = "llama.cpp-cuda-upstream";
 /// DSV4.1 native runtime: vcruz305 `runtime/deepseek41` (`f37da5711`) + the
 /// gfx906 furnace ports. Different tree/SHA from the `hip`/`cuda` pins because
 /// this branch carries `deepseek41` and not glm5next.
 const EXPECTED_SHA_DS41: &str = "24032ea2b12cc0cc38dfa58099bc1ecb6890d6fc";
-const DEFAULT_DS41_DIR: &str = "/home/agurrrrr/code/local-llm/llama.cpp-ds41";
+const VENDOR_DS41_DIR: &str = "llama.cpp-ds41";
 const EXPECTED_LLAMA_H_LINES: usize = 1638;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
@@ -88,29 +95,57 @@ fn main() {
         _ => unreachable!(),
     };
 
-    let (expected_sha, default_dir) = match gpu.as_str() {
-        "hip" | "vulkan" => (EXPECTED_SHA_HIP, DEFAULT_HIP_DIR),
-        "cuda" => (EXPECTED_SHA_CUDA, DEFAULT_CUDA_DIR),
-        "ds41" | "ds41-cuda" => (EXPECTED_SHA_DS41, DEFAULT_DS41_DIR),
+    let (expected_sha, vendor_name) = match gpu.as_str() {
+        "hip" | "vulkan" => (EXPECTED_SHA_HIP, VENDOR_HIP_DIR),
+        "cuda" => (EXPECTED_SHA_CUDA, VENDOR_CUDA_DIR),
+        "ds41" | "ds41-cuda" => (EXPECTED_SHA_DS41, VENDOR_DS41_DIR),
         _ => unreachable!(),
     };
 
-    let llama_dir =
-        PathBuf::from(env::var("GOLBANG_LLAMA_DIR").unwrap_or_else(|_| default_dir.to_string()));
+    let default_dir = vendor_dir(vendor_name);
+    let llama_dir = PathBuf::from(
+        env::var("GOLBANG_LLAMA_DIR")
+            .unwrap_or_else(|_| default_dir.to_string_lossy().into_owned()),
+    );
     if !llama_dir.is_dir() {
         panic!(
-            "GOLBANG_LLAMA_DIR does not exist: {}. Set it to the llama.cpp tree at {expected_sha} (GOLBANG_GPU={gpu}).",
+            "llama.cpp tree not found: {}. Run `scripts/build-llama.sh {gpu}` \
+             (or set GOLBANG_LLAMA_DIR) to fetch {vendor_name} + apply patches/ and build it.",
             llama_dir.display()
         );
     }
 
-    let head = git_stdout(&llama_dir, &["rev-parse", "HEAD"]);
-    if head != expected_sha {
+    // 핀 검사: 정확한 HEAD면 통과. 공개 base + `patches/`로 재현한 트리는
+    // `.golbang-llama-pin` 마커로 통과시킨다(런타임에는 여전히 .so 바이트/헤더
+    // 검사가 걸린다).
+    let head = git_head(&llama_dir);
+    let pin_ok = head.as_deref() == Some(expected_sha);
+    let marker_ok = read_pin_marker(&llama_dir).as_deref() == Some(expected_sha);
+    let allow_drift = env::var("GOLBANG_LLAMA_ALLOW_DRIFT")
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false);
+
+    if !pin_ok && !marker_ok && !allow_drift {
         panic!(
-            "llama.cpp HEAD is {head}, expected {expected_sha} (GOLBANG_GPU={gpu}). \
-             Pin is that SHA + its {gpu} .so under the matching tree. \
-             Do not mix a live header with a different .so. \
-             Sibling trees (llama.cpp / -cuda / -escha / -dflash2 / -upgrade rollback) are different HEADs."
+            "llama.cpp HEAD is {}, expected {expected_sha} (GOLBANG_GPU={gpu}) and no \
+             `.golbang-llama-pin` marker. Build the tree with `scripts/build-llama.sh {gpu}` \
+             (base commit + patches/, see patches/README.md), or set \
+             GOLBANG_LLAMA_ALLOW_DRIFT=1 to accept a different HEAD at your own risk. \
+             Do not mix a live header with a different .so.",
+            head.as_deref().unwrap_or("(not a git repository)")
+        );
+    }
+    if !pin_ok {
+        println!(
+            "cargo:warning=portable llama.cpp tree at {} (HEAD {}), pin {expected_sha} via {}. \
+             Header/.so checks still enforced.",
+            llama_dir.display(),
+            head.as_deref().unwrap_or("(no git)"),
+            if marker_ok {
+                ".golbang-llama-pin"
+            } else {
+                "GOLBANG_LLAMA_ALLOW_DRIFT"
+            }
         );
     }
 
@@ -232,11 +267,12 @@ fn main() {
     let header_dir = out_dir.join("sha-headers");
     fs::create_dir_all(&header_dir).expect("create sha-headers");
     for (git_path, file_name) in HEADER_GIT_PATHS {
-        extract_git_blob(
+        extract_header(
             &llama_dir,
             &expected_sha,
             git_path,
             &header_dir.join(file_name),
+            pin_ok,
         );
     }
 
@@ -333,8 +369,11 @@ fn main() {
     for extra in link_search_extra {
         println!("cargo:rustc-link-search=native={extra}");
     }
-    // rpath so `cargo test` finds the SHA-pinned .so without LD_LIBRARY_PATH.
+    // rpath: 개발/테스트는 절대 bin_dir로, 배포 tarball은 `$ORIGIN/lib`(바이너리
+    // 옆 `lib/`)과 `$ORIGIN`으로 `.so`를 찾는다 (scripts/package-release.sh).
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bin_dir.display());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     for extra in link_search_extra {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{extra}");
     }
@@ -369,20 +408,55 @@ fn main() {
     println!("cargo:root={}", llama_dir.display());
 }
 
-fn git_stdout(repo: &Path, args: &[&str]) -> String {
+/// 저장소 루트의 `vendor/<name>` 트리 경로.
+fn vendor_dir(name: &str) -> PathBuf {
+    Path::new(&env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("vendor")
+        .join(name)
+}
+
+/// git 저장소면 HEAD SHA, 아니면 None (tarball/vendor 트리).
+fn git_head(repo: &Path) -> Option<String> {
+    if !repo.join(".git").exists() {
+        return None;
+    }
     let out = Command::new("git")
-        .args(args)
+        .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output()
-        .unwrap_or_else(|e| panic!("git {} failed: {e}", args.join(" ")));
+        .ok()?;
     if !out.status.success() {
-        panic!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// `scripts/build-llama.sh`가 남기는 핀 마커.
+fn read_pin_marker(repo: &Path) -> Option<String> {
+    fs::read_to_string(repo.join(".golbang-llama-pin"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// 정확한 핀이면 git 오브젝트에서, 패치 재현 트리면 워킹트리에서 헤더를 가져온다.
+fn extract_header(repo: &Path, sha: &str, git_path: &str, dest: &Path, pin_ok: bool) {
+    if pin_ok {
+        extract_git_blob(repo, sha, git_path, dest);
+        return;
+    }
+    let src = repo.join(git_path);
+    fs::copy(&src, dest)
+        .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dest.display()));
 }
 
 fn extract_git_blob(repo: &Path, sha: &str, git_path: &str, dest: &Path) {

@@ -119,21 +119,23 @@ Vulkan은 같은 모델을 다른 커널 경로로 돌려볼 수 있는 백엔�
 | 항목 | 값 |
 |------|-----|
 | Rust | edition 2024 (1.85+ 권장) |
-| llama.cpp | 아래 [빌드](#빌드-백엔드별)의 핀된 SHA로 직접 빌드 |
+| llama.cpp | `scripts/build-llama.sh <backend>`가 공개 base + [`patches/`](patches/)로 빌드 |
 | GPU (HIP) | gfx906 (MI50) + ROCm. `HSA_OVERRIDE_GFX_VERSION=9.0.6` |
 | GPU (CUDA) | sm_70+ (V100은 CUDA 12.8 — CUDA 13은 compute_70 미지원) |
 | GPU (Vulkan) | Any Vulkan device. `GGML_VULKAN=ON` cmake dir |
 
 `golbang-sys/build.rs`가 llama.cpp 트리의 **git SHA와 `.so` 바이트를 검사**한다.
 핀과 다른 헤더/라이브러리를 섞으면 조용히 깨지는 대신 빌드가 **hard error**로 실패한다.
-트리 경로는 `GOLBANG_LLAMA_DIR`, cmake 산출물 경로는 `GOLBANG_LLAMA_BIN_DIR`으로 지정한다.
+트리 경로는 `GOLBANG_LLAMA_DIR`(기본 `<repo>/vendor/<tree>`), cmake 산출물 경로는
+`GOLBANG_LLAMA_BIN_DIR`으로 지정한다. `scripts/build-llama.sh`가 만든 트리는
+`.golbang-llama-pin` 마커로 핀 검사를 통과하며, `.so` 바이트·헤더 검사는 그대로 돈다.
 
 ### 빌드와 실행
 
 ```bash
-# 1) 핀된 llama.cpp을 백엔드별로 빌드해둔다 (예: HIP)
-git -C "$GOLBANG_LLAMA_DIR" checkout <핀 SHA>
-cmake -B build -DGGML_HIP=ON && cmake --build build --config Release
+# 1) 핀된 llama.cpp 코어를 공개 소스에서 재현 빌드한다 (예: HIP).
+#    게시된 base 커밋을 SHA로 받아 patches/를 적용하고 cmake로 빌드 → vendor/.
+scripts/build-llama.sh hip          # 또는 cuda / vulkan / ds41 / ds41-cuda
 
 # 2) golbang 빌드 (백엔드는 GOLBANG_GPU 빌드 타임 결정. 런타임 스위치 없음)
 CARGO_TARGET_DIR=target-hip GOLBANG_GPU=hip \
@@ -375,9 +377,23 @@ completion 1500)가 동시에 HTTP 200으로 완주했고 `failed to find a memo
 `cargo test --workspace`는 `GOLBANG_TEST_MODEL`(소형 GGUF)이 있을 때
 SSE / JSON / 빈 messages 4xx / decode 중 503까지 돌고, 없으면 스킵한다.
 
+### 코어를 어떻게 얻나
+
+- **소스 빌드 (권장)** — `scripts/build-llama.sh <backend>`가 게시된 base 커밋을
+  SHA로 받아 [`patches/`](patches/)를 적용하고 `vendor/<tree>/`에 cmake로 빌드한다.
+  `hip`/`vulkan`은 `glm5next` + gfx906 furnace 포트, `ds41`은 vcruz305
+  `runtime/deepseek41` + gfx906 포트, `cuda`는 업스트림 + qwen4exp MTP 패치다.
+  각 패치의 base SHA·출처·적용 순서는 [`patches/README.md`](patches/README.md)에 있다.
+- **바이너리 tarball** — `scripts/package-release.sh <backend>`가 `golbang-server`와
+  매칭되는 llama.cpp/ggml `.so`를 `lib/`에 모아 `$ORIGIN/lib` 기준으로 재배치 가능한
+  `dist/golbang-<ver>-<backend>-<arch>.tar.gz`를 만든다. 사용자는 ROCm/CUDA
+  드라이버만 있으면 `./run.sh --model …`으로 실행한다(GPU 런타임은 정적으로 묶지 않는다).
+
 현재 pinned llama.cpp SHA는 `golbang-sys/build.rs`의 `EXPECTED_SHA_*` 상수가 진실이다.
-업스트림 따라잡기는 워크플로 일부다 — 핀을 올릴 때는 해당 SHA로 트리를 재빌드한 뒤
-상수만 바꾼다. 형제 트리(다른 브랜치/fork)의 헤더와 `.so`를 섞지 말 것.
+`build-llama.sh`로 재현한 트리는 `.golbang-llama-pin` 마커로 핀 검사를 통과하고,
+그 밖의 HEAD는 hard error다(`GOLBANG_LLAMA_ALLOW_DRIFT=1`로만 우회). 핀을 올릴 때는
+base/패치와 `EXPECTED_SHA_*`를 함께 갱신한다. 형제 트리(다른 브랜치/fork)의 헤더와
+`.so`를 섞지 말 것.
 
 ## 배포 예시
 
@@ -459,7 +475,8 @@ Rust로 쓴 스케줄러와 제어면을 테스트하는 프로젝트다. 순수
 | [`docs/work-orders/`](docs/work-orders/) | 단계별 실행 지시서 |
 | [`docs/bench/`](docs/bench/) | 성능 기록 + `raw/` 원본 JSON |
 | [`docs/bench/p8.md`](docs/bench/p8.md) | 호스트 접두 스냅샷: 배경·A/B/C·상수·생산 저널·정직한 한계 |
-| [`scripts/`](scripts/) | 벤치 재현 스크립트 (표준 라이브러리만 사용) |
+| [`scripts/`](scripts/) | `build-llama.sh`(코어 재현 빌드), `package-release.sh`(바이너리 tarball), 벤치 재현 스크립트 |
+| [`patches/`](patches/) | llama.cpp 핀 패치 + base SHA provenance (`patches/README.md`) |
 | [`deploy/`](deploy/) | systemd 유닛 예시 |
 
 ## 기여

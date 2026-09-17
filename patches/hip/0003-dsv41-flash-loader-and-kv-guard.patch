@@ -1,0 +1,175 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 01cd315b3..735b33a5f 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -680,6 +680,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,               "blk.%d.indexer_compressor_gate" },
+     { LLM_TENSOR_INDEXER_COMPRESSOR_APE,                 "blk.%d.indexer_compressor_ape" },
+     { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer_compressor_norm" },
++    { LLM_TENSOR_FFN_EXP_PROBS_B_VL,                      "blk.%d.exp_probs_b_vl" },
++    { LLM_TENSOR_ENGRAM_EMBD,                             "blk.%d.engram_embd" },
++    { LLM_TENSOR_ENGRAM_K,                                "blk.%d.engram_k" },
++    { LLM_TENSOR_ENGRAM_Q,                                "blk.%d.engram_q" },
++    { LLM_TENSOR_ENGRAM_WKV,                              "blk.%d.engram_wkv" },
+     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
+     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
+     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
+@@ -952,6 +957,13 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_INDEXER_COMPRESSOR_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    // deepseek4 V4.1-Flash: sparse-attention / engram tensors are not modeled by the
++    // loader; register them as GGML_OP_NONE so they are always skipped (never loaded).
++    {LLM_TENSOR_FFN_EXP_PROBS_B_VL,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
++    {LLM_TENSOR_ENGRAM_EMBD,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
++    {LLM_TENSOR_ENGRAM_K,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
++    {LLM_TENSOR_ENGRAM_Q,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
++    {LLM_TENSOR_ENGRAM_WKV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_NEXTN_PROJ_PRE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_PROJ_POST,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 201d7ceff..734c49e9b 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -702,6 +702,14 @@ enum llm_tensor {
+     LLM_TENSOR_DFLASH_SELECTOR_PREV,
+     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
++    // deepseek4 (V4.1-Flash) sparse-attention / engram tensors. The V4.1-Flash loader
++    // does not model these; they are queried (and counted) but skipped so the
++    // done_getting_tensors() tensor-count check passes without loading them.
++    LLM_TENSOR_FFN_EXP_PROBS_B_VL,  // blk.%d.exp_probs_b_vl (bias)
++    LLM_TENSOR_ENGRAM_EMBD,         // blk.%d.engram_embd (n-gram lookup table)
++    LLM_TENSOR_ENGRAM_K,            // blk.%d.engram_k
++    LLM_TENSOR_ENGRAM_Q,            // blk.%d.engram_q
++    LLM_TENSOR_ENGRAM_WKV,          // blk.%d.engram_wkv
+ };
+ 
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 4ca70f2f6..6d54aef32 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1472,11 +1472,15 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
+ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+-    if (attn_rot_k) {
++    if (attn_rot_k && n_embd_head_k_all > 0) {
+         int nrot = 64;
+ 
+         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
++        // guard: an empty cache (no layers, e.g. DSV4 compressed caches when the model has no
++        // ratio-4/128 layers) has n_embd_head_k_all==0; the loop below would overflow nrot to 0
++        // and divide by zero. Return nullptr instead (the graph only uses k_rot for the
++        // corresponding compressed ratio, which is absent in that case).
+         do {
+             nrot *= 2;
+         } while (n_embd_head_k_all % nrot == 0);
+@@ -1493,7 +1497,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+-    if (attn_rot_v) {
++    if (attn_rot_v && n_embd_head_v_all > 0) {
+         int nrot = 64;
+         // using smaller rotation matrices for V seems beneficial
+         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index b1a8e828b..2682c6764 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -96,14 +96,30 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = mtp_only    ? TENSOR_NOT_REQUIRED : 0;
+     const int mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
+ 
++    // V4.1-Flash carries sparse-attention (DSpark) and engram tensors that this loader
++    // does not model. done_getting_tensors() requires EVERY tensor in the file to be
++    // queried (counted); query each with TENSOR_SKIP so it is counted but never loaded.
++    // Tensors absent from the file are a no-op (get_tensor_meta == nullptr -> early return).
++    auto skip_file_tensor = [&](const LLM_TN_IMPL & tn) -> void {
++        const std::string name = tn.str();
++        const struct ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
++        if (meta == nullptr) {
++            return; // not present in this file; nothing to count
++        }
++        create_tensor(tn, {meta->ne[0], meta->ne[1], meta->ne[2], meta->ne[3]},
++                TENSOR_NOT_REQUIRED | TENSOR_SKIP);
++    };
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+ 
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+ 
+-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
+-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
+-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
++    // V4.1-Flash has no learned hyper-connection head (output_hc_fn/base/scale absent).
++    // Make them optional; the graph collapses the HC stream by mean when they are missing.
++    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, TENSOR_NOT_REQUIRED);
++    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult},         TENSOR_NOT_REQUIRED);
++    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1},               TENSOR_NOT_REQUIRED);
+ 
+     for (int i = 0; i < n_layer_all; ++i) {
+         auto & layer = layers[i];
+@@ -129,7 +145,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+         layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, flags);
+ 
+         const int64_t ratio = hparams.dsv4_compress_ratios[i];
+-        if (ratio != 0) {
++        // V4.1-Flash uses sparse "DSpark" attention with compression ratios 1 and 2, which
++        // this loader does not model; those layers fall back to dense attention in the graph
++        // (build_raw_attention) and need no compressor/indexer tensors. Only ratio 4 (CSA +
++        // indexer) and 128 (HCA) carry compressor tensors here.
++        if (ratio == 4 || ratio == 128) {
+             const int64_t coff = ratio == 4 ? 2 : 1;
+ 
+             layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head}, flags);
+@@ -147,11 +167,28 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+                 layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
+                 layer.indexer_comp_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {2 * n_embd_indexer, ratio}, flags);
+                 layer.indexer_comp_norm  = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {n_embd_indexer}, flags);
+-            } else if (ratio != 128) {
+-                throw std::runtime_error("DeepSeek-V4 loader only supports compression ratios 0, 4, and 128");
+             }
+         }
+ 
++        // V4.1-Flash sparse-attention / engram tensors (not modeled by this loader):
++        // query them so done_getting_tensors() counts them, but skip loading (TENSOR_SKIP).
++        // Absent tensors are a no-op. Compressor/indexer are only skipped here for the
++        // sparse ratio 1/2 layers; ratio 4/128 layers create them above as real tensors.
++        skip_file_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias",   i));
++        skip_file_tensor(tn(LLM_TENSOR_ENGRAM_EMBD,        "weight", i));
++        skip_file_tensor(tn(LLM_TENSOR_ENGRAM_K,           "weight", i));
++        skip_file_tensor(tn(LLM_TENSOR_ENGRAM_Q,           "weight", i));
++        skip_file_tensor(tn(LLM_TENSOR_ENGRAM_WKV,         "weight", i));
++        if (ratio != 4 && ratio != 128) {
++            skip_file_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_INDEXER_PROJ,       "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B,   "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,     "weight", i));
++            skip_file_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,     "weight", i));
++        }
++
+         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
+         if ((uint32_t) i < hparams.dsv4_hash_layer_count) {
+             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, flags);
+@@ -1334,7 +1371,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
+     }
+ 
+-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
++    if (model.hc_head_fn != nullptr) {
++        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
++    } else {
++        // V4.1-Flash: no learned head; collapse the hyper-connection stream by mean.
++        cur = build_hc_mean(ctx0, inpL);
++    }
+     cb(cur, "hc_head", -1);
+ 
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

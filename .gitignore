@@ -5,6 +5,10 @@
 Cargo.lock.bak
 *.pdb
 
+# llama.cpp core fetched by scripts/build-llama.sh, plus release tarballs
+/vendor/
+/dist/
+
 #local scratch / tooling output
 .temp/
 .tmp-hub/
