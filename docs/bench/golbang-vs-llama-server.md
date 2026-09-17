@@ -8,7 +8,7 @@
 ## 한 줄
 
 **decode tok/s 로는 이기지 않는다. 같은 커널·같은 `n_cpu_moe=32` 천장이다.**
-골뱅이 llama.cpp보다 나은 지점은 처리량이 아니라 **제어면, 소유권, 관측성, 그리고 그 천장을 32 GiB MI50에서 켜기까지 쌓인 서빙 레이어**다.
+골방이 llama.cpp보다 나은 지점은 처리량이 아니라 **제어면, 소유권, 관측성, 그리고 그 천장을 32 GiB MI50에서 켜기까지 쌓인 서빙 레이어**다.
 긴 프롬프트 전량 prefill은 오늘 측정에서 llama-server가 더 빨랐다 (`-ub 5800` vs `--n-ubatch 1024`).
 
 ---
@@ -69,7 +69,7 @@ GPU 클럭은 양측 동일하게 `perflevel=manual`, sclk bitmask level 8, mclk
    `blk.0–31` 라우팅 expert만 CPU mmap. attention·공유 expert·나머지 ~11층 expert는 GPU.
    층당 ~2 GiB라 지금 장부에서는 31로도 못 내린다. 상세: 위키 `n-cpu-moe-vram`.
 
-2. **`--n-ubatch 1024` (골뱅만)**
+2. **`--n-ubatch 1024` (골방만)**
    핀 SHA에서 `-ub 5800` 은 compute 버퍼 ~5 GiB → `cudaMalloc` OOM.
    논리 `n_batch=5800`은 유지하고 물리 ubatch만 1024 (compute ~2.2 GiB).
    60k KV ~2.9 GiB + 가중치 ~27 GiB 위에 남는 주머니가 그것뿐이다.
@@ -124,11 +124,11 @@ llama-server 저널 중간값도 같은 방향을 가리킨다: 2536토큰 처�
 | long | 7.87 | 8.00 |
 | turn1 | 8.09 | 8.20 |
 | turn2 | 8.35 | 8.34 |
-| 골뱅 `/metrics` 수명 | **8.16** | — |
+| 골방 `/metrics` 수명 | **8.16** | — |
 
 **오차 범위의 동률.** 약 8 tok/s, 토큰당 ~120–127 ms.
 P6 rocprof가 이미 말한 천장이다. decode wall의 ~68%는 호스트/CPU expert + `graph splits=66`이고, 1위 GPU 커널은 wall의 6.3%다.
-골뱅이 Rust라는 사실과 llama.cpp가 C++라는 사실은 이 숫자에 거의 안 나타난다.
+골방이 Rust라는 사실과 llama.cpp가 C++라는 사실은 이 숫자에 거의 안 나타난다.
 
 ### 3.3 prefix / 다턴
 
@@ -139,12 +139,12 @@ P6 rocprof가 이미 말한 천장이다. decode wall의 ~68%는 호스트/CPU e
 | short-2 (같은 `1+1=`) | cache_n=7 | cache_n=4 |
 
 양측 모두 슬롯 prefix를 재사용한다.
-골뱅은 P5 경로: `prefix restored from checkpoint reuse_len=2540`.
+골방은 P5 경로: `prefix restored from checkpoint reuse_len=2540`.
 llama.cpp.new도 자체 슬롯 캐시로 같은 주문을 2.5k → 수 토큰으로 줄인다.
 
 체감 의미: 3k대 대화를 턴마다 다시 먹으면 TTFT 30–40초. 캐시가 살면 **4–6초**.
-이 이득은 “골뱅만의 속도”가 아니라 **양쪽 다 켜 둔 기능**이다.
-골뱅 쪽에서 특별히 한 일은, 핀 SHA의 DSV4가 긴 `seq_rm`을 거부하는  constr를 **체크포인트 + `n_rs_seq=1`로 뚫은 것**이다. 그 전에는 생산 대화 3턴이 전부 `cache_n=0`이었다.
+이 이득은 “골방만의 속도”가 아니라 **양쪽 다 켜 둔 기능**이다.
+골방 쪽에서 특별히 한 일은, 핀 SHA의 DSV4가 긴 `seq_rm`을 거부하는  constr를 **체크포인트 + `n_rs_seq=1`로 뚫은 것**이다. 그 전에는 생산 대화 3턴이 전부 `cache_n=0`이었다.
 
 ### 3.4 과부하 (동시 4요청)
 
@@ -157,7 +157,7 @@ llama.cpp.new도 자체 슬롯 캐시로 같은 주문을 2.5k → 수 토큰으
 | 요청별 wall | 3.22 / 6.39 / 0.002 / 0.002 s | 5.78 / 2.90 / 8.64 / **11.54** s |
 | 스위트 wall | 6.39 s | 11.54 s |
 
-골뱅은 큐가 가득 차면 핸들러가 decode를 기다리지 않고 즉시 거절한다.
+골방은 큐가 가득 차면 핸들러가 decode를 기다리지 않고 즉시 거절한다.
 llama-server는 네 건을 슬롯 하나에 직렬로 넣는다. 마지막 클라이언트는 11.5초를 모른다 채 기다린다.
 
 이 차이가 ADR이 처음부터 “llama.cpp보다 개선된 동시성”이라고 부른 실체다.
@@ -224,7 +224,7 @@ llama-server도 continuous batching이 **기본**이다.
 | 임베딩/rerank/스펙큘/슬롯 UI까지 한 프로세스 | 채팅 스트리밍 + 메트릭 + 최소 스모크 UI(`--webui`) |
 
 join의 정의도 같다: **이번 `llama_decode`가 돌아온 직후** 빈 슬롯에 넣는다.
-골뱅 로그: `join after decode boundary`. GPU 워커만 `spawn_blocking`.
+골방 로그: `join after decode boundary`. GPU 워커만 `spawn_blocking`.
 그래서 decode 중에도 수신·503·취소 토큰이 살아 있다.
 P2에서 Qwen 0.6B `np=2` 후발 TTFT는 132.5 → 50.1 ms로, 같은 조건 llama-server 49.8 ms와 동률이었다.
 
@@ -241,14 +241,14 @@ P2에서 Qwen 0.6B `np=2` 후발 TTFT는 132.5 → 50.1 ms로, 같은 조건 lla
 | CPU_Mapped expert 0–31 | ~62.8 GiB |
 | GPU 가중치 | ~26.9 GiB |
 | KV 60k | ~2.9 GiB |
-| compute (골뱅 ubatch 1024) | ~2.2 GiB |
+| compute (골방 ubatch 1024) | ~2.2 GiB |
 | VRAM 합 | ~31.6 / 32.0 GiB |
 
 런타임에 가중치를 매 토큰 PCIe로 보내지 않는다. 활성 expert 6개의 GEMV가 **CPU에서** 돈다.
 층마다 GPU attention ↔ CPU expert 경계에서 그래프가 끊긴다 (`splits=66` at bs=1).
 그래서 커널을 Rust로 다시 쓰거나 HIP 한 개를 고쳐도 decode는 안 움직인다. P6(#29)가 그 프로파일이다.
 
-골뱅이 여기서 한 일:
+골방이 여기서 한 일:
 
 - `LoadParams.n_cpu_moe` 로 llama.cpp와 같은 정규식 오버라이드를 Rust에서 켬
 - `n_batch` / `n_ubatch` / `n_ctx` / `n_rs_seq` 를 CLI로 분리
@@ -275,7 +275,7 @@ P5: Stop/Length 는 KV를 남긴다
 오늘 측정에서 그 경로가 살아 있다.
 `prefix restored from checkpoint reuse_len=2540`. turn2 wall 5.90 s.
 llama.cpp.new도 같은 주문을 캐시하므로, **사용자 체감의 다턴 이득은 이제 양쪽 다 있다.**
-차이는 구현 위치다. 골뱅은 그 로직이 Rust에 있고, DSV4 제약을 위키·지시서·테스트로 고정했다.
+차이는 구현 위치다. 골방은 그 로직이 Rust에 있고, DSV4 제약을 위키·지시서·테스트로 고정했다.
 
 ### 4.6 API 표면
 
@@ -291,7 +291,7 @@ llama.cpp.new도 같은 주문을 캐시하므로, **사용자 체감의 다턴 
 | 인증 | Bearer / `X-Api-Key` | `--api-key` |
 | 빈 messages | HTTP 400 | (구현 의존) |
 
-골뱅은 **채팅 서빙에 필요한 면만** 남겼다.
+골방은 **채팅 서빙에 필요한 면만** 남겼다.
 빠진 `/health` 는 열등이지, 철학이 아니다. 넣으면 된다.
 
 ### 4.7 로드맵이 남긴 것
@@ -311,7 +311,7 @@ P4를 열지 않은 이유가 오늘 숫자와 같다.
 
 ---
 
-## 5. 그럼 골뱅이 나은 점은 뭔가
+## 5. 그럼 골방이 나은 점은 뭔가
 
 처리량 표만 보면 llama-server가 long prefill에서 이기고 decode는 동률이다.
 그래도 이 레포를 만든 이유는 아래다.
@@ -321,7 +321,7 @@ P4를 열지 않은 이유가 오늘 숫자와 같다.
 과부하를 **관측 가능한 거절**로 바꿀 수 있다.
 오늘: 동시 4요청 중 2건이 1.6 ms 만에 503.
 llama-server 클라이언트는 11.5초를 슬롯 뒤에서 기다린다.
-정책을 바꾸려면 골뱅은 `SchedulePolicy` 구현체를 교체하면 되고, llama-server는 `server.cpp`를 고친다.
+정책을 바꾸려면 골방은 `SchedulePolicy` 구현체를 교체하면 되고, llama-server는 `server.cpp`를 고친다.
 
 ### 5.2 HTTP가 decode에 묶이지 않는다
 
@@ -347,7 +347,7 @@ llama.cpp.new도 캐시가 산다. 그래도 핀 SHA + DSV4 `seq_rm` 실패는 *
 요청이 끝나면 llama와 같은 `prompt eval` / `eval time` 로그.
 응답 JSON에 `timings`.
 `/metrics`에 수명 평균과 히스토그램.
-오늘 골뱅 수명 decode **8.16 tok/s**, prefill(캐시 제외) **68.9 tok/s**.
+오늘 골방 수명 decode **8.16 tok/s**, prefill(캐시 제외) **68.9 tok/s**.
 
 ### 5.6 표면이 얇다
 
@@ -372,13 +372,13 @@ gfx906 + 이 모델 + OpenAI 채팅만 보면 고장면이 적다.
 | ~2.5k 전량 prefill | **llama-server** (126 vs 84 tok/s). `-ub 5800` + 신 SHA |
 | decode tok/s | **동률** (~8). 차이는 노이즈 |
 | 다턴 prefix 체감 | **동률** (양쪽 cache_n ≈ 2540, 2턴 wall 6초 전후) |
-| 기능 폭 | **llama-server** (`/props`, 임베딩, 샘플러 옵션). 골뱅의 내장 UI는 API 키·속도 통계·스모크 채팅뿐 |
+| 기능 폭 | **llama-server** (`/props`, 임베딩, 샘플러 옵션). 골방의 내장 UI는 API 키·속도 통계·스모크 채팅뿐 |
 | `/health` | **llama-server** |
-| 신 트리 추적 | **llama-server** (`e700bfb37`). 골뱅은 고의로 핀 |
-| GPU 커널 | **동일 계열** ggml-hip. 골뱅은 더 오래된 SHA |
+| 신 트리 추적 | **llama-server** (`e700bfb37`). 골방은 고의로 핀 |
+| GPU 커널 | **동일 계열** ggml-hip. 골방은 더 오래된 SHA |
 | 32 GiB에서 모델이 뜨는가 | **동률**. 같은 `-ncmoe 32` |
 
-골뱅 long prefill이 느린 것은 회귀로 포장하지 않는다.
+골방 long prefill이 느린 것은 회귀로 포장하지 않는다.
 32 GiB + 핀 SHA의 compute 버퍼가 5800을 거부한 결과다.
 ubatch를 올리려면 VRAM 장부를 바꿔야 한다 (`n-cpu-moe-vram`).
 
@@ -386,7 +386,7 @@ ubatch를 올리려면 VRAM 장부를 바꿔야 한다 (`n-cpu-moe-vram`).
 
 ## 7. 결론
 
-골뱅은 llama.cpp를 **교체한 GPU 엔진이 아니다.**
+골방은 llama.cpp를 **교체한 GPU 엔진이 아니다.**
 같은 HIP 커널을 Rust가 오케스트레이션하는 **서빙 엔진**이다.
 
 오늘 숫자로 말하면:
@@ -394,9 +394,9 @@ ubatch를 올리려면 VRAM 장부를 바꿔야 한다 (`n-cpu-moe-vram`).
 - 생성 속도: **같다** (8 tok/s, `n_cpu_moe=32` 천장)
 - 긴 프롬프트 첫 토큰: **llama-server가 빠르다** (24 s vs 34 s @ 2.5k)
 - 같은 대화의 다음 턴: **둘 다 6초 전후** (prefix 생존)
-- 슬롯이 바쁠 때: **골뱅만 1.6 ms 만에 503**
+- 슬롯이 바쁠 때: **골방만 1.6 ms 만에 503**
 
-그래서 “llama.cpp로 돌리는 것보다 골뱅이 나은 점”은 벤치 표의 tok/s가 아니라 다음이다.
+그래서 “llama.cpp로 돌리는 것보다 골방이 나은 점”은 벤치 표의 tok/s가 아니라 다음이다.
 
 1. **거절할 수 있는 서버** — 과부하가 대기 시간으로 숨지 않는다
 2. **정책을 우리 언어로 바꾸는 서버** — join/evict/예산이 Rust trait
@@ -405,14 +405,14 @@ ubatch를 올리려면 VRAM 장부를 바꿔야 한다 (`n-cpu-moe-vram`).
 5. **커널 환상에 속지 않는 서버** — P6가 “고칠 커널 없음”을 숫자로 닫았다
 
 다음 레버는 여전히 커널이 아니다. VRAM을 늘리거나 `n_cpu_moe`를 내릴 수 있을 때 decode가 움직인다.
-그 전까지 골뱅의 할 일은 처리량 경쟁이 아니라, 이 천장 위에서 **제어면과 다턴과 관측을 더 정확하게 만드는 것**이다.
+그 전까지 골방의 할 일은 처리량 경쟁이 아니라, 이 천장 위에서 **제어면과 다턴과 관측을 더 정확하게 만드는 것**이다.
 
 ---
 
 ## 부록 A. 재현
 
 ```bash
-# 골뱅 (생산 유닛이 이미 떠 있으면 그대로)
+# 골방 (생산 유닛이 이미 떠 있으면 그대로)
 python3 scripts/compare_golbang_llama.py \
   --name golbang-deepseek \
   --url http://127.0.0.1:8080/v1/chat/completions \

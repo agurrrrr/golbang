@@ -2,8 +2,8 @@
 
 **English** · [한국어](README_KO.md)
 
-> **golbang** (골뱅이, "snail") — a GGUF LLM inference server that serves **current
-> large and MoE models** on AMD MI50 (gfx906) and NVIDIA V100.
+> **golbang** (골방, "a small room") — a homelab GGUF LLM inference server that serves
+> **current large and MoE models** on AMD MI50 (gfx906) and NVIDIA V100.
 > Serving, scheduling, and batching are Rust; GPU math calls a SHA-pinned
 > llama.cpp (ggml) through the C ABI.
 > The serving surface stays minimal: a single OpenAI-compatible chat API.

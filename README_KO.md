@@ -2,8 +2,8 @@
 
 [English](README.md) · **한국어**
 
-> **골뱅이(golbang)** 는 AMD MI50(gfx906)과 NVIDIA V100에서 **최신 대형·MoE 모델을 서빙**하는
-> GGUF LLM 추론 서버입니다.
+> **골방(golbang)** 은 '작은 방'이라는 뜻으로, 홈랩에서 만드는 추론 서버를 가리킵니다.
+> AMD MI50(gfx906)과 NVIDIA V100에서 **최신 대형·MoE 모델을 서빙**하는 GGUF LLM 추론 서버입니다.
 > 서빙·스케줄·배칭은 Rust가 맡고, GPU 수학은 SHA로 고정한 llama.cpp(ggml)를 C ABI로 호출합니다.
 > 서빙 표면은 OpenAI 호환 채팅 API 하나로 최소한을 유지합니다.
 
