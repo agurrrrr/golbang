@@ -2560,24 +2560,37 @@ fn restore_host_snapshot(
     if search_len == 0 {
         return None;
     }
+    // A fresh sequence (`gpu_n == 0`) cannot use the RAM tier: `seq_state_get`
+    // is PARTIAL_ONLY and omits the ISWA non-SWA base, so `seq_state_set` after
+    // `clear_seq` restores 0 cells on a hybrid model (Qwen3.8) and the bind
+    // falls back to full prefill. Prefer the self-sufficient full-state disk
+    // entry there; a resident sequence keeps the cheaper RAM path. (#250 test)
+    let fresh_seq = reuse_len == 0 || gpu_n == 0;
     let (host_ckpt, from_disk) = {
         let mut store = prefix_store.lock().unwrap();
-        if let Some(ckpt) = store.find_best_ram_for_bind(prompt, reuse_len) {
-            (ckpt, false)
-        } else if let Some(ckpt) = store.find_disk_for_bind(prompt, reuse_len) {
-            (ckpt, true)
+        let ram = store.find_best_ram_for_bind(prompt, reuse_len);
+        let disk = if fresh_seq || ram.is_none() {
+            store.find_disk_for_bind(prompt, reuse_len)
         } else {
-            if let Some(diag) = store.miss_diag(prompt) {
-                tracing::warn!(
-                    slot = slot.id.0,
-                    reuse_len,
-                    search_len,
-                    lcp = diag.max_lcp,
-                    store_ns = ?diag.store_ns,
-                    "host snapshot miss"
-                );
+            None
+        };
+        match (fresh_seq, disk, ram) {
+            (true, Some(d), _) => (d, true),
+            (_, _, Some(r)) => (r, false),
+            (_, Some(d), None) => (d, true),
+            (_, None, None) => {
+                if let Some(diag) = store.miss_diag(prompt) {
+                    tracing::warn!(
+                        slot = slot.id.0,
+                        reuse_len,
+                        search_len,
+                        lcp = diag.max_lcp,
+                        store_ns = ?diag.store_ns,
+                        "host snapshot miss"
+                    );
+                }
+                return None;
             }
-            return None;
         }
     };
     tracing::info!(
@@ -3033,6 +3046,7 @@ mod tests {
         state: std::collections::HashMap<i32, Vec<u8>>,
         n_ubatch: u32,
         seq_state_set_count: usize,
+        seq_state_full_set_count: usize,
     }
 
     impl FakeSeqKv {
@@ -3043,12 +3057,17 @@ mod tests {
                     state: std::collections::HashMap::new(),
                     n_ubatch: 2048,
                     seq_state_set_count: 0,
+                    seq_state_full_set_count: 0,
                 }),
             }
         }
 
         fn seq_state_set_count(&self) -> usize {
             self.inner.lock().unwrap().seq_state_set_count
+        }
+
+        fn seq_state_full_set_count(&self) -> usize {
+            self.inner.lock().unwrap().seq_state_full_set_count
         }
 
         fn with_n_ubatch(n_ubatch: u32) -> Self {
@@ -3124,6 +3143,7 @@ mod tests {
             }
             let mut g = self.inner.lock().unwrap();
             g.seq_state_set_count = g.seq_state_set_count.saturating_add(1);
+            g.seq_state_full_set_count = g.seq_state_full_set_count.saturating_add(1);
             g.state.insert(seq, data.to_vec());
             g.n_past.insert(seq, data.len() as u32);
             true
@@ -3790,6 +3810,41 @@ mod tests {
             disk_kv.seq_state_get(0),
             ram_state,
             "restored bytes must be identical"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_slot_prefers_full_state_disk_over_partial_ram() {
+        // #250 follow-up: `restore_host_snapshot` clears the sequence before
+        // restoring, and a PARTIAL_ONLY RAM dump omits the ISWA non-SWA base,
+        // so on a fresh slot it restores 0 cells (production: "partial restore
+        // incomplete; full prefill"). When both tiers hold the key, the
+        // self-sufficient full-state disk entry must win.
+        let dir = disk_temp_dir("fresh_disk");
+        let head: Vec<Token> = (0..12_288).map(|i| (i % 7) as Token).collect();
+        let mut prompt = head.clone();
+        prompt.extend((0..1_000).map(|i| (100 + i % 3) as Token));
+
+        let mut store = PrefixStore::with_disk(&dir, 1 << 30, disk_fp("a")).unwrap();
+        store.put(head.clone(), ckpt_n(12_288, 0x11));
+        store.persist(&head, &ckpt_n(12_288, 0x22));
+        let store = Arc::new(std::sync::Mutex::new(store));
+
+        let mut slot = Slot::new(SlotId(0));
+        let kv = FakeSeqKv::new();
+        assert!(bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store));
+        assert_eq!(
+            slot.job.as_ref().unwrap().prompt_offset,
+            12_288,
+            "restored"
+        );
+        assert_eq!(kv.seq_state_full_set_count(), 1, "disk full-state path used");
+        assert_eq!(kv.seq_state_set_count(), 1, "only the full-state restore ran");
+        assert_eq!(
+            kv.seq_state_get(0),
+            Some(vec![0x22; 12_288]),
+            "disk bytes, not the RAM partial dump"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
