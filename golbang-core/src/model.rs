@@ -525,6 +525,18 @@ impl Model {
         self.n_rs_seq
     }
 
+    /// True for hybrid (attention + recurrent) and pure-recurrent archs.
+    ///
+    /// These keep a rolling recurrent state whose per-token rollback
+    /// snapshots (`n_rs_seq` planes) are **not** serialized by the PARTIAL
+    /// `seq_state_get`/`seq_state_set` used for host prefix snapshots. A
+    /// rollback after such a restore would reuse stale planes and silently
+    /// corrupt the state, so the scheduler refuses post-restore rollback
+    /// (issue #252).
+    pub fn has_recurrent_memory(&self) -> bool {
+        unsafe { llama_model_is_hybrid(self.model) || llama_model_is_recurrent(self.model) }
+    }
+
     pub fn vision_enabled(&self) -> bool {
         self.vision.is_some()
     }

@@ -70,6 +70,12 @@ impl Engine {
         self.lock().n_rs_seq()
     }
 
+    /// True for hybrid (attention + recurrent) and pure-recurrent archs. See
+    /// [`Model::has_recurrent_memory`].
+    pub fn has_recurrent_memory(&self) -> bool {
+        self.lock().has_recurrent_memory()
+    }
+
     pub fn vision_enabled(&self) -> bool {
         self.lock().vision_enabled()
     }

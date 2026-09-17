@@ -785,6 +785,12 @@ trait SeqKv {
     fn seq_state_full_get(&self, seq: i32) -> Option<Vec<u8>>;
     fn seq_state_full_set(&self, seq: i32, data: &[u8]) -> bool;
     fn n_ubatch(&self) -> u32;
+    /// True for hybrid/recurrent archs whose recurrent rollback snapshots are
+    /// not serialized by PARTIAL `seq_state_get`/`seq_state_set`. See
+    /// [`Engine::has_recurrent_memory`]. Default `false` (tests, plain KV).
+    fn has_recurrent_memory(&self) -> bool {
+        false
+    }
     fn encode(&self, text: &str) -> crate::error::Result<Vec<Token>>;
     fn tokenize_special(&self, text: &str) -> crate::error::Result<Vec<Token>>;
     fn bind_vision(&self, slot: &mut Slot, job: Job, ctx_cap: u32) -> bool {
@@ -821,6 +827,9 @@ impl SeqKv for Engine {
     }
     fn n_ubatch(&self) -> u32 {
         Engine::n_ubatch(self)
+    }
+    fn has_recurrent_memory(&self) -> bool {
+        Engine::has_recurrent_memory(self)
     }
     fn encode(&self, text: &str) -> crate::error::Result<Vec<Token>> {
         Engine::encode(self, text)
@@ -925,6 +934,13 @@ fn bind_slot(
                     "demand boundary armed"
                 );
             }
+        }
+        // Recurrent (hybrid) models: also snapshot the state before the final
+        // prompt token. Next turn's BPE-shifted LCP lands exactly there, so the
+        // chain anchor restores without a post-restore recurrent rollback
+        // (issue #252); `reuse_for_bind` always clamps to `prompt.len()-1`.
+        if engine.has_recurrent_memory() && n_prompt > active.n_past {
+            active.pre_gen_stop = Some(n_prompt - 1);
         }
     }
     arm_think_budget(slot, engine);
@@ -1145,6 +1161,8 @@ fn apply_plan(
             let mut need_chain = false;
             let mut promote_key: Option<Vec<Token>> = None;
             let mut demand_boundary = false;
+            // Recurrent pre-generation anchor: chain-only (skip disk persist).
+            let mut pre_gen_capture = false;
             let n_ubatch = engine.n_ubatch().max(1) as u32;
             if let Some(job) = slot.job.as_mut() {
                 job.prompt_pos += *take as usize;
@@ -1163,6 +1181,10 @@ fn apply_plan(
                     job.prefill_stop = None;
                     demand_boundary = true;
                 }
+                let pre_gen_stub = job.pre_gen_stop.is_some_and(|b| n_past >= b);
+                if pre_gen_stub {
+                    job.pre_gen_stop = None;
+                }
                 let store_stub = stride_stub || demand_boundary;
                 if job.prefill_done() {
                     slot.phase = SlotPhase::Decoding;
@@ -1180,6 +1202,12 @@ fn apply_plan(
                     // window. Other stride dumps go to the host store only.
                     need_chain = is_last_host_stub(n_past) && !demand_boundary;
                     promote_key = snapshot_key(&job.prompt_tokens, n_past);
+                } else if pre_gen_stub {
+                    // Recurrent: state before the final prompt token. The next
+                    // turn's BPE-shifted LCP lands here, so it restores with no
+                    // post-restore rollback (issue #252).
+                    need_chain = true;
+                    pre_gen_capture = true;
                 }
             }
             if need_chain || promote_key.is_some() {
@@ -1190,7 +1218,7 @@ fn apply_plan(
                 // (the store-stub window plus the prefill end). Full-state
                 // dumps are bounded by the stub window except the prefill end.
                 let anchor_disk_key = promote_key.clone().or_else(|| {
-                    if need_chain {
+                    if need_chain && !pre_gen_capture {
                         slot.job
                             .as_ref()
                             .and_then(|j| snapshot_key(&j.prompt_tokens, n_tokens))
@@ -2416,14 +2444,19 @@ fn latest_ckpt_n(slot: &Slot) -> u32 {
         .unwrap_or(0)
 }
 
-/// Longest anchor with `n_tokens <= reuse_len + 1` (one-token slack covers
-/// ` thinking` vs ` response`). Returns `(index, n_tokens)` in the chain,
-/// or `None` when nothing fits.
-fn best_chain_anchor(slot: &Slot, reuse_len: usize) -> Option<(usize, u32)> {
+/// Longest anchor with `n_tokens <= reuse_len + slack` (a one-token slack
+/// covers ` thinking` vs ` response` re-tokenization). Returns
+/// `(index, n_tokens)` in the chain, or `None` when nothing fits.
+///
+/// Recurrent (hybrid) models pass `slack = 0`: restoring an anchor one token
+/// past the LCP would require a post-restore rollback, which reads stale
+/// recurrent snapshot planes (see [`post_restore_rollback_unsafe`]).
+fn best_chain_anchor(slot: &Slot, reuse_len: usize, slack: usize) -> Option<(usize, u32)> {
+    let limit = reuse_len as u32 + slack as u32;
     slot.prefix_ckpts
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.n_tokens != 0 && c.n_tokens <= reuse_len as u32 + 1)
+        .filter(|(_, c)| c.n_tokens != 0 && c.n_tokens <= limit)
         .max_by_key(|(_, c)| c.n_tokens)
         .map(|(i, c)| (i, c.n_tokens))
 }
@@ -2472,8 +2505,11 @@ fn settle_prefix_kv(
     }
     let gpu_after = engine.n_past_seq(seq);
 
-    // P8-A: pick the longest anchor that still fits the LCP.
-    if let Some((_, ckpt_n)) = best_chain_anchor(slot, reuse_len) {
+    // P8-A: pick the longest anchor that still fits the LCP. Recurrent models
+    // only accept `n_tokens <= reuse_len`: a one-token-past anchor would need a
+    // post-restore rollback, unsafe on hybrid/recurrent archs (issue #252).
+    let anchor_slack = if engine.has_recurrent_memory() { 0 } else { 1 };
+    if let Some((_, ckpt_n)) = best_chain_anchor(slot, reuse_len, anchor_slack) {
         let ckpt = slot
             .prefix_ckpts
             .iter()
@@ -2496,6 +2532,21 @@ fn settle_prefix_kv(
             );
         }
         let kept = reuse_len.min(ckpt_n as usize);
+        // Recurrent rollback planes are not in the PARTIAL dump; a shrink below
+        // the restored `ckpt_n` would corrupt the prefix (issue #252). Refuse
+        // the one-token slack trim and full-prefill instead.
+        if post_restore_rollback_unsafe(engine, ckpt_n, kept) {
+            tracing::warn!(
+                slot = slot.id.0,
+                reuse_len,
+                ckpt_n,
+                "recurrent prefix rollback after restore; full prefill"
+            );
+            engine.clear_seq(seq);
+            slot.prefix_cache.reset();
+            prune_chain_beyond_reuse(slot, 0);
+            return 0;
+        }
         if trim_seq_to(engine, seq, kept) {
             tracing::info!(
                 slot = slot.id.0,
@@ -2654,8 +2705,10 @@ fn restore_host_snapshot(
         prune_chain_beyond_reuse(slot, kept);
         return Some(kept);
     }
-    // In-process RAM entries are PARTIAL_ONLY: the non-SWA base is still
-    // resident in this context, so a rollback via `trim_seq_to` is valid.
+    // In-process RAM entries are PARTIAL_ONLY: the attention base stays
+    // resident in this context, so a positional rollback via `trim_seq_to` is
+    // valid for plain KV. Recurrent state has no positional KV to roll back —
+    // the guard below catches that case (issue #252).
     if !engine.seq_state_set(seq, &host_ckpt.data) {
         tracing::warn!(
             slot = slot.id.0,
@@ -2674,6 +2727,17 @@ fn restore_host_snapshot(
             reuse_len,
             host_n = host_ckpt.n_tokens,
             "partial restore incomplete; full prefill"
+        );
+        engine.clear_seq(seq);
+        prune_chain_beyond_reuse(slot, 0);
+        return None;
+    }
+    if post_restore_rollback_unsafe(engine, host_ckpt.n_tokens, kept) {
+        tracing::warn!(
+            slot = slot.id.0,
+            reuse_len,
+            host_n = host_ckpt.n_tokens,
+            "recurrent host-snapshot rollback; full prefill"
         );
         engine.clear_seq(seq);
         prune_chain_beyond_reuse(slot, 0);
@@ -2706,6 +2770,19 @@ fn restore_host_snapshot(
     engine.clear_seq(seq);
     prune_chain_beyond_reuse(slot, 0);
     None
+}
+
+/// `true` when shrinking a sequence from `from_n` to `to_n` would roll back a
+/// recurrent (hybrid) state after a PARTIAL host-snapshot restore.
+///
+/// `seq_state_get` PARTIAL_ONLY writes only the logical current recurrent row
+/// (plane 0); the `n_rs_seq` rollback planes are **not** serialized, and
+/// `state_read` resets `rs_idx = 0`. A following `rm_seq_from` below the
+/// restored length re-arms a rollback that would read those stale planes,
+/// silently diverging on the next decode (issue #252, qwen4exp). Only accepted
+/// when no rollback is needed (`to_n >= from_n`).
+fn post_restore_rollback_unsafe(engine: &impl SeqKv, from_n: u32, to_n: usize) -> bool {
+    engine.has_recurrent_memory() && to_n < from_n as usize
 }
 
 fn trim_seq_to(engine: &impl SeqKv, seq: i32, n: usize) -> bool {
@@ -2900,26 +2977,29 @@ mod tests {
         let slot = chain_slot(&[100, 200, 300]);
 
         // reuse_len=200 → anchor 200 fits (200 <= 201) and is the longest.
-        assert_eq!(best_chain_anchor(&slot, 200).map(|(_, n)| n), Some(200));
+        assert_eq!(best_chain_anchor(&slot, 200, 1).map(|(_, n)| n), Some(200));
         // reuse_len=150 → 200/300 too long; only 100 fits.
-        assert_eq!(best_chain_anchor(&slot, 150).map(|(_, n)| n), Some(100));
+        assert_eq!(best_chain_anchor(&slot, 150, 1).map(|(_, n)| n), Some(100));
         // reuse_len=300 → 300 fits (300 <= 301).
-        assert_eq!(best_chain_anchor(&slot, 300).map(|(_, n)| n), Some(300));
+        assert_eq!(best_chain_anchor(&slot, 300, 1).map(|(_, n)| n), Some(300));
         // reuse_len below (shortest - 1) → nothing fits.
         // (shortest=100, +1 slack → need reuse_len <= 98 for 100 to not fit)
-        assert_eq!(best_chain_anchor(&slot, 98).map(|(_, n)| n), None);
-        assert_eq!(best_chain_anchor(&slot, 99).map(|(_, n)| n), Some(100));
+        assert_eq!(best_chain_anchor(&slot, 98, 1).map(|(_, n)| n), None);
+        assert_eq!(best_chain_anchor(&slot, 99, 1).map(|(_, n)| n), Some(100));
     }
 
     #[test]
     fn best_chain_anchor_one_token_slack() {
         let slot = chain_slot(&[100, 200]);
         // n_tokens=200 <= reuse_len+1=201 → still fits at reuse_len=200.
-        assert_eq!(best_chain_anchor(&slot, 200).map(|(_, n)| n), Some(200));
+        assert_eq!(best_chain_anchor(&slot, 200, 1).map(|(_, n)| n), Some(200));
         // reuse_len=199 → 200 (<=200) still fits due to +1 slack.
-        assert_eq!(best_chain_anchor(&slot, 199).map(|(_, n)| n), Some(200));
+        assert_eq!(best_chain_anchor(&slot, 199, 1).map(|(_, n)| n), Some(200));
         // reuse_len=198 → 200 (>199) does not fit; 100 does.
-        assert_eq!(best_chain_anchor(&slot, 198).map(|(_, n)| n), Some(100));
+        assert_eq!(best_chain_anchor(&slot, 198, 1).map(|(_, n)| n), Some(100));
+        // Recurrent slack=0: use only what the LCP fully covers.
+        assert_eq!(best_chain_anchor(&slot, 199, 0).map(|(_, n)| n), Some(100));
+        assert_eq!(best_chain_anchor(&slot, 200, 0).map(|(_, n)| n), Some(200));
     }
 
     #[test]
@@ -3047,6 +3127,10 @@ mod tests {
         n_ubatch: u32,
         seq_state_set_count: usize,
         seq_state_full_set_count: usize,
+        /// Model recurrent (hybrid/recurrent arch) with this rollback window
+        /// (`n_rs_seq`). `rm_seq_from` refuses a shrink beyond it, mirroring
+        /// `llama_memory_recurrent::seq_rm`.
+        recurrent_window: Option<u32>,
     }
 
     impl FakeSeqKv {
@@ -3058,8 +3142,16 @@ mod tests {
                     n_ubatch: 2048,
                     seq_state_set_count: 0,
                     seq_state_full_set_count: 0,
+                    recurrent_window: None,
                 }),
             }
+        }
+
+        /// Recurrent (qwen4exp-like) fake: rolls back at most `window` tokens.
+        fn with_recurrent(window: u32) -> Self {
+            let kv = Self::new();
+            kv.inner.lock().unwrap().recurrent_window = Some(window);
+            kv
         }
 
         fn seq_state_set_count(&self) -> usize {
@@ -3122,6 +3214,13 @@ mod tests {
             if p0 < 0 {
                 g.n_past.insert(seq, 0);
             } else if (p0 as u32) <= cur {
+                // Recurrent rollback is bounded: `llama_memory_recurrent::seq_rm`
+                // refuses a shrink wider than `n_rs_seq` (and mutates nothing).
+                if let Some(window) = g.recurrent_window {
+                    if cur > p0 as u32 && cur - p0 as u32 > window {
+                        return false;
+                    }
+                }
                 g.n_past.insert(seq, p0 as u32);
             }
             true
@@ -3151,6 +3250,10 @@ mod tests {
 
         fn n_ubatch(&self) -> u32 {
             self.inner.lock().unwrap().n_ubatch
+        }
+
+        fn has_recurrent_memory(&self) -> bool {
+            self.inner.lock().unwrap().recurrent_window.is_some()
         }
 
         fn encode(&self, _text: &str) -> crate::error::Result<Vec<Token>> {
@@ -3480,6 +3583,149 @@ mod tests {
             "60k dump must survive prune"
         );
         assert_eq!(slots[0].prefix_cache.tokens.len(), 70_000);
+    }
+
+    // ── HAL-BUG #252: recurrent rescind of post-restore rollback ───────────
+
+    #[test]
+    fn recurrent_resend_rollback_full_prefills_instead_of_corrupting() {
+        // qwen4exp: prompt P (2000) + generated G (50) resident. Resend of the
+        // exact same P. The chain anchor sits at the prefill end (2000), but
+        // `reuse_for_bind` clamps to `prompt.len()-1` (1999), so restoring the
+        // anchor and trimming one token would re-arm a recurrent rollback whose
+        // snapshot planes were not serialized -> silent corruption and an empty
+        // reply (issue #252). Must full-prefill instead.
+        let prompt: Vec<Token> = (0..2_000).map(|i| (i % 7) as Token).collect();
+        let generated: Vec<Token> = (0..50).map(|i| (100 + i % 3) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.remember(&prompt, &generated, 2_050);
+        slot.prefix_ckpts = vec![ckpt_n(2_000, 0xAA)];
+        let kv = FakeSeqKv::with_recurrent(2);
+        kv.seed_state(0, vec![0xCD; 2_050]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+
+        assert!(bound, "resend bind must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 0,
+            "recurrent post-restore rollback must full-prefill, not corrupt"
+        );
+        assert_eq!(job.n_past, 0);
+        assert_eq!(kv.n_past_seq(0), 0, "GPU left clean for the full prefill");
+        assert!(
+            slot.prefix_ckpts.is_empty(),
+            "unusable recurrent anchor pruned"
+        );
+    }
+
+    #[test]
+    fn plain_attention_resend_still_reuses_after_rollback() {
+        // Control for #252: plain KV (qwen38 HIP) has positional attention only,
+        // so the same resend trims the generated suffix and reuses 1999.
+        let prompt: Vec<Token> = (0..2_000).map(|i| (i % 7) as Token).collect();
+        let generated: Vec<Token> = (0..50).map(|i| (100 + i % 3) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.remember(&prompt, &generated, 2_050);
+        slot.prefix_ckpts = vec![ckpt_n(2_000, 0xAA)];
+        let kv = FakeSeqKv::new();
+        kv.seed_state(0, vec![0xCD; 2_050]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+
+        assert!(bound, "plain-attention resend bind must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(job.prompt_offset, 1_999, "resident rollback reused");
+        assert_eq!(kv.n_past_seq(0), 1_999);
+    }
+
+    #[test]
+    fn recurrent_forward_multiturn_keeps_prefill_reuse() {
+        // #252 success criterion: a forward continuation (prompt grows) needs no
+        // rollback, so the recurrent guard must not drop the resident prefix.
+        let prompt: Vec<Token> = (0..2_000).map(|i| (i % 7) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.remember(&prompt, &[], 2_000);
+        slot.prefix_ckpts = vec![ckpt_n(2_000, 0xAA)];
+        let kv = FakeSeqKv::with_recurrent(2);
+        kv.seed_state(0, vec![0xCD; 2_000]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let mut forward = prompt.clone();
+        forward.extend((0..500).map(|i| (200 + i % 5) as Token));
+        let bound = bind_slot(&mut slot, job_with_tokens(forward), &kv, 40_000, &store);
+
+        assert!(bound, "forward bind must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(job.prompt_offset, 2_000, "resident prefix reused");
+        assert_eq!(kv.n_past_seq(0), 2_000, "no rollback, no restore needed");
+        assert_eq!(job.n_past, 2_000);
+    }
+
+    #[test]
+    fn recurrent_forward_multiturn_reuses_shorter_anchor() {
+        // A real forward turn diverges one token before the previous prefill end
+        // (BPE re-tokenizes the last prompt token against the appended message),
+        // and the generated suffix makes a resident rollback exceed the window.
+        // Recurrent must fall back to the last fully-covered anchor instead of a
+        // post-restore rollback, keeping the bulk of the prefill reuse.
+        let seed: Vec<Token> = (0..2_000).map(|i| (i % 7) as Token).collect();
+        let mut prev = seed.clone();
+        prev[1_999] = 111;
+        let generated: Vec<Token> = (0..100).map(|i| (400 + i % 5) as Token).collect();
+        let mut forward = seed.clone();
+        forward[1_999] = 222;
+        forward.extend((0..600).map(|i| (500 + i % 3) as Token));
+
+        let mut slot = Slot::new(SlotId(0));
+        slot.prefix_cache.remember(&prev, &generated, 2_100);
+        slot.prefix_ckpts = vec![ckpt_n(1_000, 0xAA), ckpt_n(2_000, 0xBB)];
+        let kv = FakeSeqKv::with_recurrent(2);
+        kv.seed_state(0, vec![0xCD; 2_100]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+
+        let bound = bind_slot(&mut slot, job_with_tokens(forward), &kv, 40_000, &store);
+
+        assert!(bound, "forward bind must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 1_000,
+            "recurrent forward reuses the last fully-covered anchor"
+        );
+        assert_eq!(kv.n_past_seq(0), 1_000, "restored without a rollback");
+        assert_eq!(
+            kv.seq_state_get(0),
+            Some(vec![0xAA; 1_000]),
+            "the 1000 anchor was restored"
+        );
+    }
+
+    #[test]
+    fn recurrent_host_snapshot_rollback_full_prefills() {
+        // The RAM host-snapshot path (`restore_host_snapshot`) also restores a
+        // PARTIAL dump; a shrink below the restored length is refused the same
+        // way. Store holds a 2000-token dump while the new prompt is 2000 long:
+        // search_len = 1999 < host_n => rollback => full prefill.
+        let prompt: Vec<Token> = (0..2_000).map(|i| (i % 7) as Token).collect();
+        let mut slot = Slot::new(SlotId(0));
+        let kv = FakeSeqKv::with_recurrent(2);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        store
+            .lock()
+            .unwrap()
+            .put(prompt.clone(), ckpt_n(2_000, 0xAB));
+
+        let bound = bind_slot(&mut slot, job_with_tokens(prompt), &kv, 40_000, &store);
+
+        assert!(bound, "host-snapshot bind must succeed");
+        let job = slot.job.as_ref().expect("slot occupied");
+        assert_eq!(
+            job.prompt_offset, 0,
+            "recurrent host-snapshot rollback must full-prefill"
+        );
+        assert_eq!(kv.n_past_seq(0), 0);
     }
 
     #[test]
@@ -3954,6 +4200,41 @@ mod tests {
         drop(g);
         assert!(
             slot.job.as_ref().unwrap().prefill_stop.is_none(),
+            "stop cleared after capture"
+        );
+    }
+
+    #[test]
+    fn apply_plan_captures_pre_gen_chain_anchor_without_disk() {
+        // Recurrent pre-generation stop: the chain gets the state before the
+        // final prompt token; the RAM/disk store is untouched (issue #252).
+        let mut slot = Slot::new(SlotId(0));
+        let prompt: Vec<Token> = (0..20_000).map(|i| (i % 7) as Token).collect();
+        slot.occupy(ActiveJob::for_test(prompt));
+        if let Some(job) = slot.job.as_mut() {
+            job.pre_gen_stop = Some(19_999);
+        }
+        let kv = FakeSeqKv::with_n_ubatch(2048);
+        kv.seed_state(0, vec![0xCD; 19_999]);
+        let store = Arc::new(std::sync::Mutex::new(PrefixStore::new()));
+        let plan = crate::batch::BatchPlan {
+            prefill_consumed: vec![(SlotId(0), 19_999)],
+            ..Default::default()
+        };
+
+        apply_plan(std::slice::from_mut(&mut slot), &plan, &kv, &store);
+
+        assert_eq!(
+            slot.prefix_ckpts
+                .iter()
+                .map(|c| c.n_tokens)
+                .collect::<Vec<_>>(),
+            vec![19_999],
+            "pre-generation anchor landed on the chain"
+        );
+        assert_eq!(store.lock().unwrap().len(), 0, "no store/disk promotion");
+        assert!(
+            slot.job.as_ref().unwrap().pre_gen_stop.is_none(),
             "stop cleared after capture"
         );
     }

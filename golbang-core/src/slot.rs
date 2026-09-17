@@ -114,6 +114,13 @@ pub(crate) struct ActiveJob {
     /// `apply_plan` can snapshot the observed reuse boundary exactly. Armed by
     /// `bind_slot` (Marconi selective retention) and cleared once captured.
     pub prefill_stop: Option<u32>,
+    /// Recurrent (hybrid) models: absolute `n_past` of the pre-generation
+    /// boundary (`n_prompt - 1`). Prefill pauses here so `apply_plan` can
+    /// capture a chain anchor for the state **before** the final prompt token.
+    /// The next turn's BPE-shifted LCP lands exactly here, so it restores
+    /// without a post-restore recurrent rollback (issue #252). Chain-only;
+    /// cleared once captured.
+    pub pre_gen_stop: Option<u32>,
     pub max_tokens: u32,
     /// Original `max_tokens` request. `max_tokens` is clamped to the current
     /// slot cap and can rise again when a neighbor leaves.
@@ -216,6 +223,7 @@ impl ActiveJob {
             n_generated: 0,
             n_prompt,
             prefill_stop: None,
+            pre_gen_stop: None,
             max_tokens,
             max_tokens_req,
             ctx_cap,
@@ -308,13 +316,18 @@ impl ActiveJob {
             .saturating_sub(self.prefill_cursor())
     }
 
-    /// Prefill tokens the next chunk may consume, honoring `prefill_stop` so a
-    /// demand-boundary snapshot lands exactly on the boundary (P9 borrow 1).
-    /// Once `n_past` reaches the stop the full remainder is returned; the
-    /// boundary is captured and the stop cleared in `apply_plan`.
+    /// Prefill tokens the next chunk may consume, honoring `prefill_stop`
+    /// (demand boundary) and `pre_gen_stop` (recurrent pre-generation anchor) so
+    /// a snapshot lands exactly on the boundary. Once `n_past` reaches a stop the
+    /// full remainder is returned; the boundary is captured and the stop cleared
+    /// in `apply_plan`.
     pub fn prefill_remaining_to_stop(&self) -> usize {
         let rem = self.prefill_remaining();
-        match self.prefill_stop {
+        let stop = match (self.prefill_stop, self.pre_gen_stop) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match stop {
             Some(stop) if stop > self.n_past => rem.min((stop - self.n_past) as usize),
             _ => rem,
         }
