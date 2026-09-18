@@ -59,17 +59,24 @@ ENV GOLBANG_N_THREADS=20
 ENV GOLBANG_N_BATCH=2048
 ENV GOLBANG_N_UBATCH=512
 ENV GOLBANG_JINJA=true
-# 임베디드 MTP(nextn_predict_layers=1) 추측 디코딩: 구조적/반복 생성에서 약 3x.
-# 자유 서술은 초안 수락률이 낮아(0.2~0.6) 이득이 작고, p_min으로 조기 중단해야
-# 초안 낭비가 줄어든다. 아래 p_min=0.5는 자유 서술 draft_ms 비중을 17%→10%로
-# 낮추면서 구조적 작업(수락률 1.0, mean len 3.97)은 그대로 유지한다.
-ENV GOLBANG_LOAD_MTP=true
-ENV GOLBANG_SPEC_TYPE=draft-mtp
+# 추측 디코딩(MTP)은 기본으로 끈다(2026-09-18). 사고모드는 자유 서술 비중이 커서
+# 초안 수락률이 낮고(0.2~0.6) per-token이 오히려 느려진다. 켜려면 LOAD_MTP=true,
+# SPEC_TYPE=draft-mtp에 아래 N_MAX/P_MIN을 쓴다(p_min=0.5가 자유 서술 draft_ms
+# 비중을 17%→10%로 낮추면서 구조적 작업 수락률 1.0은 유지한다).
+ENV GOLBANG_LOAD_MTP=false
+ENV GOLBANG_SPEC_TYPE=
 ENV GOLBANG_SPEC_DRAFT_N_MAX=3
 ENV GOLBANG_SPEC_DRAFT_P_MIN=0.5
 
-# 권장 샘플링 기본값 (empero-ai/Qwen3.8-4B-Distill 모델 카드: temp 0.6 / top_p 0.95 / top_k 20)
-ENV GOLBANG_TEMPERATURE=0.6
+# 사고(thinking) 모드: deepseek가 <think> 블록을 reasoning_content로 분리한다.
+# xhigh + budget 4096은 Qwen3.8-27B 유닛과 같은 값이다. 예산이 없으면 xhigh가
+# max_tokens을 전부 사고에 써버리므로 CPU에서는 특히 필요하다. efforts: xhigh|medium|low.
+ENV GOLBANG_REASONING_FORMAT=deepseek
+ENV GOLBANG_REASONING_EFFORT=xhigh
+ENV GOLBANG_REASONING_BUDGET=4096
+
+# 권장 샘플링 기본값 (empero-ai/Qwen3.8-4B-Distill 모델 카드: 사고 일반 temp 1.0 / top_p 0.95 / top_k 20)
+ENV GOLBANG_TEMPERATURE=1.0
 ENV GOLBANG_TOP_P=0.95
 ENV GOLBANG_TOP_K=20
 ENV GOLBANG_MAX_TOKENS=0
