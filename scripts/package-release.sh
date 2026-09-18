@@ -32,6 +32,7 @@ backend_target() {
     vulkan)    echo "target-vulkan" ;;
     ds41)      echo "target-ds41" ;;
     ds41-cuda) echo "target-ds41-cuda" ;;
+    cpu)       echo "target-cpu" ;;
     *) return 1 ;;
   esac
 }
@@ -42,6 +43,7 @@ backend_tree() {
     cuda)      echo "llama.cpp-cuda-upstream" ;;
     vulkan)    echo "llama.cpp-glm5next" ;;
     ds41|ds41-cuda) echo "llama.cpp-ds41" ;;
+    cpu)       echo "llama.cpp-glm5next" ;;
   esac
 }
 
@@ -49,13 +51,14 @@ backend_bindir() {
   case "$1" in
     vulkan) echo "build-vulkan/bin" ;;
     ds41-cuda) echo "build-cuda/bin" ;;
+    cpu) echo "build-cpu/bin" ;;
     *) echo "build/bin" ;;
   esac
 }
 
 BACKENDS=("$@")
 if [ "${#BACKENDS[@]}" -eq 0 ]; then
-  BACKENDS=(hip cuda vulkan ds41 ds41-cuda)
+  BACKENDS=(hip cuda vulkan ds41 ds41-cuda cpu)
 fi
 
 mkdir -p "$OUT"

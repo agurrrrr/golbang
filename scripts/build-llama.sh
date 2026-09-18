@@ -11,6 +11,7 @@
 #   scripts/build-llama.sh cuda         # V100(sm_70, CUDA 12.8)
 #   scripts/build-llama.sh ds41         # DeepSeek-V4.1 네이티브 런타임 (MI50)
 #   scripts/build-llama.sh vulkan
+#   scripts/build-llama.sh cpu          # CPU 전용 (GPU 백엔드 없음, 컨테이너 배포용)
 #
 # 빌드 후:
 #   GOLBANG_GPU=hip CARGO_TARGET_DIR=target-hip cargo build -p golbang-server --release
@@ -39,7 +40,7 @@ NOBUILD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    hip|cuda|vulkan|ds41|ds41-cuda) GPU="$1"; shift ;;
+    hip|cuda|vulkan|ds41|ds41-cuda|cpu) GPU="$1"; shift ;;
     --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
     --jobs) JOBS="${2:?--jobs needs a value}"; shift 2 ;;
     --force) FORCE=1; shift ;;
@@ -53,6 +54,10 @@ done
 
 GGML_URL="https://github.com/ggml-org/llama.cpp.git"
 VCRUZ_URL="https://github.com/vcruz305/llama.cpp.git"
+# 대상 타깃. 비우면 전체(`all`). CPU만 공유 라이브러리만 빌드한다 — 최신 트리의
+# `llama` 앱 타깃이 `LLAMA_BUILD_EXAMPLES/SERVER=OFF`에서 impl 심볼을 못 찾아
+# 링크에 실패하므로(golbang이 쓰지 않는 실행 파일), 필요한 라이브러리만 고른다.
+TARGETS=()
 
 # 트리/베이스/패치/빌드 디렉터리/최종 핀은 모두 build.rs와 일치해야 한다.
 case "$GPU" in
@@ -83,6 +88,19 @@ case "$GPU" in
     BINDIR="build"
     CMAKE_FLAGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70)
     PIN="1c4cfda6cc8b28d91eca48a30623a70253ca21fc"
+    ;;
+  cpu)
+    TREE="llama.cpp-glm5next"; URL="$GGML_URL"
+    BASE="f8dbcd61893702976f9ab03be89c2b9f436d532c"
+    PATCHES=(hip/0001-glm5next-glm5next-feature-and-pr27754.patch
+             hip/0002-gfx906-furnace-ports.patch
+             hip/0003-dsv41-flash-loader-and-kv-guard.patch)
+    BINDIR="build-cpu"
+    # GPU 백엔드를 모두 끄고 호스트 CPU에 맞춰 빌드한다. dtc 컨테이너(amd64)에
+    # 넣어 CPU 전용으로 서빙한다. AVX2/FMA/F16C는 네이티브 감지에 맡긴다.
+    CMAKE_FLAGS=(-DGGML_NATIVE=ON)
+    TARGETS=(llama ggml ggml-base ggml-cpu mtmd)
+    PIN="367ebbc20c2b20db411d5acf72b88d26a7c13d70"
     ;;
   ds41|ds41-cuda)
     TREE="llama.cpp-ds41"; URL="$VCRUZ_URL"
@@ -124,7 +142,7 @@ if [ "$DRY_RUN" = 1 ]; then
   run git -C "$DIR" checkout --detach --force FETCH_HEAD
   run git -C "$DIR" reset --hard FETCH_HEAD
 elif [ -f "$PIN_FILE" ] && [ "$(cat "$PIN_FILE")" = "$PIN" ] \
-     && [ -d "$DIR/.git" ] && [ "$FORCE" != 1 ]; then
+     && git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 && [ "$FORCE" != 1 ]; then
   info "이미 패치된 트리가 있습니다: $DIR ($PIN) — fetch/apply 생략"
 elif [ -e "$DIR" ] && [ "$FORCE" != 1 ]; then
   die "$DIR 가 이미 존재하지만 핀 마커가 없습니다. --force로 다시 만들거나 지우세요."
@@ -135,7 +153,7 @@ if [ "$DRY_RUN" != 1 ] && [ "$FORCE" = 1 ]; then
   rm -rf "$DIR"
 fi
 
-if [ "$DRY_RUN" != 1 ] && { [ ! -f "$PIN_FILE" ] || [ ! -d "$DIR/.git" ]; }; then
+if [ "$DRY_RUN" != 1 ] && { [ ! -f "$PIN_FILE" ] || ! git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1; }; then
   info "base 커밋을 받습니다: $TREE @ $BASE"
   git init -q "$DIR"
   if git -C "$DIR" remote get-url origin >/dev/null 2>&1; then
@@ -190,7 +208,11 @@ cmake -S "$DIR" -B "$DIR/$BINDIR" \
   -DLLAMA_BUILD_SERVER=OFF
 
 info "cmake build: -j $JOBS"
-cmake --build "$DIR/$BINDIR" --config Release -j "$JOBS"
+if [ "${#TARGETS[@]}" -gt 0 ]; then
+  cmake --build "$DIR/$BINDIR" --config Release -j "$JOBS" --target "${TARGETS[@]}"
+else
+  cmake --build "$DIR/$BINDIR" --config Release -j "$JOBS"
+fi
 
 info "완료. golbang 빌드:"
 echo "  CARGO_TARGET_DIR=target-$GPU GOLBANG_GPU=$GPU \\"

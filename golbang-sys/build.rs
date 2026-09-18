@@ -1,7 +1,7 @@
 //! SHA-pinned `llama.h` bindgen + matching backend `.so`.
 //!
-//! Backend is selected via `GOLBANG_GPU` env (`hip` default, `cuda` /
-//! `vulkan` optional).
+//! Backend is selected via `GOLBANG_GPU` env (`hip` default; `cuda`,
+//! `vulkan`, `cpu` optional).
 //!
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
@@ -16,6 +16,11 @@
 //!   the system `libvulkan.so.1` is used. The gfx906 HIP kernel ports
 //!   (DPP/mmq/GCN repack) are HIP-only — the Vulkan path tests the plain
 //!   upstream kernels on the same model.
+//! - `cpu` → same tree/SHA as `hip` (`llama.cpp-glm5next`), but the
+//!   `build-cpu/` cmake dir with every GPU backend off. Links only
+//!   `llama`/`ggml`/`ggml-base`/`ggml-cpu`/`mtmd`; no ROCm/CUDA/Vulkan runtime.
+//!   Used for the CPU-only container deployment (dtc). See wiki
+//!   `golbang-cpu-docker-deploy`.
 //! - `ds41` → DSV4.1 native runtime tree (`llama.cpp-ds41`, vcruz305
 //!   `runtime/deepseek41` + gfx906 furnace ports), HIP build `build/bin`.
 //!   Reuses the HIP link recipe; the tree/SHA differs from `hip`.
@@ -80,23 +85,25 @@ fn main() {
     let gpu = env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
     let gpu = gpu.trim().to_lowercase();
     match gpu.as_str() {
-        "hip" | "cuda" | "vulkan" | "ds41" | "ds41-cuda" => {}
+        "hip" | "cuda" | "vulkan" | "ds41" | "ds41-cuda" | "cpu" => {}
         other => panic!(
-            "GOLBANG_GPU must be 'hip', 'cuda', 'vulkan', 'ds41' or 'ds41-cuda', got '{other}'"
+            "GOLBANG_GPU must be 'hip', 'cuda', 'vulkan', 'ds41', 'ds41-cuda' or 'cpu', got '{other}'"
         ),
     }
 
     // `ds41`/`ds41-cuda` reuse the HIP/CUDA link recipe but point at the DSV4.1
-    // native runtime tree (different SHA + cmake dirs).
+    // native runtime tree (different SHA + cmake dirs). `cpu` uses the HIP tree
+    // built without any GPU backend.
     let backend = match gpu.as_str() {
         "hip" | "ds41" => "hip",
         "cuda" | "ds41-cuda" => "cuda",
         "vulkan" => "vulkan",
+        "cpu" => "cpu",
         _ => unreachable!(),
     };
 
     let (expected_sha, vendor_name) = match gpu.as_str() {
-        "hip" | "vulkan" => (EXPECTED_SHA_HIP, VENDOR_HIP_DIR),
+        "hip" | "vulkan" | "cpu" => (EXPECTED_SHA_HIP, VENDOR_HIP_DIR),
         "cuda" => (EXPECTED_SHA_CUDA, VENDOR_CUDA_DIR),
         "ds41" | "ds41-cuda" => (EXPECTED_SHA_DS41, VENDOR_DS41_DIR),
         _ => unreachable!(),
@@ -167,6 +174,7 @@ fn main() {
         _ => llama_dir.join(match gpu.as_str() {
             "vulkan" => "build-vulkan/bin",
             "ds41-cuda" => "build-cuda/bin",
+            "cpu" => "build-cpu/bin",
             _ => "build/bin",
         }),
     };
@@ -251,6 +259,29 @@ fn main() {
             ];
             // V100 (sm_70) needs CUDA 12.8; CUDA 13 at /opt/cuda dropped compute_70.
             link_search_extra = &["/opt/cuda-12.8/targets/x86_64-linux/lib"];
+        }
+        "cpu" => {
+            let cpu_so = first_existing(&[
+                bin_dir.join("libggml-cpu.so"),
+                bin_dir.join("libggml-cpu.so.0"),
+            ]);
+            let bytes = fs::read(&cpu_so).unwrap_or_else(|e| {
+                panic!("failed to read {}: {e}", cpu_so.display());
+            });
+            if !bytes
+                .windows(b"ggml_backend_cpu_buffer_type".len())
+                .any(|w| w == b"ggml_backend_cpu_buffer_type")
+            {
+                panic!(
+                    "{} does not contain the ggml CPU backend. Rebuild build-cpu with \
+                     `scripts/build-llama.sh cpu`.",
+                    cpu_so.display()
+                );
+            }
+            backend_so = cpu_so;
+            link_libs = &["llama", "ggml", "ggml-base", "ggml-cpu", "mtmd"];
+            // No GPU runtime; ggml-cpu self-registers (static, not plugin-loaded).
+            link_search_extra = &[];
         }
         _ => unreachable!(),
     }
@@ -395,6 +426,9 @@ fn main() {
         "vulkan" => {
             // libvulkan.so.1 is a DT_NEEDED of libggml-vulkan.so itself;
             // no direct link needed.
+        }
+        "cpu" => {
+            // ggml-cpu has no external GPU runtime dependency.
         }
         _ => unreachable!(),
     }
