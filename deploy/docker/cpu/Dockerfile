@@ -38,15 +38,15 @@ ENV LD_LIBRARY_PATH=/app/lib
 # === 모델/서버 기본값: Qwen3.8-4B-Distill Q8_0 (qwen35 hybrid SSM) ===
 # 실제 값은 dtc `--env`로 덮어쓴다. 아래는 컨테이너 단독 실행용 기본값이다.
 # 주의: KV 풀 = GOLBANG_N_CTX * GOLBANG_N_PARALLEL 이다(kv-unified). 아래
-# 기본값은 풀 65536(32768 x 2)이고, q8_0 KV 2GiB + 모델 4.3GiB + MTP 버퍼를
-# 합쳐 약 7.5GiB를 쓴다. `dtc deploy --memory 16384` 이상을 권장한다.
+# 기본값은 풀 32768(32768 x 1)이고, q8_0 KV 1GiB + 모델 4.3GiB + MTP 버퍼를
+# 합쳐 약 6.5GiB를 쓴다. `dtc deploy --memory 16384` 이상을 권장한다.
 ENV GOLBANG_MODEL=/models/Qwen3.8-4B-Q8_0.gguf
 ENV GOLBANG_ALIAS=qwen38-4b-cpu
 ENV GOLBANG_HOST=0.0.0.0
 ENV GOLBANG_PORT=8080
 ENV GOLBANG_N_GPU_LAYERS=0
 ENV GOLBANG_N_CTX=32768
-ENV GOLBANG_N_PARALLEL=2
+ENV GOLBANG_N_PARALLEL=1
 ENV GOLBANG_QUEUE_SIZE=2
 ENV GOLBANG_KV_UNIFIED=true
 ENV GOLBANG_SINGLE_MAX_CTX=32768
