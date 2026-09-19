@@ -9,7 +9,7 @@ golbang은 llama.cpp를 커밋 SHA로 고정해 FFI로 링크한다. 공개 원�
 |------|-------------|------|---------|
 | `hip`, `vulkan` | ggml-org/llama.cpp `f8dbcd618` | `hip/0001` + `hip/0002` + `hip/0003` | `367ebbc20` + `0003` |
 | `ds41`, `ds41-cuda` | vcruz305/llama.cpp `runtime/deepseek41` `f37da5711` | `ds41/0001` | `24032ea2b` |
-| `cuda` | ggml-org/llama.cpp `911f6cdc8` | `cuda/0001` | `53b1389d0` (PR #28243 head) |
+| `cuda` | ggml-org/llama.cpp `911f6cdc8` | `cuda/0001` + `cuda/0002` | `775aa4edc` (base + #28243 + #28136) |
 
 base 커밋은 모두 공개 GitHub에서 SHA로 직접 fetch할 수 있다.
 
@@ -62,6 +62,21 @@ vcruz305 `runtime/deepseek41`의 `f37da57110ebbe07e982a934f2d444d9fd30eb09` 위�
 
    이전 핀 `1c4cfda6c`(= `c069aa7f5f` + #28243)은 롤백용으로 보존한다. 위키
    `qwen38-cuda-pin-rebase-28896-28901` 참조.
+
+2. `0002-qwen4exp-lazy-direct-reads.patch` — ggml-org PR #28136 (`--lazy-mode
+   on-direct`: PR head `c6a9e5c9a` = `90fde1f7f` qwen4exp direct PLE reads +
+   `c6a9e5c9a` shared reader/gemma4). `0001` 위에 적용하면 최종 트리
+   `775aa4edc8ec16cb0d1a4876c05ca851d361a99e`가 된다. lazy 테이블의 행을
+   mmap demand fault 대신 명시적 `pread()`로 읽어 cold prefill의 scatter
+   gather·readahead 낭비를 줄인다. `llama.h`는 1645 → 1646줄(새
+   `LLAMA_LAZY_MODE_DIRECT` enum). golbang은 `--lazy-mode`로 이 모드를
+   노출한다. 채택 여부와 측정은 `docs/bench/fn4-lazy-direct-ple.md` 참조.
+
+   원 PR은 `67a17c17c`(2026-09-03) 기반이라 `911f6cdc8a`에 직접 얹으면
+   `src/llama-model.{cpp,h}`, `src/models/{models.h,qwen4exp.cpp}`에서
+   충돌한다. 위 커밋들을 현재 핀(base + `0001`)에 순서대로 cherry-pick해
+   해소했고, 충돌은 `tools/llama-bench/llama-bench.cpp`의 `--lazy-mode`
+   도움말 한 곳뿐이었다(HEAD의 최신 도움말을 유지하고 `on-direct`만 추가).
 
 ## 검증 방법
 

@@ -63,6 +63,13 @@ pub struct LoadParams {
     pub n_rs_seq: u32,
     /// `true` → `LLAMA_LOAD_MODE_MMAP` (llama default). `false` is `--no-mmap`.
     pub use_mmap: bool,
+    /// `llama_model_params.lazy_mode`. `LLAMA_LAZY_MODE_AUTO` (llama default)
+    /// reads arch-marked tables (e.g. the qwen4exp PLE table) lazily only when
+    /// larger than 4 GiB. `LLAMA_LAZY_MODE_DIRECT` (llama-server
+    /// `--lazy-mode on-direct`) reads those rows with explicit `pread()`s
+    /// instead of demand-faulting them through the mmap. See PR #28136 and
+    /// wiki `qwen38-flashnext-speedup`.
+    pub lazy_mode: i32,
     /// Load MTP / nextn tensors. Implied by `--spec-type draft-mtp`.
     pub load_mtp: bool,
     pub spec: SpecParams,
@@ -104,6 +111,7 @@ impl Default for LoadParams {
             // DSV4 suffix rm needs ≥1 snapshot (~12 MiB). Other archs clamp to 0.
             n_rs_seq: 1,
             use_mmap: true,
+            lazy_mode: LLAMA_LAZY_MODE_AUTO as i32,
             load_mtp: false,
             spec: SpecParams::default(),
             mmproj: None,
@@ -261,6 +269,7 @@ impl Model {
         } else {
             LLAMA_LOAD_MODE_NONE
         };
+        mparams.lazy_mode = params.lazy_mode as _;
 
         // Patterns must stay alive until `llama_model_load_from_file` returns.
         let tensor_overrides =

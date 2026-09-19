@@ -15,8 +15,10 @@ Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
 # Qwen3.8-Flash-Next (arch qwen4exp, 176.94 B, 6 B active) UD-Q4_K_XL, 4 shards.
-# mmap is mandatory: the PLE n-gram table (per_layer_token_embd, 27.4 GiB) is
-# TENSOR_READ_LAZY and is gathered from the mapping row by row. Do NOT pass
+# mmap is mandatory for the PLE n-gram table (per_layer_token_embd, 27.4 GiB):
+# it is TENSOR_READ_LAZY, and both lazy paths require mmap. `--lazy-mode
+# on-direct` (FN-SPEED-4) then reads each gathered row with an explicit pread()
+# from its own descriptor, so the table is never made resident. Do NOT pass
 # --no-mmap, or the whole 27.4 GiB table is loaded into RAM.
 # n-cpu-moe 42 with a *shifted* tensor-split (11,1) keeps experts of layers 42..47
 # on the V100s: the proportional split boundary lands at layer 44, so GPU0 carries
@@ -83,12 +85,23 @@ Environment=RUST_LOG=info
 # nor one fewer CPU layer beats the run-to-run spread. NOT ADOPTED; f16 KV and
 # n-cpu-moe 42 stay. Output grade for q8_0 at n-cpu-moe 42 was byte-identical
 # greedy, NUMERIC at n-cpu-moe 41. See docs/bench/fn3-kv-q8-expert-move.md.
+# FN-SPEED-4 (#257, 2026-09-20): --lazy-mode on-direct (ggml-org PR #28136,
+# `patches/cuda/0002`) reads the lazy PLE table rows with explicit pread()s
+# from a freshly opened descriptor instead of demand-faulting the mmap. On this
+# unit it removes ~99% of major faults (cold 369k -> 2.9k, warm ~40k -> ~30)
+# and gives a small but reproducible prefill gain: paired A/B medians +4.4%
+# cold (n=3), +3.6%/+4.5% warm (n=6, both orders), identical decode
+# (31.9 -> 32.1 t/s, n=8) and byte-identical greedy output. Device read bytes
+# are unchanged (storage reads 4 KiB blocks either way), so the win is avoided
+# synchronous fault stalls, not less I/O. ADOPTED; see
+# docs/bench/fn4-lazy-direct-ple.md. Default is `auto`; on/on-direct require mmap.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --alias qwen3.8-flash-next \
   --host 0.0.0.0 --port 8090 \
   --n-gpu-layers 99 --n-cpu-moe 42 --flash-attn on \
   --tensor-split 11,1 \
+  --lazy-mode on-direct \
   --n-ctx 100000 --n-batch 4096 --n-ubatch 2048 --n-threads 32 --n-rs-seq 1 \
   --n-parallel 1 --queue-size 2 \
   --jinja --reasoning-format deepseek \

@@ -92,6 +92,13 @@ struct Args {
     #[arg(long, env = "GOLBANG_NO_MMAP", default_value_t = false)]
     no_mmap: bool,
 
+    /// `llama_model_params.lazy_mode` (llama-server `--lazy-mode`).
+    /// `auto` (default) lazy-reads arch-marked tables > 4 GiB; `on` reads all
+    /// marked rows lazily; `on-direct` reads them with explicit pread()s
+    /// (PR #28136); `off` keeps them resident. `on`/`on-direct` require mmap.
+    #[arg(long, env = "GOLBANG_LAZY_MODE", default_value = "auto")]
+    lazy_mode: String,
+
     /// Reported model id (llama-server `-a`). Default is the GGUF file name.
     #[arg(long, env = "GOLBANG_ALIAS")]
     alias: Option<String>,
@@ -291,6 +298,17 @@ fn parse_flash_attn(s: &str) -> Result<i32> {
         "on" | "1" | "true" | "enabled" => Ok(1),
         "off" | "0" | "false" | "disabled" => Ok(0),
         other => anyhow::bail!("--flash-attn must be auto|on|off, got {other}"),
+    }
+}
+
+fn parse_lazy_mode(s: &str) -> Result<i32> {
+    // llama.h: OFF=0, AUTO=1, ON=2, DIRECT=3
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Ok(0),
+        "auto" | "1" => Ok(1),
+        "on" | "2" => Ok(2),
+        "on-direct" | "direct" | "3" => Ok(3),
+        other => anyhow::bail!("--lazy-mode must be off|auto|on|on-direct, got {other}"),
     }
 }
 
@@ -560,6 +578,7 @@ async fn main() -> Result<()> {
         n_threads: args.n_threads,
         n_rs_seq: args.n_rs_seq,
         use_mmap: !args.no_mmap,
+        lazy_mode: parse_lazy_mode(&args.lazy_mode)?,
         load_mtp,
         spec,
         mmproj: args.mmproj.clone(),

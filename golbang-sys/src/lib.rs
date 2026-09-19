@@ -77,7 +77,7 @@ mod api_names {
         let _rpc_reg = ggml_backend_register;
         let gpu = std::env::var("GOLBANG_GPU").unwrap_or_else(|_| "hip".to_string());
         let expected = if gpu.trim().eq_ignore_ascii_case("cuda") {
-            "53b1389d0bf98fa367e2a0ce0475008e762ebf28"
+            "775aa4edc8ec16cb0d1a4876c05ca851d361a99e"
         } else {
             "367ebbc20c2b20db411d5acf72b88d26a7c13d70"
         };
