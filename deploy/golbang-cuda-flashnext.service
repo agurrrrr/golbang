@@ -37,6 +37,16 @@ Environment=RUST_LOG=info
 # offsets the CPU expert union cost. Output is valid but not bit-identical to
 # no-spec greedy (batched-verify numerics). Needs the PR #28243 runtime
 # (EXPECTED_SHA_CUDA 1c4cfda6c); the draft rides on CUDA1 (~5.4 GiB, ~2 GiB free).
+# FN-SPEED-1 (#254, 2026-09-19): the golbang-server default for
+# `--spec-draft-p-min` is 0.90, not 0.0, so the old unit already pruned at 0.90.
+# Sweeping n-max with p-min held at 0.90 shows n-max 4 is the peak: decode
+# 26.1 -> 30.3 tok/s short (+16%), 20.6 -> 27.4 at ~15k (+33%), 15.9 -> 23.2 at
+# ~80k (+45%), acceptance unchanged at 0.94-0.96, mean accepted length 2.4 -> 3.7.
+# n-max 5/6 regress, and p-min 0.85 (acceptance drops to 0.89) or 0.95 (drafts cut
+# early) are worse than 0.90. Each n-max step costs only ~106 MiB on CUDA0; n-max 4
+# leaves ~1.9 GiB free. n_rs_seq is auto-raised to n_max and no 115 MiB per-step
+# snapshot reappears. p-min is stated explicitly to keep the intent. Output grade
+# is NUMERIC, not byte-identical (see docs/bench/fn-mtp-nmax.md).
 # Prompt lookup (`--spec-type draft-mtp,prompt-lookup`, #247) copies the tail of
 # an earlier suffix. On this unit it lifts copy-heavy mean accepted length
 # 2.99 -> 3.72 but decode only 35.4 -> 35.8 tok/s (+1.1%) because the verify
@@ -69,7 +79,7 @@ ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --jinja --reasoning-format deepseek \
   --temperature 1.0 --top-p 0.95 --top-k 20 \
   --model-draft /home/agurrrrr/models/qwen3.8/mtp-flashnext/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --spec-type draft-mtp --spec-draft-n-max 2 \
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.90 \
   --api-key "${GOLBANG_API_KEY}"
 Restart=on-failure
 RestartSec=10

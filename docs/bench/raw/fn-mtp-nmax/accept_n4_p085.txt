@@ -1,0 +1,11 @@
+[2m2026-09-19T07:36:02.752965Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m n_rs_seq raised to spec n_max/pld_k (llama need_n_rs_seq) [3mfrom[0m[2m=[0m1 [3mto[0m[2m=[0m4 [3mn_max[0m[2m=[0m4 [3mpld_k[0m[2m=[0m3
+[2m2026-09-19T07:36:09.800815Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m MTP draft context ready [3mn_nextn[0m[2m=[0m1 [3mn_embd[0m[2m=[0m10240 [3mn_max[0m[2m=[0m4 [3mp_min[0m[2m=[0m0.8500000238418579 [3mn_outputs_max[0m[2m=[0m1 [3mseparate_draft[0m[2m=[0mtrue
+[2m2026-09-19T07:37:03.233111Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =    3040.26 ms /    77 tokens (   39.48 ms per token,    25.33 tokens per second)
+[2m2026-09-19T07:37:03.233117Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   49549.76 ms /  1466 tokens (   33.80 ms per token,    29.59 tokens per second)
+[2m2026-09-19T07:37:03.233122Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.93467 (  887 accepted /   949 generated), mean len =  3.70
+[2m2026-09-19T07:37:54.225473Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =      52.38 ms /     1 tokens (   52.38 ms per token,    19.09 tokens per second)
+[2m2026-09-19T07:37:54.225478Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   50867.39 ms /  1500 tokens (   33.91 ms per token,    29.49 tokens per second)
+[2m2026-09-19T07:37:54.225483Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.89521 (  897 accepted /  1002 generated), mean len =  3.57
+[2m2026-09-19T07:38:57.562815Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =      53.34 ms /     1 tokens (   53.34 ms per token,    18.75 tokens per second)
+[2m2026-09-19T07:38:57.562820Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   63210.95 ms /  1500 tokens (   42.14 ms per token,    23.73 tokens per second)
+[2m2026-09-19T07:38:57.562826Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.89296 (  634 accepted /   710 generated), mean len =  2.83

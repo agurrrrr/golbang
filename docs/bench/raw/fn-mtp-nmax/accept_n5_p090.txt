@@ -1,0 +1,19 @@
+[2m2026-09-19T07:30:03.533973Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m n_rs_seq raised to spec n_max/pld_k (llama need_n_rs_seq) [3mfrom[0m[2m=[0m1 [3mto[0m[2m=[0m5 [3mn_max[0m[2m=[0m5 [3mpld_k[0m[2m=[0m3
+[2m2026-09-19T07:30:10.620142Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m MTP draft context ready [3mn_nextn[0m[2m=[0m1 [3mn_embd[0m[2m=[0m10240 [3mn_max[0m[2m=[0m5 [3mp_min[0m[2m=[0m0.8999999761581421 [3mn_outputs_max[0m[2m=[0m1 [3mseparate_draft[0m[2m=[0mtrue
+[2m2026-09-19T07:31:20.488623Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =    3041.68 ms /    77 tokens (   39.50 ms per token,    25.31 tokens per second)
+[2m2026-09-19T07:31:20.488629Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   66011.75 ms /  1500 tokens (   44.01 ms per token,    22.72 tokens per second)
+[2m2026-09-19T07:31:20.488643Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.91707 (  564 accepted /   615 generated), mean len =  2.88
+[2m2026-09-19T07:32:01.309386Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =      60.39 ms /     1 tokens (   60.39 ms per token,    16.56 tokens per second)
+[2m2026-09-19T07:32:01.309395Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   40689.37 ms /  1253 tokens (   32.47 ms per token,    30.79 tokens per second)
+[2m2026-09-19T07:32:01.309404Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.95610 (  784 accepted /   820 generated), mean len =  4.07
+[2m2026-09-19T07:33:04.542131Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =      77.86 ms /     1 tokens (   77.86 ms per token,    12.84 tokens per second)
+[2m2026-09-19T07:33:04.542137Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   63076.98 ms /  1500 tokens (   42.05 ms per token,    23.78 tokens per second)
+[2m2026-09-19T07:33:04.542142Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.91921 (  603 accepted /   656 generated), mean len =  3.09
+[2m2026-09-19T08:09:11.377746Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m n_rs_seq raised to spec n_max/pld_k (llama need_n_rs_seq) [3mfrom[0m[2m=[0m1 [3mto[0m[2m=[0m5 [3mn_max[0m[2m=[0m5 [3mpld_k[0m[2m=[0m3
+[2m2026-09-19T08:09:18.434080Z[0m [32m INFO[0m [2mgolbang_core::model[0m[2m:[0m MTP draft context ready [3mn_nextn[0m[2m=[0m1 [3mn_embd[0m[2m=[0m10240 [3mn_max[0m[2m=[0m5 [3mp_min[0m[2m=[0m0.8999999761581421 [3mn_outputs_max[0m[2m=[0m1 [3mseparate_draft[0m[2m=[0mtrue
+[2m2026-09-19T08:11:21.364229Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =   66340.68 ms / 14956 tokens (    4.44 ms per token,   225.44 tokens per second)
+[2m2026-09-19T08:11:21.364234Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   55672.04 ms /  1500 tokens (   37.11 ms per token,    26.94 tokens per second)
+[2m2026-09-19T08:11:21.364241Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.91984 (  895 accepted /   973 generated), mean len =  3.78
+[2m2026-09-19T08:12:30.081950Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m prompt eval time =      55.52 ms /     1 tokens (   55.52 ms per token,    18.01 tokens per second)
+[2m2026-09-19T08:12:30.081955Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m        eval time =   68524.44 ms /  1500 tokens (   45.68 ms per token,    21.89 tokens per second)
+[2m2026-09-19T08:12:30.081970Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.92378 (  606 accepted /   656 generated), mean len =  2.94
