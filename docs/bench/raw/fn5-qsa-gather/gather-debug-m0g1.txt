@@ -1,0 +1,9 @@
+2026-09-19T17:34:11.225944Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=1 n_stream=1 n_kv=100096 width=2304 gather=1
+2026-09-19T17:34:11.234604Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=2048 n_stream=1 n_kv=100096 width=2304 gather=0
+2026-09-19T17:34:11.581550Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=1 n_stream=1 n_kv=100096 width=2304 gather=1
+2026-09-19T17:34:11.587024Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=2048 n_stream=1 n_kv=100096 width=2304 gather=0
+2026-09-19T17:35:09.182908Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=1 n_stream=1 n_kv=10240 width=2304 gather=1
+2026-09-19T17:35:19.024378Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=2048 n_stream=1 n_kv=2048 width=2304 gather=0
+2026-09-19T17:41:36.715977Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=1 n_stream=1 n_kv=77568 width=2304 gather=1
+2026-09-19T17:41:50.309775Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=2048 n_stream=1 n_kv=2048 width=2304 gather=0
+2026-09-19T17:49:41.455100Z  INFO llama: [QSA-GATHER-DBG] il=3 n_tokens=1 n_stream=1 n_kv=90624 width=2304 gather=1
