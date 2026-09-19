@@ -1,0 +1,79 @@
+{
+  "label": "next",
+  "started": "2026-09-19T09:19:58.773334+00:00",
+  "runs": {
+    "short": [
+      {
+        "prompt_tokens": 68,
+        "completion_tokens": 1500,
+        "wall_s": 51.25,
+        "prompt_per_second": 21.466606315660126,
+        "predicted_per_second": 31.207564188273516,
+        "draft_n": 1076,
+        "draft_n_accepted": 973,
+        "predicted_n": 1500,
+        "acceptance": 0.9043
+      },
+      {
+        "prompt_tokens": 68,
+        "completion_tokens": 1500,
+        "wall_s": 52.53,
+        "prompt_per_second": 19.6590878261885,
+        "predicted_per_second": 28.590376557588346,
+        "draft_n": 919,
+        "draft_n_accepted": 818,
+        "predicted_n": 1500,
+        "acceptance": 0.8901
+      },
+      {
+        "prompt_tokens": 68,
+        "completion_tokens": 1500,
+        "wall_s": 46.03,
+        "prompt_per_second": 20.47962671374796,
+        "predicted_per_second": 32.63856113969583,
+        "draft_n": 1035,
+        "draft_n_accepted": 958,
+        "predicted_n": 1500,
+        "acceptance": 0.9256
+      }
+    ],
+    "mid": [
+      {
+        "prompt_tokens": 14809,
+        "completion_tokens": 1398,
+        "wall_s": 114.68,
+        "prompt_per_second": 221.3069914305093,
+        "predicted_per_second": 29.35107888830251,
+        "draft_n": 970,
+        "draft_n_accepted": 874,
+        "predicted_n": 1398,
+        "acceptance": 0.901
+      },
+      {
+        "prompt_tokens": 14809,
+        "completion_tokens": 1500,
+        "wall_s": 57.99,
+        "prompt_per_second": 18.275670394994805,
+        "predicted_per_second": 25.942871326298295,
+        "draft_n": 840,
+        "draft_n_accepted": 770,
+        "predicted_n": 1500,
+        "acceptance": 0.9167
+      }
+    ],
+    "long": [
+      {
+        "prompt_tokens": 78169,
+        "completion_tokens": 1200,
+        "wall_s": 437.68,
+        "prompt_per_second": 202.72034482692388,
+        "predicted_per_second": 23.329729855338257,
+        "draft_n": 821,
+        "draft_n_accepted": 761,
+        "predicted_n": 1200,
+        "acceptance": 0.9269
+      }
+    ]
+  },
+  "finished": "2026-09-19T09:32:38.926412+00:00"
+}

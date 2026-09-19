@@ -6,11 +6,12 @@
 //! - `hip`  → `llama.cpp-glm5next` worktree (`origin/master` + glm5next PR
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
 //!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
-//! - `cuda` → `llama.cpp-cuda-upstream` (plain `origin/master` + ggml-org
+//! - `cuda` → `llama.cpp-cuda-upstream` (`origin/master` `911f6cdc8a` + ggml-org
 //!   PR #28243 qwen4exp MTP), CUDA-symbol
 //!   `.so` byte check, CUDA runtime (`cudart`/`cublas`) link. Rollback trees:
-//!   `llama.cpp-escha` @ `c5d759c8a` (`escha-w2-dense` + DSV4.1 loader patches)
-//!   and `llama.cpp-cuda` @ `749f688fc` (kept, do not delete).
+//!   `llama.cpp-escha` @ `c5d759c8a` (`escha-w2-dense` + DSV4.1 loader patches),
+//!   `llama.cpp-cuda` @ `749f688fc`, and the preserved old-pin tree
+//!   `local-llm/llama.cpp-cuda-upstream-1c4cfda6c` (kept, do not delete).
 //! - `vulkan` → same tree/SHA as `hip` (`llama.cpp-glm5next`), but the
 //!   `build-vulkan/` cmake dir (`GGML_VULKAN=ON`, Mesa RADV). No ROCm link;
 //!   the system `libvulkan.so.1` is used. The gfx906 HIP kernel ports
@@ -46,11 +47,16 @@ use std::process::Command;
 /// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
 /// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
-/// 1c4cfda6c = upstream `c069aa7f5f` + ggml-org PR #28243 (`qwen4exp` NextN/MTP
-/// draft head + cross-model shared-tensor borrowing). Needed so an external
-/// Unsloth MTP head runs via `-md` + `--spec-type draft-mtp` on
-/// Qwen3.8-Flash-Next. llama.h C API unchanged. See wiki `qwen38-mtp`.
-const EXPECTED_SHA_CUDA: &str = "1c4cfda6cc8b28d91eca48a30623a70253ca21fc";
+/// 53b1389d0 = upstream `911f6cdc8a` + ggml-org PR #28243 (`qwen4exp` NextN/MTP
+/// draft head + cross-model shared-tensor borrowing), conflict-resolved. Needed
+/// so an external Unsloth MTP head runs via `-md` + `--spec-type draft-mtp` on
+/// Qwen3.8-Flash-Next. The base raise (was `c069aa7f5f` + PR #28243 = `1c4cfda6c`)
+/// pulls in #28896 (`rms_norm + mul` fusion) and #28901 (`hc ops`), which cut the
+/// CUDA kernel/graph-node count across the CPU↔GPU split. `patches/cuda/0001`
+/// reproduces this tree exactly from `911f6cdc8a`. llama.h grew 1638 → 1645 lines
+/// but the C API names golbang binds are unchanged. See wiki
+/// `qwen38-cuda-pin-rebase-28896-28901`. Rollback pin: `1c4cfda6c`.
+const EXPECTED_SHA_CUDA: &str = "53b1389d0bf98fa367e2a0ce0475008e762ebf28";
 /// `vendor/` 아래 트리 이름. `scripts/build-llama.sh`가 여기에 base 커밋을 받아
 /// `patches/`를 적용하고 cmake로 빌드한다. `GOLBANG_LLAMA_DIR`로 덮어쓸 수 있다.
 const VENDOR_HIP_DIR: &str = "llama.cpp-glm5next";
@@ -60,7 +66,7 @@ const VENDOR_CUDA_DIR: &str = "llama.cpp-cuda-upstream";
 /// this branch carries `deepseek41` and not glm5next.
 const EXPECTED_SHA_DS41: &str = "24032ea2b12cc0cc38dfa58099bc1ecb6890d6fc";
 const VENDOR_DS41_DIR: &str = "llama.cpp-ds41";
-const EXPECTED_LLAMA_H_LINES: usize = 1638;
+const EXPECTED_LLAMA_H_LINES: usize = 1645;
 
 const HEADER_GIT_PATHS: &[(&str, &str)] = &[
     ("include/llama.h", "llama.h"),

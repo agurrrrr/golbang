@@ -36,7 +36,9 @@ Environment=RUST_LOG=info
 # ~15k ctx (~21 -> ~22 tok/s). Verifying a draft span batches several tokens, which
 # offsets the CPU expert union cost. Output is valid but not bit-identical to
 # no-spec greedy (batched-verify numerics). Needs the PR #28243 runtime
-# (EXPECTED_SHA_CUDA 1c4cfda6c); the draft rides on CUDA1 (~5.4 GiB, ~2 GiB free).
+# (FN-SPEED-2 #255: pin raised to EXPECTED_SHA_CUDA 53b1389d0 = upstream
+# 911f6cdc8a + PR #28243, adding qwen4exp #28896/#28901); the draft rides on
+# CUDA1 (~5.4 GiB, ~2 GiB free).
 # FN-SPEED-1 (#254, 2026-09-19): the golbang-server default for
 # `--spec-draft-p-min` is 0.90, not 0.0, so the old unit already pruned at 0.90.
 # Sweeping n-max with p-min held at 0.90 shows n-max 4 is the peak: decode

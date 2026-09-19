@@ -83,11 +83,14 @@ case "$GPU" in
     ;;
   cuda)
     TREE="llama.cpp-cuda-upstream"; URL="$GGML_URL"
-    BASE="c069aa7f5f2beeead1a3a8e9f71510f1b64d0725"
+    BASE="911f6cdc8ab8a530b2bee09ee61471a6f3178eeb"
     PATCHES=(cuda/0001-qwen4exp-mtp-draft-head.patch)
     BINDIR="build"
     CMAKE_FLAGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70)
-    PIN="1c4cfda6cc8b28d91eca48a30623a70253ca21fc"
+    # `llama` 앱은 `LLAMA_BUILD_SERVER=OFF`에서 `llama-server-impl`/`llama-cli-impl`을
+    # 못 찾아 링크에 실패한다. golbang이 쓰는 라이브러리만 명시적으로 고른다.
+    TARGETS=(llama ggml ggml-base ggml-cpu ggml-cuda mtmd)
+    PIN="53b1389d0bf98fa367e2a0ce0475008e762ebf28"
     ;;
   cpu)
     TREE="llama.cpp-glm5next"; URL="$GGML_URL"
@@ -192,6 +195,13 @@ fi
 CUDA_COMPILER_FLAG=()
 if [ -x /opt/cuda-12.8/bin/nvcc ]; then
   CUDA_COMPILER_FLAG=(-DCMAKE_CUDA_COMPILER=/opt/cuda-12.8/bin/nvcc)
+  # CUDA 12.8 rejects the host default gcc 16 ("unsupported GNU version").
+  # Pin the g++-14 that the production build used and allow the version override
+  # so `scripts/build-llama.sh cuda` reproduces without a manual cache edit.
+  if [ -x /usr/bin/g++-14 ]; then
+    CUDA_COMPILER_FLAG+=(-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14)
+  fi
+  CUDA_COMPILER_FLAG+=(-DCMAKE_CUDA_FLAGS=--allow-unsupported-compiler)
 fi
 
 info "cmake configure: $BINDIR (${CMAKE_FLAGS[*]})"

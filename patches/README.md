@@ -9,7 +9,7 @@ golbang은 llama.cpp를 커밋 SHA로 고정해 FFI로 링크한다. 공개 원�
 |------|-------------|------|---------|
 | `hip`, `vulkan` | ggml-org/llama.cpp `f8dbcd618` | `hip/0001` + `hip/0002` + `hip/0003` | `367ebbc20` + `0003` |
 | `ds41`, `ds41-cuda` | vcruz305/llama.cpp `runtime/deepseek41` `f37da5711` | `ds41/0001` | `24032ea2b` |
-| `cuda` | ggml-org/llama.cpp `c069aa7f5` (tag `b10924`) | `cuda/0001` | `1c4cfda6c` |
+| `cuda` | ggml-org/llama.cpp `911f6cdc8` | `cuda/0001` | `53b1389d0` (PR #28243 head) |
 
 base 커밋은 모두 공개 GitHub에서 SHA로 직접 fetch할 수 있다.
 
@@ -46,12 +46,22 @@ vcruz305 `runtime/deepseek41`의 `f37da57110ebbe07e982a934f2d444d9fd30eb09` 위�
 
 ## cuda — `llama.cpp-cuda-upstream`
 
-`c069aa7f5f2beeead1a3a8e9f71510f1b64d0725`(ggml-org, tag `b10924`) 위에:
+`911f6cdc8ab8a530b2bee09ee61471a6f3178eeb`(ggml-org `origin/master`, 2026-09-18) 위에:
 
 1. `0001-qwen4exp-mtp-draft-head.patch` — ggml-org PR #28243 `qwen4exp` NextN/MTP
    드래프트 헤드 + cross-model shared-tensor borrowing. Qwen3.8-Flash-Next의 외부
    MTP head(`-md` + `--spec-type draft-mtp`)용. 위키 `qwen38-mtp` 참조.
-   결과 트리 `1c4cfda6cc8b28d91eca48a30623a70253ca21fc`.
+   결과 트리 `53b1389d0bf98fa367e2a0ce0475008e762ebf28`.
+
+   이 패치는 PR #28243의 head `53b1389d0`(PR이 master를 `911f6cdc8a`로 merge하며
+   "Fix merge conflicts")를 base `911f6cdc8a`와 비교한 순수 diff다. 즉 base를
+   `c069aa7f5f` → `911f6cdc8a`로 올려 #28896(`rms_norm + mul` fusion)과
+   #28901(`hc ops`)을 정식으로 편입했고, MTP 변경분은 PR이 이미 해소한 충돌 상태
+   그대로다. `base + 0001`의 트리는 PR head 트리와 바이트 동일하다
+   (`git diff base 53b1389d0` → `0001`).
+
+   이전 핀 `1c4cfda6c`(= `c069aa7f5f` + #28243)은 롤백용으로 보존한다. 위키
+   `qwen38-cuda-pin-rebase-28896-28901` 참조.
 
 ## 검증 방법
 
