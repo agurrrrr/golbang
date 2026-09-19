@@ -1,0 +1,7 @@
+[2m2026-09-19T10:59:04.477919Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.91071 (  102 accepted /   112 generated), mean len =  3.17
+[2m2026-09-19T10:59:49.578808Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.90892 (  988 accepted /  1087 generated), mean len =  3.72
+[2m2026-09-19T11:00:35.839847Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.90970 (  947 accepted /  1041 generated), mean len =  3.59
+[2m2026-09-19T11:01:22.888944Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.90622 (  947 accepted /  1045 generated), mean len =  3.65
+[2m2026-09-19T11:03:19.330466Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.90437 (  870 accepted /   962 generated), mean len =  3.48
+[2m2026-09-19T11:04:12.189691Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.93211 (  865 accepted /   928 generated), mean len =  3.51
+[2m2026-09-19T11:11:23.570812Z[0m [32m INFO[0m [2mgolbang_core::scheduler[0m[2m:[0m draft acceptance = 0.91463 (  750 accepted /   820 generated), mean len =  3.60

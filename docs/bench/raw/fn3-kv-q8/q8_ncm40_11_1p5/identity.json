@@ -1,0 +1,17 @@
+{
+  "text": "\n\n# √2가 무리수임을 증명하는 단계별 설명\n\n√2가 무리수임을 증명하는 가장 고전적이고 우아한 방법은 **귀류법(Proof by Contradiction)**을 사용하는 것입니다.\n\n귀류법의 기본 논리는 다음과 같습니다:\n1. 증명하려는 명제의 **반대**가 참이라고 가정한다.\n2. 그 가정으로부터 **모순(Contradiction)**을 도출한다.\n3. 따라서 가정이 거짓이며, 원래 명제가 참임을 결론짓는다.\n\n---\n\n## 1단계: 가정하기 (귀류법의 시작)\n\n√2가 무리수가 아니라고 가정합니다. 즉, √2가 **유리수**라고 가정합니다.\n\n유리수의 정의에 따라, √2는 두 정수 \\( a \\)와 \\( b \\) (\\( b \\neq 0 \\))의 비로 나타낼 수 있습니다.\n",
+  "completion_tokens": 200,
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 68,
+    "prompt_ms": 2908.226983,
+    "prompt_per_token_ms": 42.76804386764706,
+    "prompt_per_second": 23.38194384327394,
+    "predicted_n": 200,
+    "predicted_ms": 7324.772854,
+    "predicted_per_token_ms": 36.62386427,
+    "predicted_per_second": 27.304600973500715,
+    "draft_n": 111,
+    "draft_n_accepted": 101
+  }
+}

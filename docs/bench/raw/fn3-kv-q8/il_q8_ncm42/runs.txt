@@ -1,0 +1,20 @@
+### q8_ncm42 ready ncm=42 split=11,1 kv=q8_0 loadavg=28.23 23.34 19.55
+[short#1] {"case": "short", "i": 1, "prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 51.96, "pp": 22.55715871398191, "tg": 30.652965537260055, "draft_n": 993, "accepted": 903, "acceptance": 0.9094}
+[short#2] {"case": "short", "i": 2, "prompt_tokens": 68, "completion_tokens": 1343, "wall_s": 40.99, "pp": 19.663249161190368, "tg": 32.8172976757559, "draft_n": 953, "accepted": 871, "acceptance": 0.914}
+[short#3] {"case": "short", "i": 3, "prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 48.35, "pp": 19.660745577546294, "tg": 31.065310179438757, "draft_n": 1026, "accepted": 923, "acceptance": 0.8996}
+[short#4] {"case": "short", "i": 4, "prompt_tokens": 68, "completion_tokens": 1365, "wall_s": 41.83, "pp": 18.87700793081622, "tg": 32.69117780386633, "draft_n": 964, "accepted": 875, "acceptance": 0.9077}
+[mid#1] {"case": "mid", "i": 1, "prompt_tokens": 14809, "completion_tokens": 1500, "wall_s": 127.22, "pp": 223.0845434678434, "tg": 24.71057494257891, "draft_n": 789, "accepted": 722, "acceptance": 0.9151}
+[mid#2] {"case": "mid", "i": 2, "prompt_tokens": 14809, "completion_tokens": 1500, "wall_s": 54.14, "pp": 18.665905894118172, "tg": 27.79227790520455, "draft_n": 952, "accepted": 858, "acceptance": 0.9013}
+[mid#3] {"case": "mid", "i": 3, "prompt_tokens": 14809, "completion_tokens": 1411, "wall_s": 49.46, "pp": 18.217293545598324, "tg": 28.63064266718416, "draft_n": 938, "accepted": 841, "acceptance": 0.8966}
+wrote /tmp/opencode/fn3/raw/il_q8_ncm42/reps_1789819370.json
+### q8_ncm42 done loadavg=28.18 25.64 22.04
+### q8_ncm42 ready ncm=42 split=11,1 kv=q8_0 loadavg=26.24 25.73 24.22
+[short#1] {"case": "short", "i": 1, "prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 50.28, "pp": 22.593425979413155, "tg": 31.737641579073728, "draft_n": 1048, "accepted": 948, "acceptance": 0.9046}
+[short#2] {"case": "short", "i": 2, "prompt_tokens": 68, "completion_tokens": 1434, "wall_s": 42.88, "pp": 15.461657971829075, "tg": 33.50841651777347, "draft_n": 1031, "accepted": 955, "acceptance": 0.9263}
+[short#3] {"case": "short", "i": 3, "prompt_tokens": 68, "completion_tokens": 1493, "wall_s": 46.63, "pp": 19.582387185818465, "tg": 32.0636591884373, "draft_n": 1051, "accepted": 944, "acceptance": 0.8982}
+[short#4] {"case": "short", "i": 4, "prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 46.93, "pp": 19.58034733852269, "tg": 32.011783243415685, "draft_n": 1042, "accepted": 951, "acceptance": 0.9127}
+[mid#1] {"case": "mid", "i": 1, "prompt_tokens": 14809, "completion_tokens": 1500, "wall_s": 114.24, "pp": 226.70619668917263, "tg": 30.743325771942537, "draft_n": 1050, "accepted": 978, "acceptance": 0.9314}
+[mid#2] {"case": "mid", "i": 2, "prompt_tokens": 14809, "completion_tokens": 1500, "wall_s": 65.43, "pp": 12.62933289363048, "tg": 22.99620624370921, "draft_n": 683, "accepted": 618, "acceptance": 0.9048}
+[mid#3] {"case": "mid", "i": 3, "prompt_tokens": 14809, "completion_tokens": 1500, "wall_s": 51.37, "pp": 18.95039162689832, "tg": 29.29723355007288, "draft_n": 1028, "accepted": 934, "acceptance": 0.9086}
+wrote /tmp/opencode/fn3/raw/il_q8_ncm42/reps_1789820636.json
+### q8_ncm42 done loadavg=29.51 27.99 25.91

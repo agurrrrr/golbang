@@ -70,6 +70,19 @@ Environment=RUST_LOG=info
 # 3 KiB indexer cache); the recurrent (GDN) state is fixed at ~225 MiB. At
 # n_ctx 100000 that is ~2.6 GiB KV. The native ceiling n_ctx 262144 also loads,
 # so the real limit on long context is prefill time, not VRAM.
+# FN-SPEED-3 (#256, 2026-09-19): q8_0 KV was retried and is SAFE on this pin
+# (the old self_k_rot assert no longer fires; `attn_rot_k = 1` is active), and
+# it reclaims ~1.1 GiB (KV ~2743 -> ~1506 MiB at 100k). That is enough to move
+# one expert layer to GPU: `--n-cpu-moe 41` loads only with q8_0 KV (f16 + 41
+# OOMs GPU0). But decode does not improve: cross A/B medians short 32.42 -> 32.39
+# t/s, ~15k 28.75 -> 29.32 (noise), ~80k 23.36 -> 22.46 (slightly worse), and
+# prefill is flat. Moving two layers (`n-cpu-moe 40`) is not stable: the MTP
+# draft OOMs GPU1 at every split where the main model loads, and the one split
+# that fits the draft (11,1.5, 235 MiB free) crashes mid-bench. Root cause is
+# the same as above: decode is bound by the CPU expert GEMV, so neither less KV
+# nor one fewer CPU layer beats the run-to-run spread. NOT ADOPTED; f16 KV and
+# n-cpu-moe 42 stay. Output grade for q8_0 at n-cpu-moe 42 was byte-identical
+# greedy, NUMERIC at n-cpu-moe 41. See docs/bench/fn3-kv-q8-expert-move.md.
 ExecStart=/home/agurrrrr/code/golbang/target-cuda/release/golbang-server \
   --model /home/agurrrrr/models/qwen3.8/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --alias qwen3.8-flash-next \

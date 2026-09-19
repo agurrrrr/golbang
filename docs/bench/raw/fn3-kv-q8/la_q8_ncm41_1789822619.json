@@ -1,0 +1,26 @@
+[
+  {
+    "case": "long",
+    "i": 1,
+    "prompt_tokens": 78169,
+    "completion_tokens": 1200,
+    "wall_s": 426.77,
+    "pp": 208.82209579316293,
+    "tg": 23.137475046484063,
+    "draft_n": 880,
+    "accepted": 778,
+    "acceptance": 0.8841
+  },
+  {
+    "case": "long",
+    "i": 2,
+    "prompt_tokens": 78169,
+    "completion_tokens": 1200,
+    "wall_s": 55.04,
+    "pp": 10.554114549525536,
+    "tg": 22.059276159806476,
+    "draft_n": 788,
+    "accepted": 714,
+    "acceptance": 0.9061
+  }
+]

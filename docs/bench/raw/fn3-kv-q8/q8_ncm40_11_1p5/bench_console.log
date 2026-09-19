@@ -1,0 +1,37 @@
+[q8_ncm40_11_1p5] short #1: {"prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 48.68, "prompt_per_second": 21.07360891474349, "predicted_per_second": 30.86028195606513, "draft_n": 966, "draft_n_accepted": 872, "predicted_n": 1500, "acceptance": 0.9027}
+[q8_ncm40_11_1p5] short #2: {"prompt_tokens": 68, "completion_tokens": 1500, "wall_s": 45.27, "prompt_per_second": 21.170152219322098, "predicted_per_second": 33.181697618442605, "draft_n": 1093, "draft_n_accepted": 972, "predicted_n": 1500, "acceptance": 0.8893}
+[q8_ncm40_11_1p5] short #3: {"prompt_tokens": 68, "completion_tokens": 1257, "wall_s": 39.14, "prompt_per_second": 14.087581508105185, "predicted_per_second": 32.18790073998038, "draft_n": 873, "draft_n_accepted": 798, "predicted_n": 1257, "acceptance": 0.9141}
+Traceback (most recent call last):
+  File "/tmp/opencode/fn2_bench.py", line 133, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/tmp/opencode/fn2_bench.py", line 106, in main
+    resp = post(args.url, body)
+  File "/tmp/opencode/fn2_bench.py", line 34, in post
+    with urllib.request.urlopen(req, timeout=1800) as resp:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 487, in open
+    response = self._open(req, data)
+  File "/usr/lib/python3.14/urllib/request.py", line 504, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "/usr/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.14/urllib/request.py", line 1350, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 1325, in do_open
+    r = h.getresponse()
+  File "/usr/lib/python3.14/http/client.py", line 1459, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+                             " response")
+http.client.RemoteDisconnected: Remote end closed connection without response
