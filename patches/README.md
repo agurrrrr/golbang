@@ -9,7 +9,7 @@ golbang은 llama.cpp를 커밋 SHA로 고정해 FFI로 링크한다. 공개 원�
 |------|-------------|------|---------|
 | `hip`, `vulkan` | ggml-org/llama.cpp `f8dbcd618` | `hip/0001` + `hip/0002` + `hip/0003` | `367ebbc20` + `0003` |
 | `ds41`, `ds41-cuda` | vcruz305/llama.cpp `runtime/deepseek41` `f37da5711` | `ds41/0001` | `24032ea2b` |
-| `cuda` | ggml-org/llama.cpp `911f6cdc8` | `cuda/0001` + `cuda/0002` | `775aa4edc` (base + #28243 + #28136) |
+| `cuda` | ggml-org/llama.cpp `911f6cdc8` | `cuda/0001` + `cuda/0002` + `cuda/0003` + `cuda/0004` | `e7ec442b7` (base + #28243 + #28136 + #28770 + Volta opt-in) |
 
 base 커밋은 모두 공개 GitHub에서 SHA로 직접 fetch할 수 있다.
 
@@ -77,6 +77,28 @@ vcruz305 `runtime/deepseek41`의 `f37da57110ebbe07e982a934f2d444d9fd30eb09` 위�
    충돌한다. 위 커밋들을 현재 핀(base + `0001`)에 순서대로 cherry-pick해
    해소했고, 충돌은 `tools/llama-bench/llama-bench.cpp`의 `--lazy-mode`
    도움말 한 곳뿐이었다(HEAD의 최신 도움말을 유지하고 `on-direct`만 추가).
+
+3. `0003-qwen4-sparse-fa.patch` — ggml-org PR #28770(`CUDA: enable sparse
+   fa for qwen4`, 2026-09-20 master 머지). `0002` 위에 적용한다. qwen4exp의
+   QSA 마스크에서 실제로 보이는 열만 모아(`ggml_cuda_flash_attn_ext_compact_mask`)
+   `ncols1`개 질의 타일마다 인덱스 목록을 만들고, FA가 그 열만 훑는다. 새
+   지원 형태는 `DKQ==256 && DV==256 && ncols2==8`에 `ncols1==1|8`이다.
+   qwen4exp의 그래프도 sparse를 켜도록 바뀐다(`build_attn_qsa`의
+   `build_attn_mha(..., top_k->ne[0], ...)`). `llama.h`는 그대로 1646줄이다.
+   전체가 `ggml-cuda/fattn-{common,mma-f16}.cuh`·`fattn.cu`·`qwen4exp.cpp`·
+   `tests/test-backend-ops.cpp`에 한정된다. 측정은 위키 `qwen38-sparse-fa-volta`,
+   `docs/bench/fn6-sparse-fa.md` 참조.
+
+4. `0004-volta-sparse-fa-optin.patch` — golbang 자체 변경. 위 #28770의 sparse
+   게이트는 `turing_mma_available(cc)`를 요구해 V100(sm_70)에서는 절대 켜지지
+   않는다. 또한 Volta 분기(`switch_ncols2`)는 gqa 비율의 약수로 `ncols2`를
+   고르는데 qwen4exp의 gqa는 12라 `ncols2==8`이 선택되지 않는다. 이 패치는
+   `GOLBANG_VOLTA_SPARSE_FA=1`일 때 `DKQ/DV==256 && ncols2==8` 형태에 한해
+   (a) `shall_use_sparse`가 Volta를 허용하고 (b) prefill/검증 배치(`Q->ne[1]>4`,
+   `K->ne[1] >= max(4096, 16*n_kv_max)`)에서 `ncols2=8`을 강제한다. `ncols1==1`
+   형태는 Volta에서 컴파일 불가(`ncols1*ncols2=8 < 32`)라 그대로 둔다. 기본
+   비활성이며 유닛이 환경변수로 켠다. 결과: 83k prefill **+5~8%**, decode 무변화,
+   그리디 출력은 NUMERIC(다른 커널, 비트 동일 아님). 위키 `qwen38-sparse-fa-volta`.
 
 ## 검증 방법
 

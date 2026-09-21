@@ -85,13 +85,15 @@ case "$GPU" in
     TREE="llama.cpp-cuda-upstream"; URL="$GGML_URL"
     BASE="911f6cdc8ab8a530b2bee09ee61471a6f3178eeb"
     PATCHES=(cuda/0001-qwen4exp-mtp-draft-head.patch
-             cuda/0002-qwen4exp-lazy-direct-reads.patch)
+             cuda/0002-qwen4exp-lazy-direct-reads.patch
+             cuda/0003-qwen4-sparse-fa.patch
+             cuda/0004-volta-sparse-fa-optin.patch)
     BINDIR="build"
     CMAKE_FLAGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70)
     # `llama` 앱은 `LLAMA_BUILD_SERVER=OFF`에서 `llama-server-impl`/`llama-cli-impl`을
     # 못 찾아 링크에 실패한다. golbang이 쓰는 라이브러리만 명시적으로 고른다.
     TARGETS=(llama ggml ggml-base ggml-cpu ggml-cuda mtmd)
-    PIN="775aa4edc8ec16cb0d1a4876c05ca851d361a99e"
+    PIN="e7ec442b7cbd3bf3f97e29a8530619c8dceb5206"
     ;;
   cpu)
     TREE="llama.cpp-glm5next"; URL="$GGML_URL"

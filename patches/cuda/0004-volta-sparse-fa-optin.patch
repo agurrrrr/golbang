@@ -1,0 +1,58 @@
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index f78e652..1b9ad46 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -134,10 +134,31 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
+ 
+     const int64_t n_gather = (ncols1 == 1 ? Q->ne[1] : ncols1) * (int64_t) n_kv_max;
+ 
+-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
++    const ggml_tensor * V = dst->src[2];
++
++    // golbang: upstream gates the sparse gather to Turing+, but the qwen4exp shape
++    // (DKQ/DV 256, ncols1 8, ncols2 8) is Volta-compatible (ncols1*ncols2 = 64 >= 32).
++    // Opt in on V100 with GOLBANG_VOLTA_SPARSE_FA=1 for A/B; the ncols1 == 1 variant
++    // is NOT Volta-compatible (8 < 32) and stays off.
++    const bool volta_sparse_ok = volta_mma_available(cc) && ncols1 == 8 &&
++        Q->ne[0] == 256 && V->ne[0] == 256 && getenv("GOLBANG_VOLTA_SPARSE_FA") != nullptr &&
++        atoi(getenv("GOLBANG_VOLTA_SPARSE_FA")) != 0;
++
++    const bool sparse_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && (turing_mma_available(cc) || volta_sparse_ok) &&
+         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
++
++    if (sparse_ok) {
++        static bool logged = false;
++        if (!logged) {
++            GGML_LOG_INFO("[golbang] sparse FA active: DKQ=%d ncols1=%d n_kv_max=%d n_kv=%d n_queries=%d\n",
++                (int) Q->ne[0], ncols1, (int) n_kv_max, (int) K->ne[1], (int) Q->ne[1]);
++            logged = true;
++        }
++    }
++
++    return sparse_ok;
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ }
+ 
+@@ -210,6 +231,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+ 
+     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
+     if (cc == GGML_CUDA_CC_VOLTA) {
++        // golbang: qwen4exp (DKQ/DV 256, gqa 12) needs ncols2 8 to reach the sparse
++        // gather (the new may_use_sparse shapes are ncols2 8 only); upstream's Volta
++        // branch picks ncols2 by divisibility and 12 % 8 != 0, so force 8 for the sparse
++        // shape when opted in. Only when the sparse gate itself holds (Q->ne[1] > 4 so
++        // switch_ncols1 picks ncols1 8, and K long enough), so short-context prefill and
++        // decode keep the default Volta tiling.
++        int32_t n_kv_max_sp = ggml_get_op_params_i32(dst, 4);
++        if (use_gqa_opt && Q->ne[1] > 4 && DKQ == 256 && DV == 256 && n_kv_max_sp > 0 &&
++            K->ne[1] >= std::max<int64_t>(4096, 16LL*n_kv_max_sp) &&
++            getenv("GOLBANG_VOLTA_SPARSE_FA") != nullptr && atoi(getenv("GOLBANG_VOLTA_SPARSE_FA")) != 0) {
++            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
++            return;
++        }
++
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+             return;

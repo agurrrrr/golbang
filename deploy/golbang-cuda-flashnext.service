@@ -14,6 +14,13 @@ Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
 Environment=LD_LIBRARY_PATH=/home/agurrrrr/code/local-llm/llama.cpp-cuda-upstream/build/bin:/opt/cuda-12.8/lib64
 Environment=RUST_LOG=info
+# FN-SPEED-6 (#273): enable the qwen4exp sparse flash-attention gather on Volta.
+# Upstream PR #28770 (patches/cuda/0003) gates sparse FA to Turing+, and its Volta
+# ncols2 selector never picks 8 for qwen4exp's gqa 12, so `patches/cuda/0004` opts
+# the V100 in for the DKQ/DV 256 shape only. Measured: ~83k prefill +5~8%, decode
+# flat, greedy output NUMERIC (different kernel, not bit-identical). Set to 0 (or
+# remove) to fall back to dense attention. See wiki `qwen38-sparse-fa-volta`.
+Environment=GOLBANG_VOLTA_SPARSE_FA=1
 # Qwen3.8-Flash-Next (arch qwen4exp, 176.94 B, 6 B active) UD-Q4_K_XL, 4 shards.
 # mmap is mandatory for the PLE n-gram table (per_layer_token_embd, 27.4 GiB):
 # it is TENSOR_READ_LAZY, and both lazy paths require mmap. `--lazy-mode

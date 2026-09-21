@@ -7,7 +7,9 @@
 //!   + DPP / MMQ I=64 / GCN repack), gfx906 `.so` byte check, HIP/ROCm link.
 //!   Rollback path: `llama.cpp-upgrade` @ `3ac5658c7` (kept, do not delete).
 //! - `cuda` → `llama.cpp-cuda-upstream` (`origin/master` `911f6cdc8a` + ggml-org
-//!   PR #28243 qwen4exp MTP + PR #28136 lazy-direct PLE reads), CUDA-symbol
+//!   PR #28243 qwen4exp MTP + PR #28136 lazy-direct PLE reads + PR #28770
+//!   qwen4 sparse FA, plus a golbang Volta opt-in for the sparse gather),
+//!   CUDA-symbol
 //!   `.so` byte check, CUDA runtime (`cudart`/`cublas`) link. Rollback trees:
 //!   `llama.cpp-escha` @ `c5d759c8a` (`escha-w2-dense` + DSV4.1 loader patches),
 //!   `llama.cpp-cuda` @ `749f688fc`, and the preserved old-pin tree
@@ -47,14 +49,18 @@ use std::process::Command;
 /// wiki `p0-ffi-notes` — 2026-09-01 G2 bump (glm5next, issue #98).
 /// Rollback pin: `llama.cpp-upgrade` @ `3ac5658c710c0a6f3bf64d3232c4f2f386b6c2ee`.
 const EXPECTED_SHA_HIP: &str = "367ebbc20c2b20db411d5acf72b88d26a7c13d70";
-/// 775aa4edc = upstream `911f6cdc8a` + PR #28243 (`qwen4exp` MTP) +
+/// e7ec442b7 = upstream `911f6cdc8a` + PR #28243 (`qwen4exp` MTP) +
 /// ggml-org PR #28136 (`--lazy-mode on-direct`: explicit pread()s for the
-/// lazy PLE table, prefill speedup). `patches/cuda/0001` then `0002`
-/// reproduce this tree exactly from `911f6cdc8a`. llama.h grew 1645 → 1646
-/// lines (one new `LLAMA_LAZY_MODE_DIRECT` enum value); the C API names
-/// golbang binds are unchanged. See wiki `qwen38-flashnext-speedup`.
-/// Rollback pins: `53b1389d0` (MTP only), `1c4cfda6c`.
-const EXPECTED_SHA_CUDA: &str = "775aa4edc8ec16cb0d1a4876c05ca851d361a99e";
+/// lazy PLE table, prefill speedup) + ggml-org PR #28770 (`CUDA: enable
+/// sparse fa for qwen4`) + a golbang Volta opt-in for the sparse gather
+/// (`GOLBANG_VOLTA_SPARSE_FA=1`). `patches/cuda/0001`..`0004` reproduce
+/// this tree exactly from `911f6cdc8a`; `llama.h` is unchanged at 1646
+/// lines (PR #28770 only touches `ggml-cuda/*.cu[h]` and the qwen4exp
+/// graph; its new `shall_use_sparse` signature is internal). See wiki
+/// `qwen38-sparse-fa-volta`, `qwen38-flashnext-speedup`.
+/// Rollback pins: `775aa4edc` (before PR #28770), `53b1389d0` (MTP only),
+/// `1c4cfda6c`.
+const EXPECTED_SHA_CUDA: &str = "e7ec442b7cbd3bf3f97e29a8530619c8dceb5206";
 /// `vendor/` 아래 트리 이름. `scripts/build-llama.sh`가 여기에 base 커밋을 받아
 /// `patches/`를 적용하고 cmake로 빌드한다. `GOLBANG_LLAMA_DIR`로 덮어쓸 수 있다.
 const VENDOR_HIP_DIR: &str = "llama.cpp-glm5next";
